@@ -1,0 +1,41 @@
+[profile.default]
+src = "src"
+out = "out"
+libs = ["lib"]
+ffi = true
+ast = true
+build_info = true
+extra_output = ["storageLayout"]
+
+solc = "0.8.26"
+optimizer = true
+optimizer_runs = 99999
+auto_detect_solc = false
+evm_version = "cancun"
+via_ir = true
+
+# Coverage scope per PRD §13.3: src/ excluding interfaces and libraries of pure types.
+no_match_coverage = "(src/interfaces/|test/|script/|lib/)"
+
+fs_permissions = [{ access = "read-write", path = "deployments/" }]
+
+[fmt]
+line_length = 120
+tab_width = 4
+bracket_spacing = true
+
+[fuzz]
+runs = 1024
+max_test_rejects = 65536
+seed = '0x1'
+
+[invariant]
+runs = 256
+depth = 64
+fail_on_revert = false
+
+[profile.ci.fuzz]
+runs = 4096
+
+[rpc_endpoints]
+push_donut = "${PUSH_DONUT_RPC_URL}"

@@ -1,0 +1,13 @@
+forge-std/=lib/forge-std/src/
+@openzeppelin/contracts/=lib/openzeppelin-contracts/contracts/
+smartsessions/=lib/smartsessions/contracts/
+contracts/=lib/smartsessions/contracts/
+erc7579/=lib/vendor/erc7579/src/
+account-abstraction/=lib/vendor/@ERC4337/account-abstraction/contracts/
+@ERC4337/=lib/vendor/@ERC4337/
+@rhinestone/=lib/vendor/@rhinestone/
+modulekit/=lib/vendor/@rhinestone/modulekit/src/
+module-bases/=lib/vendor/@rhinestone/module-bases/src/
+flatbytes/=lib/vendor/@rhinestone/flatbytes/src/
+solady/=lib/vendor/solady/src/
+excessively-safe-call/=lib/vendor/excessively-safe-call/src/

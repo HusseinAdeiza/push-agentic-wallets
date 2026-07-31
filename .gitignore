@@ -1,0 +1,13 @@
+out/
+cache/
+broadcast/
+.env
+lcov.info
+docs/
+node_modules/
+docs-internal
+
+# Local deploy artifacts. Real deployments are recorded deliberately, not by
+# whatever anvil run happened last.
+deployments/*.json
+!deployments/.gitkeep
