@@ -3,8 +3,10 @@ cache/
 broadcast/
 .env
 lcov.info
-docs/
 node_modules/
+
+# forge doc output. Hand-written docs live in docs/ and ARE tracked.
+docs/book/
 docs-internal
 
 # Local deploy artifacts. Real deployments are recorded deliberately, not by
