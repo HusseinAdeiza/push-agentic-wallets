@@ -12,7 +12,13 @@ import { ExecutionLib } from "../../src/libraries/ExecutionLib.sol";
 import { SmartSession } from "smartsessions/SmartSession.sol";
 import { ISmartSession } from "smartsessions/ISmartSession.sol";
 import {
-    Session, PolicyData, ActionData, ERC7739Data, ERC7739Context, PermissionId, SmartSessionMode
+    Session,
+    PolicyData,
+    ActionData,
+    ERC7739Data,
+    ERC7739Context,
+    PermissionId,
+    SmartSessionMode
 } from "smartsessions/DataTypes.sol";
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
 import { ERC20SpendingLimitPolicy } from "smartsessions/external/policies/ERC20SpendingLimitPolicy.sol";
@@ -46,7 +52,22 @@ contract TestToken {
     }
 }
 
-/// @notice PRD §11.5 I-08 / §12 A-06 — cumulative ERC-20 spend cap.
+/**
+ * @notice PRD §11.5 I-08 / §12 A-06 — the ADOPTED ERC20SpendingLimitPolicy, in isolation.
+ *
+ * ⚠ SCOPE — THIS DOES NOT COVER THE OUTBOUND FLOW.
+ *
+ * These tests bind the action to `(token, transfer)`. In the real flow the wallet
+ * never calls the token: it calls `UniversalGatewayPC.sendUniversalTxOutbound`, and
+ * the gateway burns the PRC20 internally. An ERC20SpendingLimitPolicy attached to
+ * `(gateway, sendUniversalTxOutbound)` would try to decode `transfer(address,uint256)`
+ * arguments out of an outbound request and read garbage — the two policies can never
+ * both fire on the same action.
+ *
+ * The cumulative cap for the real flow is enforced by `ACPActionPolicy` R5b
+ * (`maxAmountTotal` / `spent`), covered by P-21…P-24 and I-12. Do not read this file
+ * as coverage for that.
+ */
 contract SpendingLimitTest is Test {
     PushAgentWallet internal wallet;
     AgentWalletFactory internal factory;
@@ -86,8 +107,7 @@ contract SpendingLimitTest is Test {
         limits[0] = SPEND_CAP;
 
         PolicyData[] memory actionPolicies = new PolicyData[](1);
-        actionPolicies[0] =
-            PolicyData({ policy: address(spendPolicy), initData: abi.encode(tokens, limits) });
+        actionPolicies[0] = PolicyData({ policy: address(spendPolicy), initData: abi.encode(tokens, limits) });
 
         ActionData[] memory actions = new ActionData[](1);
         actions[0] = ActionData({
@@ -102,8 +122,7 @@ contract SpendingLimitTest is Test {
             salt: bytes32(0),
             userOpPolicies: new PolicyData[](0),
             erc7739Policies: ERC7739Data({
-                allowedERC7739Content: new ERC7739Context[](0),
-                erc1271Policies: new PolicyData[](0)
+                allowedERC7739Content: new ERC7739Context[](0), erc1271Policies: new PolicyData[](0)
             }),
             actions: actions,
             permitERC4337Paymaster: true
@@ -122,9 +141,7 @@ contract SpendingLimitTest is Test {
     }
 
     function _transferCalldata(uint256 amount) internal view returns (bytes memory) {
-        return ExecutionLib.encodeSingle(
-            address(token), 0, abi.encodeCall(TestToken.transfer, (recipient, amount))
-        );
+        return ExecutionLib.encodeSingle(address(token), 0, abi.encodeCall(TestToken.transfer, (recipient, amount)));
     }
 
     function _sign(PermissionId pid, ModeCode mode, bytes memory execCd, uint192 key, uint64 seq)

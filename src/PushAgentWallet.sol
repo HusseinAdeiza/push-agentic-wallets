@@ -40,8 +40,10 @@ contract PushAgentWallet is ReentrancyGuardTransient, IERC165, IERC721Receiver, 
     // ==============================
 
     uint256 internal constant MODULE_TYPE_VALIDATOR = 1;
-    uint256 internal constant MODULE_TYPE_EXECUTOR = 2; // declared, never installable in v1 (D-04)
-    uint256 internal constant MODULE_TYPE_FALLBACK = 3; // declared, never installable in v1 (D-07)
+    // intentionally unreferenced — declared for spec completeness, never installable
+    uint256 internal constant MODULE_TYPE_EXECUTOR = 2; // D-04
+    // intentionally unreferenced — see above
+    uint256 internal constant MODULE_TYPE_FALLBACK = 3; // D-07
     uint256 internal constant MODULE_TYPE_HOOK = 4;
 
     string internal constant ACCOUNT_ID = "push.agentwallet.1.0.0";
@@ -87,14 +89,23 @@ contract PushAgentWallet is ReentrancyGuardTransient, IERC165, IERC721Receiver, 
     //          MODIFIERS
     // ==============================
 
-    /// @dev The UEA owner, or the wallet calling itself (enables batched self-config).
-    ///      SECURITY: because address(this) is permitted here, ACPActionPolicy MUST
-    ///      reject address(this) as a call target. See §8.5 rule R7 / attack test A-04.
-    modifier onlyOwnerOrSelf() {
-        if (msg.sender != owner && msg.sender != address(this)) revert PushWalletErrors.Unauthorized();
-        _;
-    }
-
+    /**
+     * @dev Only the owning UEA.
+     *
+     *      A `msg.sender == address(this)` branch was removed deliberately (D-3). It
+     *      existed to permit "batched self-config", but that was never needed: a UEA
+     *      multicall calls each target directly (`UEA_EVM: calls[i].to.call(...)`), so
+     *      every entry arrives with `msg.sender == UEA`. The branch was unreachable
+     *      anyway — `execute` and `installModule` are both `nonReentrant`.
+     *
+     *      Keeping a dead branch that appears to grant self-call authority is a hazard:
+     *      a future maintainer could remove `nonReentrant` to "fix" it and reopen A-04.
+     *
+     *      SECURITY: `ACPActionPolicy` R7 (rejecting `to == account`) MUST be retained
+     *      regardless. A-04 has three independent defences — SmartSession's own
+     *      `InvalidSelfCall` check, our R7, and this modifier — and none of them may be
+     *      removed as "redundant".
+     */
     modifier onlyOwner() {
         if (msg.sender != owner) revert PushWalletErrors.Unauthorized();
         _;
@@ -143,7 +154,7 @@ contract PushAgentWallet is ReentrancyGuardTransient, IERC165, IERC721Receiver, 
 
     function installModule(uint256 moduleTypeId, address module, bytes calldata initData)
         external
-        onlyOwnerOrSelf
+        onlyOwner
         nonReentrant
     {
         if (!supportsModule(moduleTypeId)) revert PushWalletErrors.UnsupportedModuleType(moduleTypeId);
@@ -154,7 +165,16 @@ contract PushAgentWallet is ReentrancyGuardTransient, IERC165, IERC721Receiver, 
 
         // SECURITY: set state BEFORE the external call — onInstall may reenter.
         _modules[moduleTypeId][module] = true;
-        if (moduleTypeId == MODULE_TYPE_HOOK) _hook = module;
+
+        // Only ONE hook may be active. Silently overwriting `_hook` would orphan the
+        // previous hook: its `_modules[4][old]` entry would stay true, making it
+        // permanently un-reinstallable and making isModuleInstalled lie. This is the
+        // single-active-module hazard named in the ERC-7579 security considerations.
+        // Require an explicit uninstall first.
+        if (moduleTypeId == MODULE_TYPE_HOOK) {
+            if (_hook != address(0)) revert PushWalletErrors.HookAlreadyInstalled(_hook);
+            _hook = module;
+        }
 
         IERC7579Module(module).onInstall(initData);
 
@@ -166,7 +186,7 @@ contract PushAgentWallet is ReentrancyGuardTransient, IERC165, IERC721Receiver, 
     ///      `emergencyRevokeAll` exists as the escape hatch.
     function uninstallModule(uint256 moduleTypeId, address module, bytes calldata deInitData)
         external
-        onlyOwnerOrSelf
+        onlyOwner
         nonReentrant
     {
         if (!_modules[moduleTypeId][module]) {
@@ -189,7 +209,7 @@ contract PushAgentWallet is ReentrancyGuardTransient, IERC165, IERC721Receiver, 
     //          EXECUTION
     // ==============================
 
-    function execute(ModeCode mode, bytes calldata executionCalldata) external payable onlyOwnerOrSelf nonReentrant {
+    function execute(ModeCode mode, bytes calldata executionCalldata) external payable onlyOwner nonReentrant {
         _execute(mode, executionCalldata);
     }
 
@@ -275,7 +295,16 @@ contract PushAgentWallet is ReentrancyGuardTransient, IERC165, IERC721Receiver, 
                 ++i;
             }
         }
-        _hook = address(0);
+        // Clear the active hook's MAPPING entry too, not just the slot. Because
+        // installModule rejects a second hook, `_hook` is provably the only address
+        // with _modules[4][.] == true, so this is complete (invariant N-02).
+        address h = _hook;
+        if (h != address(0)) {
+            _modules[MODULE_TYPE_HOOK][h] = false;
+            emit ModuleUninstalled(MODULE_TYPE_HOOK, h);
+            _hook = address(0);
+        }
+
         emit EmergencyRevokeAll(msg.sender);
     }
 
@@ -385,6 +414,8 @@ contract PushAgentWallet is ReentrancyGuardTransient, IERC165, IERC721Receiver, 
         } else if (ct == CALLTYPE_BATCH) {
             Execution[] calldata execs = ExecutionLib.decodeBatch(executionCalldata);
             uint256 len = execs.length;
+            // Reject an empty batch so "executed nothing" can never look like success.
+            if (len == 0) revert PushWalletErrors.EmptyBatch();
             for (uint256 i; i < len;) {
                 _call(execs[i].target, execs[i].value, execs[i].callData);
                 unchecked {
@@ -409,6 +440,10 @@ contract PushAgentWallet is ReentrancyGuardTransient, IERC165, IERC721Receiver, 
         }
     }
 
+    /// @dev NOTE: `executeWithSession` is not payable, so `value` is STRUCTURALLY ZERO
+    ///      on the session path — the wallet spends its own PC balance through the
+    ///      execution `value` field instead (D-15). A future hook doing native-value
+    ///      accounting must not assume this reflects value actually moved.
     function _preHook(address sender, uint256 value, bytes calldata data) internal returns (bytes memory) {
         address h = _hook;
         if (h == address(0)) return "";
@@ -440,6 +475,12 @@ contract PushAgentWallet is ReentrancyGuardTransient, IERC165, IERC721Receiver, 
         return IERC1155Receiver.onERC1155BatchReceived.selector;
     }
 
+    /// @dev Reports only ERC-165 and the token-receiver interfaces. ERC-7579 defines
+    ///      NO single account interfaceId — the spec splits the surface across several
+    ///      interfaces and prescribes discovery via `accountId()`, which returns
+    ///      "push.agentwallet.1.0.0". `IERC7579Account` in src/interfaces is a
+    ///      deliberate local subset (no `executeFromExecutor`, D-04) and MUST NOT be
+    ///      advertised as conformance we do not have.
     function supportsInterface(bytes4 iid) external pure returns (bool) {
         return iid == type(IERC165).interfaceId || iid == type(IERC721Receiver).interfaceId
             || iid == type(IERC1155Receiver).interfaceId;

@@ -90,9 +90,12 @@ struct Execution {
 }
 ```
 
-The reason this matters: the two encodings are structurally different, and decoding one as
-the other does not reliably produce a clean error. Always pair the encoder with the
-matching mode — `encodeSingle` with a single mode, `encodeBatch` with a batch mode.
+The reason this matters: the two encodings are structurally different. `decodeBatch`
+therefore validates before it trusts anything — the offset word must land inside the blob,
+there must be room for the length word, and the decoded length's entries must fit in what
+remains. A mismatched encoding reverts rather than decoding into a plausible-looking empty
+batch. Always pair the encoder with the matching mode — `encodeSingle` with a single mode,
+`encodeBatch` with a batch mode.
 
 ---
 

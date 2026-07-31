@@ -15,7 +15,13 @@ import { UniversalOutboundTxRequest, Multicall, MULTICALL_SELECTOR } from "../..
 import { SmartSession } from "smartsessions/SmartSession.sol";
 import { ISmartSession } from "smartsessions/ISmartSession.sol";
 import {
-    Session, PolicyData, ActionData, ERC7739Data, ERC7739Context, PermissionId, SmartSessionMode
+    Session,
+    PolicyData,
+    ActionData,
+    ERC7739Data,
+    ERC7739Context,
+    PermissionId,
+    SmartSessionMode
 } from "smartsessions/DataTypes.sol";
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
 import { TimeFramePolicy } from "smartsessions/external/policies/TimeFramePolicy.sol";
@@ -74,9 +80,9 @@ contract FullFlowTest is Test {
 
     // ── helpers ───────────────────────────────────────────────────────
 
-    function _acpConfig() internal view returns (bytes memory) {
+    function _acpConfigWithTotal(uint256 total) internal view returns (bytes memory) {
         AllowedCall[] memory allowed = new AllowedCall[](1);
-        allowed[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 68, true);
+        allowed[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 68, true, 0);
 
         Config memory cfg = Config({
             initialized: false,
@@ -84,6 +90,27 @@ contract FullFlowTest is Test {
             expectedCEA: expectedCEA,
             asset: asset,
             maxAmountPerCall: MAX_AMOUNT,
+            maxAmountTotal: total,
+            maxPCPerCall: type(uint256).max,
+            spent: 0,
+            allowedCalls: allowed
+        });
+        return abi.encode(cfg);
+    }
+
+    function _acpConfig() internal view returns (bytes memory) {
+        AllowedCall[] memory allowed = new AllowedCall[](1);
+        allowed[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 68, true, 0);
+
+        Config memory cfg = Config({
+            initialized: false,
+            destChainHash: keccak256("eip155:1"),
+            expectedCEA: expectedCEA,
+            asset: asset,
+            maxAmountPerCall: MAX_AMOUNT,
+            maxAmountTotal: type(uint256).max,
+            maxPCPerCall: type(uint256).max,
+            spent: 0,
             allowedCalls: allowed
         });
         return abi.encode(cfg);
@@ -91,11 +118,7 @@ contract FullFlowTest is Test {
 
     /// Builds a session granting `provKey` the right to call the gateway,
     /// gated by ACPActionPolicy (and optionally TimeFramePolicy).
-    function _session(uint8 scheme, bytes memory key, uint48 validUntil)
-        internal
-        view
-        returns (Session memory s)
-    {
+    function _session(uint8 scheme, bytes memory key, uint48 validUntil) internal view returns (Session memory s) {
         PolicyData[] memory actionPolicies = new PolicyData[](validUntil == 0 ? 1 : 2);
         actionPolicies[0] = PolicyData({ policy: address(acp), initData: _acpConfig() });
         if (validUntil != 0) {
@@ -116,8 +139,30 @@ contract FullFlowTest is Test {
             salt: bytes32(0),
             userOpPolicies: new PolicyData[](0),
             erc7739Policies: ERC7739Data({
-                allowedERC7739Content: new ERC7739Context[](0),
-                erc1271Policies: new PolicyData[](0)
+                allowedERC7739Content: new ERC7739Context[](0), erc1271Policies: new PolicyData[](0)
+            }),
+            actions: actions,
+            permitERC4337Paymaster: true
+        });
+    }
+
+    /// Session whose ACP config carries an explicit cumulative ceiling (C-2).
+    function _sessionWithTotal(uint256 total) internal view returns (Session memory s) {
+        PolicyData[] memory actionPolicies = new PolicyData[](1);
+        actionPolicies[0] = PolicyData({ policy: address(acp), initData: _acpConfigWithTotal(total) });
+
+        ActionData[] memory actions = new ActionData[](1);
+        actions[0] = ActionData({
+            actionTargetSelector: bytes4(0x77b86bec), actionTarget: address(gateway), actionPolicies: actionPolicies
+        });
+
+        s = Session({
+            sessionValidator: ISessionValidator(address(sessionValidator)),
+            sessionValidatorInitData: abi.encode(uint8(0), abi.encodePacked(provKey)),
+            salt: bytes32(0),
+            userOpPolicies: new PolicyData[](0),
+            erc7739Policies: ERC7739Data({
+                allowedERC7739Content: new ERC7739Context[](0), erc1271Policies: new PolicyData[](0)
             }),
             actions: actions,
             permitERC4337Paymaster: true
@@ -398,10 +443,60 @@ contract FullFlowTest is Test {
         bytes memory sig = _sign(pid, _opHash(mode, execCd, 0, 0));
 
         vm.prank(provider);
-        vm.expectRevert(
-            abi.encodeWithSelector(PushWalletErrors.ValidatorNotInstalled.selector, address(smartSession))
-        );
+        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.ValidatorNotInstalled.selector, address(smartSession)));
         wallet.executeWithSession(address(smartSession), mode, execCd, sig, 0, 0);
+    }
+
+    // ── I-12 — C-2 cumulative cap, end to end ─────────────────────────
+
+    /**
+     * I-12 / C-2 — the cumulative mandate ceiling holds through the REAL stack:
+     * executeWithSession -> SmartSession -> ACPActionPolicy.
+     *
+     * Each call is within maxAmountPerCall, so before the fix the provider could
+     * repeat until the wallet was empty.
+     */
+    function test_I12_C2_cumulativeCapEnforcedEndToEnd() public {
+        PermissionId pid = _grantSession(_sessionWithTotal(250e6));
+        ModeCode mode = ModeLib.encodeSimpleSingle();
+
+        bytes memory cd1 = _execCalldata(expectedCEA, 100e6);
+        vm.prank(provider);
+        wallet.executeWithSession(address(smartSession), mode, cd1, _sign(pid, _opHash(mode, cd1, 0, 0)), 0, 0);
+
+        bytes memory cd2 = _execCalldata(expectedCEA, 100e6);
+        vm.prank(provider);
+        wallet.executeWithSession(address(smartSession), mode, cd2, _sign(pid, _opHash(mode, cd2, 0, 1)), 0, 1);
+
+        assertEq(gateway.callCount(), 2, "two calls within the cap succeed");
+
+        // Third call is individually legal but takes the total to 300 > 250.
+        bytes memory cd3 = _execCalldata(expectedCEA, 100e6);
+        vm.prank(provider);
+        vm.expectRevert();
+        wallet.executeWithSession(address(smartSession), mode, cd3, _sign(pid, _opHash(mode, cd3, 0, 2)), 0, 2);
+
+        assertEq(gateway.callCount(), 2, "the mandate ceiling holds");
+    }
+
+    /**
+     * I-13 — a session key must not be able to reconfigure sessions by calling
+     * SmartSession through its own session. SmartSession routes calls targeting itself to a
+     * sentinel actionId with no policy configured, so this fails upstream — pinning
+     * behaviour we rely on.
+     */
+    function test_I13_sessionKeyCannotCallSmartSessionThroughItsOwnSession() public {
+        PermissionId pid = _grantSession(_session(0, abi.encodePacked(provKey), 0));
+        ModeCode mode = ModeLib.encodeSimpleSingle();
+
+        bytes memory attack =
+            ExecutionLib.encodeSingle(address(smartSession), 0, abi.encodeCall(ISmartSession.removeSession, (pid)));
+
+        vm.prank(provider);
+        vm.expectRevert();
+        wallet.executeWithSession(address(smartSession), mode, attack, _sign(pid, _opHash(mode, attack, 0, 0)), 0, 0);
+
+        assertTrue(smartSession.isPermissionEnabled(pid, address(wallet)), "session must survive");
     }
 
     // ── I-11 — owner authority is unconditional (C4) ──────────────────

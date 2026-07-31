@@ -13,6 +13,9 @@ library PushWalletErrors {
     error UnsupportedCallType(CallType callType);
     error UnsupportedExecType(ExecType execType);
     error ModuleAlreadyInstalled(uint256 moduleTypeId, address module);
+    error HookAlreadyInstalled(address current);
+    error MalformedBatchCalldata();
+    error EmptyBatch();
     error ModuleNotInstalled(uint256 moduleTypeId, address module);
     error ValidatorNotInstalled(address validator);
     error InvalidNonce(uint192 key, uint64 expected, uint64 provided);

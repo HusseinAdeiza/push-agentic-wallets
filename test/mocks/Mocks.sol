@@ -114,10 +114,7 @@ contract MockHook is IERC7579Hook {
     uint256 public lastMsgValue;
     bool public installed;
 
-    function preCheck(address msgSender, uint256 msgValue, bytes calldata)
-        external
-        returns (bytes memory hookData)
-    {
+    function preCheck(address msgSender, uint256 msgValue, bytes calldata) external returns (bytes memory hookData) {
         ++preCount;
         lastMsgSender = msgSender;
         lastMsgValue = msgValue;

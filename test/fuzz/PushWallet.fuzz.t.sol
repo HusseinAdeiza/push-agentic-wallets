@@ -19,7 +19,7 @@ import {
     CALLTYPE_DELEGATECALL,
     EXECTYPE_DEFAULT
 } from "../../src/libraries/ModeLib.sol";
-import { ExecutionLib } from "../../src/libraries/ExecutionLib.sol";
+import { ExecutionLib, Execution } from "../../src/libraries/ExecutionLib.sol";
 import { MockValidator, MockTarget } from "../mocks/Mocks.sol";
 
 /// @dev Exposes the internals under test.
@@ -64,7 +64,18 @@ contract ExtractHarness {
     }
 }
 
-/// @notice PRD §11.6 — fuzz properties F-01 … F-04.
+/// @dev Exposes decodeBatch across an external boundary for calldata fuzzing.
+contract BatchDecodeHarness {
+    function decodeBatchLength(bytes calldata ecd) external pure returns (uint256 len, uint256 baseOffset) {
+        Execution[] calldata execs = ExecutionLib.decodeBatch(ecd);
+        assembly {
+            baseOffset := calldataload(ecd.offset)
+        }
+        return (execs.length, baseOffset);
+    }
+}
+
+/// @notice PRD §11.6 — fuzz properties F-01 … F-05.
 contract PushWalletFuzzTest is Test {
     PushAgentWallet internal wallet;
     AgentWalletFactory internal factory;
@@ -72,6 +83,7 @@ contract PushWalletFuzzTest is Test {
     MockTarget internal target;
     HashHarness internal hasher;
     ExtractHarness internal extractor;
+    BatchDecodeHarness internal decoder;
 
     address internal ownerUEA = address(0xB0B);
 
@@ -85,6 +97,7 @@ contract PushWalletFuzzTest is Test {
         target = new MockTarget();
         hasher = new HashHarness();
         extractor = new ExtractHarness();
+        decoder = new BatchDecodeHarness();
 
         vm.prank(ownerUEA);
         wallet.installModule(1, address(validator), "");
@@ -104,8 +117,10 @@ contract PushWalletFuzzTest is Test {
     }
 
     function testFuzz_F01_opHashNeverCollidesAcrossDifferingInputs(OpInputs memory a, OpInputs memory b) public view {
-        bytes32 hA = hasher.computeOpHash(a.wallet, a.validator, ModeCode.wrap(a.mode), a.cd, a.key, a.seq, block.chainid);
-        bytes32 hB = hasher.computeOpHash(b.wallet, b.validator, ModeCode.wrap(b.mode), b.cd, b.key, b.seq, block.chainid);
+        bytes32 hA =
+            hasher.computeOpHash(a.wallet, a.validator, ModeCode.wrap(a.mode), a.cd, a.key, a.seq, block.chainid);
+        bytes32 hB =
+            hasher.computeOpHash(b.wallet, b.validator, ModeCode.wrap(b.mode), b.cd, b.key, b.seq, block.chainid);
 
         bool sameInputs = a.wallet == b.wallet && a.validator == b.validator && a.mode == b.mode
             && keccak256(a.cd) == keccak256(b.cd) && a.key == b.key && a.seq == b.seq;
@@ -120,8 +135,10 @@ contract PushWalletFuzzTest is Test {
     /// F-01b — the chain id is always bound.
     function testFuzz_F01b_opHashBindsChainId(uint256 chainA, uint256 chainB, bytes calldata cd) public view {
         vm.assume(chainA != chainB);
-        bytes32 hA = hasher.computeOpHash(address(wallet), address(validator), ModeLib.encodeSimpleSingle(), cd, 0, 0, chainA);
-        bytes32 hB = hasher.computeOpHash(address(wallet), address(validator), ModeLib.encodeSimpleSingle(), cd, 0, 0, chainB);
+        bytes32 hA =
+            hasher.computeOpHash(address(wallet), address(validator), ModeLib.encodeSimpleSingle(), cd, 0, 0, chainA);
+        bytes32 hB =
+            hasher.computeOpHash(address(wallet), address(validator), ModeLib.encodeSimpleSingle(), cd, 0, 0, chainB);
         assertTrue(hA != hB);
     }
 
@@ -153,15 +170,12 @@ contract PushWalletFuzzTest is Test {
         ModeCode mode = ModeCode.wrap(rawMode);
         (CallType ct, ExecType et,,) = ModeLib.decode(mode);
 
-        bytes memory execCd =
-            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
+        bytes memory execCd = ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
 
         // `execCd` is single-call encoded.
         //   SINGLE+DEFAULT → performs the call.
-        //   BATCH+DEFAULT  → ExecutionLib.decodeBatch reads a length of 0 from this
-        //                    calldata and returns an empty batch, so execute()
-        //                    succeeds while performing NO call. See F-03b and
-        //                    DEVIATIONS.md D-4.
+        //   BATCH+DEFAULT  → decodeBatch now rejects this encoding (D-4 fixed), so
+        //                    it reverts rather than silently no-opping. See F-03b.
         //   anything else  → typed revert.
         bool isSingle = (et == EXECTYPE_DEFAULT) && (ct == CALLTYPE_SINGLE);
         bool isBatch = (et == EXECTYPE_DEFAULT) && (ct == CALLTYPE_BATCH);
@@ -180,32 +194,49 @@ contract PushWalletFuzzTest is Test {
     }
 
     /**
-     * F-03b — ⚠ FINDING. Documents a real silent no-op.
+     * F-03b — D-4 REGRESSION GUARD (inverted after the fix).
      *
-     * `ExecutionLib.decodeBatch` (specified verbatim in PRD §9.2) reads the array
-     * length straight out of unvalidated calldata via assembly. Given single-call
-     * encoded calldata, it decodes a length of 0 and returns an empty batch, so
-     * `execute` in BATCH mode completes successfully having performed no call at
-     * all — no revert, no effect.
+     * `ExecutionLib.decodeBatch` previously read the array length straight out of
+     * unvalidated calldata. Given SINGLE-encoded calldata it decoded a length of
+     * zero and returned an empty batch, so `execute` in batch mode SUCCEEDED having
+     * performed no call — a silent no-op that still consumed a nonce and emitted
+     * SessionExecuted, misleading any off-chain consumer.
      *
-     * Impact is bounded: `mode` and `keccak256(executionCalldata)` are both bound
-     * into opHash, so this cannot be used to execute anything unintended. The
-     * consequence is that `executeWithSession` consumes a nonce and emits
-     * SessionExecuted for an operation that did nothing.
-     *
-     * Recorded in DEVIATIONS.md D-4 rather than fixed, because §9.2 is specified
-     * verbatim and §13.10 forbids unspecified changes.
+     * It must now revert.
      */
-    function test_F03b_batchModeOnSingleCalldataSilentlyNoOps() public {
+    function test_F03b_batchModeOnSingleCalldataReverts() public {
         bytes memory singleEncoded =
             ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
         ModeCode batchMode = ModeLib.encodeSimpleBatch();
 
         uint256 before = target.callCount();
+        vm.expectRevert();
         vm.prank(ownerUEA);
-        wallet.execute(batchMode, singleEncoded); // succeeds
+        wallet.execute(batchMode, singleEncoded);
 
-        assertEq(target.callCount(), before, "no call is performed: the silent no-op");
+        assertEq(target.callCount(), before, "no partial effect");
+    }
+
+    /// D-4 — an empty batch is rejected, so "executed nothing" cannot look like success.
+    function test_F03c_emptyBatchReverts() public {
+        Execution[] memory none = new Execution[](0);
+        vm.expectRevert(PushWalletErrors.EmptyBatch.selector);
+        vm.prank(ownerUEA);
+        wallet.execute(ModeLib.encodeSimpleBatch(), ExecutionLib.encodeBatch(none));
+    }
+
+    /**
+     * F-05 — for ANY random blob, decodeBatch either reverts or returns a length
+     * whose head slots all lie within the calldata. It must never report a length
+     * that the buffer cannot contain.
+     */
+    function testFuzz_F05_decodeBatchNeverReportsImpossibleLength(bytes calldata blob) public view {
+        try decoder.decodeBatchLength(blob) returns (uint256 len, uint256 baseOffset) {
+            uint256 remaining = blob.length - baseOffset - 32;
+            assertLe(len, remaining / 32, "reported length must fit in the remaining calldata");
+        } catch {
+            // Reverting is the other acceptable outcome.
+        }
     }
 
     /// F-04 — the nonce sequence is strictly monotonic per key.
@@ -230,12 +261,9 @@ contract PushWalletFuzzTest is Test {
     /// F-04b — a wrong sequence never advances the nonce.
     function testFuzz_F04b_wrongSeqNeverAdvancesNonce(uint192 key, uint64 wrongSeq) public {
         vm.assume(wrongSeq != 0);
-        bytes memory execCd =
-            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
+        bytes memory execCd = ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
 
-        vm.expectRevert(
-            abi.encodeWithSelector(PushWalletErrors.InvalidNonce.selector, key, uint64(0), wrongSeq)
-        );
+        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.InvalidNonce.selector, key, uint64(0), wrongSeq));
         wallet.executeWithSession(address(validator), ModeLib.encodeSimpleSingle(), execCd, "", key, wrongSeq);
 
         assertEq(wallet.nonce(key), 0, "nonce must be untouched");
@@ -244,8 +272,7 @@ contract PushWalletFuzzTest is Test {
     /// Nonce keys are fully independent of one another.
     function testFuzz_nonceKeysIndependent(uint192 keyA, uint192 keyB) public {
         vm.assume(keyA != keyB);
-        bytes memory execCd =
-            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
+        bytes memory execCd = ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
 
         wallet.executeWithSession(address(validator), ModeLib.encodeSimpleSingle(), execCd, "", keyA, 0);
         assertEq(wallet.nonce(keyA), 1);
@@ -269,8 +296,7 @@ contract PushWalletFuzzTest is Test {
     /// Only the owner may ever execute directly.
     function testFuzz_onlyOwnerCanExecute(address caller) public {
         vm.assume(caller != ownerUEA && caller != address(wallet));
-        bytes memory execCd =
-            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
+        bytes memory execCd = ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
 
         vm.expectRevert(PushWalletErrors.Unauthorized.selector);
         vm.prank(caller);

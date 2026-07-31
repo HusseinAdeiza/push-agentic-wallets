@@ -133,6 +133,12 @@ The wallet supports exactly two module types.
 calling `onInstall`, so a module that tries to reenter during its own installation finds
 the state already settled and is additionally stopped by the reentrancy guard.
 
+**Only one hook may be active.** Installing a second hook while one is present is
+rejected rather than silently replacing it. A silent replacement would leave the previous
+hook's registry entry set — making it permanently un-reinstallable and making
+`isModuleInstalled` report a hook that is not active. This is the single-active-module
+hazard named in the ERC-7579 security considerations.
+
 ```mermaid
 sequenceDiagram
     participant O as Owner UEA
@@ -159,8 +165,7 @@ Two entry points, two very different authority models.
 function execute(ModeCode mode, bytes calldata executionCalldata) external payable;
 ```
 
-Restricted to the owner (or the wallet itself). No policy applies: the UEA is the root
-authority. This is the path the owner uses to move funds, unwind positions, or act when no
+Restricted to the owner. No policy applies: the UEA is the root authority. This is the path the owner uses to move funds, unwind positions, or act when no
 session exists.
 
 ### `executeWithSession` — the delegated path
@@ -203,7 +208,7 @@ the whole transaction, and it guarantees the sequence is strictly monotonic per 
 | Call type | Supported | Note |
 |---|---|---|
 | Single | ✅ | One call |
-| Batch | ✅ | Several calls, in order, all-or-nothing |
+| Batch | ✅ | Several calls, in order, all-or-nothing. An empty or malformed batch is rejected, so "executed nothing" can never look like success |
 | Delegatecall | ❌ | The target would own the account's storage |
 | Static | ❌ | No use case for a state-changing entry point |
 
@@ -292,7 +297,8 @@ The owner's authority is unconditional and cannot be constrained by any module.
 function emergencyRevokeAll(address[] calldata validators) external;
 ```
 
-Clears validators **without** calling `onUninstall`, and clears the hook slot. This is the
+Clears validators **without** calling `onUninstall`, and fully clears the active hook —
+both the slot and its registry entry, so it can be reinstalled afterwards. This is the
 answer to a hostile or broken module that reverts in its own removal callback: the normal
 `uninstallModule` path could be blocked forever, this one cannot be.
 

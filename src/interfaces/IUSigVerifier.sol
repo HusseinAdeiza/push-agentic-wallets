@@ -5,6 +5,13 @@ pragma solidity 0.8.26;
  * @title IUSigVerifier
  * @notice Minimal interface for the Push Chain USV precompile at
  *         0xEC00000000000000000000000000000000000001 (PRD §7.2).
+ * @dev    ⚠ DOCUMENTATION ONLY — do NOT call the precompile through this interface.
+ *         Solidity inserts an `extcodesize(target) > 0` check before any high-level
+ *         call that ABI-decodes return data, and reverts when the target has no code.
+ *         Precompiles have no code, so such a call always reverts on-chain.
+ *         `PushSessionValidator` uses a raw staticcall instead, mirroring the audited
+ *         `UEA_SVM`. This interface exists to document the ABI.
+ *
  * @dev    Declared locally rather than imported, to avoid a cross-repo build
  *         dependency on the Push Chain node repo (PRD §4.3).
  *         Both methods cost 4,000 gas. `pubKey` MUST be raw 32 bytes — the

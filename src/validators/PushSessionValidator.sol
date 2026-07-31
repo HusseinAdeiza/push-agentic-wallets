@@ -65,7 +65,20 @@ contract PushSessionValidator is ISessionValidator {
             // MUST NOT use verifyEd25519 — that verifies over the ASCII of a hex
             // string, which a headless agent signing with a standard library will
             // not produce.
-            return IUSigVerifier(USV).verifyEd25519RawMessage(key, abi.encodePacked(hash), sig);
+            //
+            // SECURITY: this MUST be a raw staticcall, not a high-level call through
+            // IUSigVerifier. Solidity inserts an `extcodesize(target) > 0` check before
+            // any high-level call that ABI-decodes return data, and reverts when the
+            // target has no code. Precompiles have no code, so the interface call
+            // reverts on-chain. The audited UEA_SVM uses a raw staticcall for exactly
+            // this reason. IUSigVerifier is retained for documentation only.
+            (bool ok, bytes memory ret) = USV.staticcall(
+                abi.encodeWithSignature("verifyEd25519RawMessage(bytes,bytes,bytes)", key, abi.encodePacked(hash), sig)
+            );
+            // Fail closed. Consistent with the ECDSA branch: a revert inside validation
+            // is indistinguishable from a policy failure and degrades error reporting.
+            if (!ok || ret.length < 32) return false;
+            return abi.decode(ret, (bool));
         }
 
         revert UnsupportedScheme(scheme);

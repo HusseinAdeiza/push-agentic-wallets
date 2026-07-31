@@ -90,12 +90,28 @@ grants the session:
 | `destChainHash` | Destination chain identifier, e.g. `keccak256("eip155:1")` |
 | `expectedCEA` | The wallet's CEA on that chain — **the required beneficiary** |
 | `asset` | The only PRC20 token this session may move |
-| `maxAmountPerCall` | Ceiling on a single call's amount |
+| `maxAmountPerCall` | Ceiling on a **single call's** amount |
+| `maxAmountTotal` | **Cumulative** ceiling across the session's lifetime |
+| `maxPCPerCall` | Ceiling on **Push Chain** native value forwarded to the gateway per call |
+| `spent` | Running total authorised so far; reset on re-grant |
 | `allowedCalls[]` | Exhaustive allowlist of permitted inner calls |
 
-Each `allowedCalls` entry is a `(target, selector, beneficiaryOffset, hasBeneficiary)`
-tuple: which contract, which function, where the beneficiary sits in the calldata, and
-whether it has one at all (`approve`, for instance, does not).
+Each `allowedCalls` entry is a `(target, selector, beneficiaryOffset, hasBeneficiary,
+maxValue)` tuple: which contract, which function, where the beneficiary sits in the
+calldata, whether it has one at all (`approve`, for instance, does not), and how much
+destination-chain native value that call may carry (`0` for every v1 target, since all
+are non-payable).
+
+The two amount ceilings are deliberately redundant and bound different things:
+
+| Field | Bounds | Failure it contains |
+|---|---|---|
+| `maxAmountPerCall` | single-transaction blast radius | a compromised key draining the mandate in **one** transaction, before monitoring can react |
+| `maxAmountTotal` | lifetime mandate exposure | the same key draining it across **N** transactions |
+
+Without the per-call ceiling a 1,000 USDC mandate empties in a single call. With it, an
+attacker needs N transactions — each an observable on-chain event the owner can revoke
+against mid-sequence.
 
 ## 5. The eleven rules
 
@@ -106,17 +122,20 @@ flowchart TD
     R1["R1 · config initialized?"] --> R2["R2 · target == UniversalGatewayPC?"]
     R2 --> R3["R3 · selector == sendUniversalTxOutbound?"]
     R3 --> R4["R4 · req.token == configured asset?"]
-    R4 --> R5["R5 · req.amount <= cap?"]
-    R5 --> R10["R10 · revertRecipient == the account?"]
+    R4 --> R5["R5 · req.amount <= per-call cap?"]
+    R5 --> R5B["R5b · spent + amount <= total cap?"]
+    R5B --> R12["R12 · forwarded PC <= maxPCPerCall?"]
+    R12 --> R13["R13 · req.amount != 0?"]
+    R13 --> R10["R10 · revertRecipient == the account?"]
     R10 --> R6["R6 · payload is a multicall?"]
 
     R6 --> LOOP["for each inner call"]
     LOOP --> R7["R7 · target is not the account,<br/>the policy, or the gateway"]
     R7 --> R8["R8 · (target, selector) on the allowlist?"]
     R8 --> R9["R9 · beneficiary == expectedCEA?"]
-    R9 --> LOOP
-    LOOP --> R11["R11 · summed inner value <= forwarded value"]
-    R11 --> OK["VALIDATION_SUCCESS"]
+    R9 --> R11["R11 · entry value <= its allowed maxValue"]
+    R11 --> LOOP
+    LOOP --> OK["VALIDATION_SUCCESS"]
 
     style OK fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
     style R9 fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
@@ -129,12 +148,30 @@ Three of these carry most of the security weight.
 requires it to equal the committed CEA. This is what stops redirection.
 
 **R7 — forbidden inner targets.** An inner call may not target the account itself, the
-policy, or the gateway. The account is the important one: the wallet permits calls from
-itself, so without R7 an agent could route a call back into the wallet and reach
-`installModule`, taking control of the whole account.
+policy, or the gateway. The account is the important one: without R7 an agent could route
+a call back into the wallet and reach `installModule`, taking control of the whole
+account. This is defence-in-depth — SmartSession rejects self-calls upstream and the
+wallet's own authorization rejects them too — and all three layers are kept deliberately.
 
 **R10 — revert recipient.** If the cross-chain transaction fails, funds return to the
 account, never to a third party.
+
+**R5b — the cumulative cap.** `spent` accumulates across the session's lifetime, so an
+agent cannot make repeated individually-legal calls until the wallet is empty. The
+accumulation happens during validation and reverts with the transaction if execution
+later fails. It is written **after every other check passes**, so a failure later in the
+rule set leaves no partial state.
+
+**R12 / R13 — bounding the gas budget.** These close a path the amount caps cannot see.
+The gateway infers the transaction type from the request: with `req.amount == 0` it skips
+the token burn entirely, so `spent` never grows — yet it still takes a protocol fee from
+the Push Chain native value attached to the call. A session key could therefore drain the
+wallet's PC balance through repeated zero-amount calls while every amount cap read as
+untouched.
+
+R13 rejects zero-amount outbounds outright, closing the class. R12 caps the per-call PC
+outflow for the shapes that remain. The two together mean the PC gas budget is bounded in
+both shape and size.
 
 ## 6. Reading the beneficiary
 

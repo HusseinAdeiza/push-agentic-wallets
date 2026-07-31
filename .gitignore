@@ -13,3 +13,4 @@ docs-internal
 # whatever anvil run happened last.
 deployments/*.json
 !deployments/.gitkeep
+DEVIATIONS.md

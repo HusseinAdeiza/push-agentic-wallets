@@ -25,7 +25,14 @@ import {
     MODE_DEFAULT
 } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib, Execution } from "../../src/libraries/ExecutionLib.sol";
-import { MockValidator, StubbornValidator, ReenteringValidator, MockTarget, MockHook, RejectsPC } from "../mocks/Mocks.sol";
+import {
+    MockValidator,
+    StubbornValidator,
+    ReenteringValidator,
+    MockTarget,
+    MockHook,
+    RejectsPC
+} from "../mocks/Mocks.sol";
 
 /// @notice PRD §11.1 — unit tests U-01 … U-23.
 contract PushAgentWalletTest is Test {
@@ -394,6 +401,68 @@ contract PushAgentWalletTest is Test {
         wallet.emergencyRevokeAll(vs);
     }
 
+    // ── U-24 … U-26 — Q8: single-active-hook discipline ───────────────
+
+    /// U-24 — emergencyRevokeAll clears the hook MAPPING, not just the slot, so the
+    /// hook can be reinstalled afterwards.
+    function test_U24_Q8_emergencyRevokeAllClearsHookMapping() public {
+        MockHook hook = new MockHook();
+        vm.startPrank(ownerUEA);
+        wallet.installModule(4, address(hook), "");
+        assertTrue(wallet.isModuleInstalled(4, address(hook), ""));
+
+        address[] memory none = new address[](0);
+        wallet.emergencyRevokeAll(none);
+
+        assertFalse(wallet.isModuleInstalled(4, address(hook), ""), "mapping must be cleared, not just _hook");
+
+        // The previously-orphaning bug made this revert forever.
+        wallet.installModule(4, address(hook), "");
+        vm.stopPrank();
+        assertTrue(wallet.isModuleInstalled(4, address(hook), ""), "hook must be reinstallable");
+    }
+
+    /// U-25 — installing a second hook while one is active is rejected. Silently
+    /// overwriting _hook would orphan the first hook's mapping entry forever.
+    function test_U25_Q8_secondHookRejected() public {
+        MockHook a = new MockHook();
+        MockHook b = new MockHook();
+
+        vm.startPrank(ownerUEA);
+        wallet.installModule(4, address(a), "");
+
+        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.HookAlreadyInstalled.selector, address(a)));
+        wallet.installModule(4, address(b), "");
+        vm.stopPrank();
+
+        assertTrue(wallet.isModuleInstalled(4, address(a), ""));
+        assertFalse(wallet.isModuleInstalled(4, address(b), ""));
+    }
+
+    /// U-26 — explicit uninstall then install leaves no orphan.
+    function test_U26_Q8_uninstallThenInstallSecondHook() public {
+        MockHook a = new MockHook();
+        MockHook b = new MockHook();
+
+        vm.startPrank(ownerUEA);
+        wallet.installModule(4, address(a), "");
+        wallet.uninstallModule(4, address(a), "");
+        wallet.installModule(4, address(b), "");
+        vm.stopPrank();
+
+        assertFalse(wallet.isModuleInstalled(4, address(a), ""), "A must not be orphaned");
+        assertTrue(wallet.isModuleInstalled(4, address(b), ""));
+
+        // B is the active hook.
+        vm.prank(ownerUEA);
+        wallet.execute(
+            ModeLib.encodeSimpleSingle(),
+            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)))
+        );
+        assertEq(b.preCount(), 1, "B is active");
+        assertEq(a.preCount(), 0, "A is not");
+    }
+
     // ── U-20 / A-14 — callValidator ───────────────────────────────────
 
     function test_U20_A14_callValidatorUninstalledReverts() public {
@@ -462,34 +531,47 @@ contract PushAgentWalletTest is Test {
     }
 
     /**
-     * @notice Documents ACTUAL behaviour of the wallet→self call path.
+     * D-3 — self-calls are rejected by AUTHORIZATION, not by the reentrancy guard.
      *
-     * PRD §5.7 states `onlyOwnerOrSelf` permits `address(this)` in order to
-     * "enable batched self-config", and §1.4 Stage B batches installModule /
-     * enableSessions inside a single UEA multicall. However, both `execute` and
-     * `installModule` are `nonReentrant` per §5.10/§5.11, so a wallet→wallet
-     * self-call trips the reentrancy guard and reverts.
+     * The `msg.sender == address(this)` branch was removed: a UEA multicall calls
+     * each target directly, so Stage B config arrives with `msg.sender == UEA` and
+     * never needs the wallet to call itself.
      *
-     * The self-config path specified in §5.7 is therefore NOT reachable as
-     * specified. This is a contradiction inside the PRD, recorded in
-     * DEVIATIONS.md (D-3) rather than silently resolved, because either fix
-     * (dropping nonReentrant, or dropping the self-branch) changes the security
-     * model and is a decision for review.
-     *
-     * ACPActionPolicy R7 (forbidding `to == account`) is retained regardless, as
-     * defence-in-depth: it must not depend on the guard for its safety property.
+     * ACPActionPolicy R7 is retained regardless. A-04 has three independent
+     * defences — SmartSession's InvalidSelfCall, our R7, and this modifier — and
+     * this test pins the third.
      */
-    function test_selfCallIsBlockedByReentrancyGuard() public {
+    function test_D3_selfCallRejectedByAuthorization() public {
         Execution[] memory execs = new Execution[](1);
-        execs[0] = Execution(
-            address(wallet), 0, abi.encodeCall(PushAgentWallet.installModule, (1, address(validator), ""))
-        );
+        execs[0] =
+            Execution(address(wallet), 0, abi.encodeCall(PushAgentWallet.installModule, (1, address(validator), "")));
 
-        vm.expectRevert(); // ReentrancyGuardReentrantCall
+        // The inner self-call bubbles Unauthorized, not ReentrancyGuardReentrantCall.
+        vm.expectRevert(PushWalletErrors.Unauthorized.selector);
         vm.prank(ownerUEA);
         wallet.execute(ModeLib.encodeSimpleBatch(), ExecutionLib.encodeBatch(execs));
 
         assertFalse(wallet.isModuleInstalled(1, address(validator), ""));
+    }
+
+    /// D-3 — the wallet calling itself directly is also rejected.
+    function test_D3_directSelfCallRejected() public {
+        vm.expectRevert(PushWalletErrors.Unauthorized.selector);
+        vm.prank(address(wallet));
+        wallet.installModule(1, address(validator), "");
+    }
+
+    /**
+     * D-3 — Stage B works as a UEA multicall: each entry arrives with
+     * msg.sender == UEA, so config needs no self-call at all.
+     */
+    function test_D3_stageBConfigViaOwnerCallsSucceeds() public {
+        vm.startPrank(ownerUEA);
+        wallet.installModule(1, address(validator), "");
+        wallet.callValidator(address(validator), abi.encodeCall(MockValidator.setValidationData, (0)));
+        vm.stopPrank();
+
+        assertTrue(wallet.isModuleInstalled(1, address(validator), ""));
     }
 
     /// Owner may still configure directly (the path Stage B must use today).

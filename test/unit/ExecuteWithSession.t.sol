@@ -6,7 +6,14 @@ import { Test } from "forge-std/Test.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { AgentWalletFactory } from "../../src/AgentWalletFactory.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
-import { ModeLib, ModeCode, ModePayload, CALLTYPE_SINGLE, EXECTYPE_DEFAULT, MODE_DEFAULT } from "../../src/libraries/ModeLib.sol";
+import {
+    ModeLib,
+    ModeCode,
+    ModePayload,
+    CALLTYPE_SINGLE,
+    EXECTYPE_DEFAULT,
+    MODE_DEFAULT
+} from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib } from "../../src/libraries/ExecutionLib.sol";
 import { MockValidator, MockTarget } from "../mocks/Mocks.sol";
 
@@ -56,14 +63,7 @@ contract ExecuteWithSessionTest is Test {
     ) internal pure returns (bytes32) {
         return keccak256(
             abi.encode(
-                OP_HASH_DOMAIN,
-                chainId,
-                wallet_,
-                validator_,
-                ModeCode.unwrap(mode),
-                keccak256(execCalldata),
-                key,
-                seq
+                OP_HASH_DOMAIN, chainId, wallet_, validator_, ModeCode.unwrap(mode), keccak256(execCalldata), key, seq
             )
         );
     }
@@ -91,7 +91,9 @@ contract ExecuteWithSessionTest is Test {
     // ── S-03 … S-05 — nonces ──────────────────────────────────────────
 
     function test_S03_wrongNonceSeqReverts() public {
-        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.InvalidNonce.selector, uint192(0), uint64(0), uint64(5)));
+        vm.expectRevert(
+            abi.encodeWithSelector(PushWalletErrors.InvalidNonce.selector, uint192(0), uint64(0), uint64(5))
+        );
         wallet.executeWithSession(address(validator), ModeLib.encodeSimpleSingle(), _execCalldata(1), "", 0, 5);
     }
 
@@ -101,7 +103,9 @@ contract ExecuteWithSessionTest is Test {
         wallet.executeWithSession(address(validator), ModeLib.encodeSimpleSingle(), cd, "", 0, 0);
         assertEq(wallet.nonce(0), 1);
 
-        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.InvalidNonce.selector, uint192(0), uint64(1), uint64(0)));
+        vm.expectRevert(
+            abi.encodeWithSelector(PushWalletErrors.InvalidNonce.selector, uint192(0), uint64(1), uint64(0))
+        );
         wallet.executeWithSession(address(validator), ModeLib.encodeSimpleSingle(), cd, "", 0, 0);
     }
 
@@ -239,7 +243,8 @@ contract ExecuteWithSessionTest is Test {
         bytes32 h1 = validator.lastOpHash();
 
         // Same call type/exec type but a different mode payload → different hash.
-        ModeCode other = ModeLib.encode(CALLTYPE_SINGLE, EXECTYPE_DEFAULT, MODE_DEFAULT, ModePayload.wrap(bytes22(uint176(1))));
+        ModeCode other =
+            ModeLib.encode(CALLTYPE_SINGLE, EXECTYPE_DEFAULT, MODE_DEFAULT, ModePayload.wrap(bytes22(uint176(1))));
         wallet.executeWithSession(address(validator), other, cd, "", 0, 1);
 
         assertTrue(validator.lastOpHash() != h1, "mode must be bound");

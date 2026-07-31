@@ -63,11 +63,11 @@ contract ACPActionPolicyTest is Test {
     function _defaultAllowedCalls() internal view returns (AllowedCall[] memory calls) {
         calls = new AllowedCall[](3);
         // Aave v3 supply(address,uint256,address,uint16) — onBehalfOf at offset 68
-        calls[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 68, true);
+        calls[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 68, true, 0);
         // Morpho Blue supply(MarketParams,uint256,uint256,address,bytes) — onBehalf at 228
-        calls[1] = AllowedCall(morpho, IMorphoBlue.supply.selector, 228, true);
+        calls[1] = AllowedCall(morpho, IMorphoBlue.supply.selector, 228, true, 0);
         // ERC-20 approve — no beneficiary
-        calls[2] = AllowedCall(usdc, IERC20Like.approve.selector, 0, false);
+        calls[2] = AllowedCall(usdc, IERC20Like.approve.selector, 0, false, 0);
     }
 
     function _initConfig() internal {
@@ -77,6 +77,9 @@ contract ACPActionPolicyTest is Test {
             expectedCEA: expectedCEA,
             asset: asset,
             maxAmountPerCall: MAX_AMOUNT,
+            maxAmountTotal: type(uint256).max,
+            maxPCPerCall: type(uint256).max,
+            spent: 0,
             allowedCalls: _defaultAllowedCalls()
         });
         // Encode BEFORE pranking: argument evaluation makes calls of its own, which
@@ -159,7 +162,7 @@ contract ACPActionPolicyTest is Test {
 
     function test_P02_initializeOverwritesExistingConfig() public {
         AllowedCall[] memory one = new AllowedCall[](1);
-        one[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 68, true);
+        one[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 68, true, 0);
 
         Config memory cfg = Config({
             initialized: false,
@@ -167,6 +170,9 @@ contract ACPActionPolicyTest is Test {
             expectedCEA: address(0xBEEF),
             asset: address(0xFEED),
             maxAmountPerCall: 1,
+            maxAmountTotal: type(uint256).max,
+            maxPCPerCall: type(uint256).max,
+            spent: 0,
             allowedCalls: one
         });
         bytes memory initData2 = abi.encode(cfg);
@@ -179,6 +185,9 @@ contract ACPActionPolicyTest is Test {
             address cea,
             address a,
             uint256 maxAmt,
+            uint256 maxTotal,
+            uint256 maxPC,
+            uint256 spentSoFar,
             AllowedCall[] memory allowed
         ) = policy.getConfig(cfgId, smartSession, account);
 
@@ -187,6 +196,8 @@ contract ACPActionPolicyTest is Test {
         assertEq(cea, address(0xBEEF));
         assertEq(a, address(0xFEED));
         assertEq(maxAmt, 1);
+        assertEq(maxTotal, type(uint256).max, "cumulative ceiling must be stored");
+        assertEq(spentSoFar, 0, "spent must reset on overwrite");
         assertEq(allowed.length, 1, "allowlist must be replaced, not appended");
     }
 
@@ -364,36 +375,277 @@ contract ACPActionPolicyTest is Test {
         policy.checkAction(cfgId, account, gateway, 0, d);
     }
 
-    // ── P-15 — R11 ────────────────────────────────────────────────────
+    // ── P-15 — R11: per-call native value ceiling ─────────────────────
 
-    function test_P15_R11_valueOverspendReverts() public {
+    /// R11 — an entry whose value exceeds its allowlisted maxValue is rejected.
+    /// v1 entries all carry maxValue = 0, so ANY native value is refused.
+    function test_P15_R11_innerValueAboveAllowanceReverts() public {
         Multicall[] memory calls = new Multicall[](1);
         calls[0] = Multicall(aavePool, 5 ether, _aaveSupply(expectedCEA));
 
-        bytes memory d = _data(_request(_multicallPayload(calls)));
-        vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.ValueOverspend.selector, 5 ether, 1 ether));
+        bytes memory d = _encode(calls);
+        vm.expectRevert(
+            abi.encodeWithSelector(ACPActionPolicy.InnerValueExceedsAllowance.selector, uint256(0), 5 ether, uint256(0))
+        );
+        _call(d);
+    }
+
+    /// R11 — zero value against a maxValue of zero is fine (the v1 shape).
+    function test_P15b_zeroInnerValuePasses() public {
+        assertEq(_check(_validCalls()), 0);
+    }
+
+    /// R11 — the ceiling is PER ENTRY, so the offending index is reported.
+    function test_P15c_secondEntryValueReported() public {
+        Multicall[] memory calls = new Multicall[](2);
+        calls[0] = Multicall(usdc, 0, abi.encodeCall(IERC20Like.approve, (aavePool, 100e6)));
+        calls[1] = Multicall(aavePool, 1 ether, _aaveSupply(expectedCEA));
+
+        bytes memory d = _encode(calls);
+        vm.expectRevert(
+            abi.encodeWithSelector(ACPActionPolicy.InnerValueExceedsAllowance.selector, uint256(1), 1 ether, uint256(0))
+        );
+        _call(d);
+    }
+
+    /// R11 — a payable target configured with a non-zero maxValue is permitted up
+    /// to that ceiling. This is the CEA-attestation-callback shape.
+    function test_P15d_valueWithinConfiguredAllowancePasses() public {
+        AllowedCall[] memory allowed = new AllowedCall[](1);
+        allowed[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 68, true, 2 ether);
+
+        Config memory cfg = Config({
+            initialized: false,
+            destChainHash: keccak256("eip155:1"),
+            expectedCEA: expectedCEA,
+            asset: asset,
+            maxAmountPerCall: MAX_AMOUNT,
+            maxAmountTotal: type(uint256).max,
+            maxPCPerCall: type(uint256).max,
+            spent: 0,
+            allowedCalls: allowed
+        });
+        bytes memory initData = abi.encode(cfg);
+        vm.prank(smartSession);
+        policy.initializeWithMultiplexer(account, cfgId, initData);
+
+        Multicall[] memory calls = new Multicall[](1);
+        calls[0] = Multicall(aavePool, 2 ether, _aaveSupply(expectedCEA));
+        assertEq(_check(calls), 0, "value at the ceiling is allowed");
+
+        Multicall[] memory over = new Multicall[](1);
+        over[0] = Multicall(aavePool, 2 ether + 1, _aaveSupply(expectedCEA));
+        bytes memory d = _encode(over);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                ACPActionPolicy.InnerValueExceedsAllowance.selector, uint256(0), 2 ether + 1, 2 ether
+            )
+        );
+        _call(d);
+    }
+
+    // ── P-21 … P-23 — C-2: cumulative spend cap ───────────────────────
+
+    /// Re-configure with an explicit cumulative ceiling.
+    function _initWithTotal(uint256 perCall, uint256 total) internal {
+        Config memory cfg = Config({
+            initialized: false,
+            destChainHash: keccak256("eip155:1"),
+            expectedCEA: expectedCEA,
+            asset: asset,
+            maxAmountPerCall: perCall,
+            maxAmountTotal: total,
+            maxPCPerCall: type(uint256).max,
+            spent: 0,
+            allowedCalls: _defaultAllowedCalls()
+        });
+        bytes memory initData = abi.encode(cfg);
+        vm.prank(smartSession);
+        policy.initializeWithMultiplexer(account, cfgId, initData);
+    }
+
+    function _spend(uint256 amount) internal view returns (bytes memory) {
+        UniversalOutboundTxRequest memory req = _request(_multicallPayload(_validCalls()));
+        req.amount = amount;
+        return _data(req);
+    }
+
+    /**
+     * P-21 / C-2 — N calls each within maxAmountPerCall but collectively over
+     * maxAmountTotal: the call that crosses the line reverts.
+     *
+     * Before this fix R5 was a PER-CALL ceiling only, so a compromised session key
+     * could drain the wallet in repeated in-cap calls.
+     */
+    function test_P21_C2_cumulativeCapBlocksRepeatedInCapCalls() public {
+        _initWithTotal(100e6, 250e6);
+
+        _call(_spend(100e6)); // 100 total
+        _call(_spend(100e6)); // 200 total
+
+        // Third call is individually legal but takes the total to 300 > 250.
+        bytes memory d = _spend(100e6);
+        vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.TotalSpendCapExceeded.selector, 300e6, 250e6));
+        _call(d);
+    }
+
+    /// P-22 — spending exactly to the ceiling succeeds; the next call reverts.
+    function test_P22_C2_exactCeilingThenReject() public {
+        _initWithTotal(100e6, 200e6);
+
+        _call(_spend(100e6));
+        _call(_spend(100e6)); // exactly at the cap
+
+        (,,,,,,, uint256 spentSoFar,) = policy.getConfig(cfgId, smartSession, account);
+        assertEq(spentSoFar, 200e6, "spent must track exactly");
+
+        bytes memory d = _spend(1);
+        vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.TotalSpendCapExceeded.selector, 200e6 + 1, 200e6));
+        _call(d);
+    }
+
+    /// P-23 — re-initialization RESETS spent (a fresh grant by the owner).
+    function test_P23_C2_reinitializationResetsSpent() public {
+        _initWithTotal(100e6, 200e6);
+        _call(_spend(100e6));
+
+        (,,,,,,, uint256 before,) = policy.getConfig(cfgId, smartSession, account);
+        assertEq(before, 100e6);
+
+        _initWithTotal(100e6, 200e6); // fresh grant
+
+        (,,,,,,, uint256 afterReset,) = policy.getConfig(cfgId, smartSession, account);
+        assertEq(afterReset, 0, "spent must reset on re-initialization");
+
+        // Full budget is available again.
+        _call(_spend(100e6));
+        _call(_spend(100e6));
+    }
+
+    /// P-23b — a supplied non-zero `spent` in initData is ignored, never trusted.
+    function test_P23b_C2_suppliedSpentIsIgnored() public {
+        Config memory cfg = Config({
+            initialized: false,
+            destChainHash: keccak256("eip155:1"),
+            expectedCEA: expectedCEA,
+            asset: asset,
+            maxAmountPerCall: 100e6,
+            maxAmountTotal: 200e6,
+            maxPCPerCall: type(uint256).max,
+            spent: 199e6, // attacker-ish value
+            allowedCalls: _defaultAllowedCalls()
+        });
+        bytes memory initData = abi.encode(cfg);
+        vm.prank(smartSession);
+        policy.initializeWithMultiplexer(account, cfgId, initData);
+
+        (,,,,,,, uint256 spentSoFar,) = policy.getConfig(cfgId, smartSession, account);
+        assertEq(spentSoFar, 0, "supplied spent must be ignored");
+    }
+
+    /// P-24 — the per-call ceiling still applies independently of the total.
+    function test_P24_perCallCeilingStillEnforced() public {
+        _initWithTotal(50e6, 1000e6);
+
+        bytes memory d = _spend(51e6);
+        vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.AmountExceedsCap.selector, 51e6, 50e6));
+        _call(d);
+    }
+
+    // ── P-25 … P-27 — R12/R13: Push Chain native value ────────────────
+
+    /// Config with an explicit PC ceiling on the outer gateway call.
+    function _initWithPCCap(uint256 pcCap) internal {
+        Config memory cfg = Config({
+            initialized: false,
+            destChainHash: keccak256("eip155:1"),
+            expectedCEA: expectedCEA,
+            asset: asset,
+            maxAmountPerCall: MAX_AMOUNT,
+            maxAmountTotal: type(uint256).max,
+            maxPCPerCall: pcCap,
+            spent: 0,
+            allowedCalls: _defaultAllowedCalls()
+        });
+        bytes memory initData = abi.encode(cfg);
+        vm.prank(smartSession);
+        policy.initializeWithMultiplexer(account, cfgId, initData);
+    }
+
+    /// P-25 / R12 — forwarding more Push Chain PC than the ceiling is rejected.
+    function test_P25_R12_pcValueAboveCapReverts() public {
+        _initWithPCCap(1 ether);
+
+        bytes memory d = _data(_request(_multicallPayload(_validCalls())));
+        vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.PCValueExceedsCap.selector, 2 ether, 1 ether));
+        vm.prank(smartSession);
+        policy.checkAction(cfgId, account, gateway, 2 ether, d);
+    }
+
+    /// P-26 / R12 — value exactly at the ceiling passes.
+    function test_P26_R12_pcValueAtCapPasses() public {
+        _initWithPCCap(1 ether);
+
+        bytes memory d = _data(_request(_multicallPayload(_validCalls())));
+        vm.prank(smartSession);
+        assertEq(policy.checkAction(cfgId, account, gateway, 1 ether, d), 0);
+    }
+
+    /**
+     * P-27 — THE ATTACK, demonstrated blocked.
+     *
+     * A compromised session key could drain the wallet's PC balance with repeated
+     * outbounds carrying `req.amount = 0`:
+     *   - amount 0 makes the gateway infer TX_TYPE.GAS_AND_PAYLOAD and SKIP
+     *     `_burnPRC20`, so `spent` never grows and the cumulative cap is blind;
+     *   - every inner entry has value 0, so `AllowedCall.maxValue` passes;
+     *   - the outer `value` carries the whole PC balance, and the gateway takes
+     *     `protocolFee` from it unconditionally.
+     *
+     * R13 rejects the shape outright; R12 caps the outflow for the shapes that remain.
+     */
+    function test_P27_zeroAmountDrainBlocked() public {
+        _initWithPCCap(1 ether);
+
+        UniversalOutboundTxRequest memory req = _request(_multicallPayload(_validCalls()));
+        req.amount = 0; // the drain shape
+
+        bytes memory d = _data(req);
+        vm.expectRevert(ACPActionPolicy.ZeroAmountNotPermitted.selector);
         vm.prank(smartSession);
         policy.checkAction(cfgId, account, gateway, 1 ether, d);
     }
 
-    function test_P15b_valueWithinBudgetPasses() public {
-        Multicall[] memory calls = new Multicall[](1);
-        calls[0] = Multicall(aavePool, 1 ether, _aaveSupply(expectedCEA));
+    /// P-27b — even were the amount non-zero, R12 bounds the per-call PC outflow, so
+    /// the drain cannot be scaled up through the value field either.
+    function test_P27b_pcOutflowBoundedIndependentlyOfAmount() public {
+        _initWithPCCap(0.1 ether);
 
-        bytes memory d = _data(_request(_multicallPayload(calls)));
+        UniversalOutboundTxRequest memory req = _request(_multicallPayload(_validCalls()));
+        req.amount = 1; // minimal, so the amount caps barely move
+
+        bytes memory d = _data(req);
+        vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.PCValueExceedsCap.selector, 5 ether, 0.1 ether));
         vm.prank(smartSession);
-        assertEq(policy.checkAction(cfgId, account, gateway, 2 ether, d), 0);
+        policy.checkAction(cfgId, account, gateway, 5 ether, d);
     }
 
-    function test_P15c_summedValueAcrossEntriesEnforced() public {
-        Multicall[] memory calls = new Multicall[](2);
-        calls[0] = Multicall(aavePool, 1 ether, _aaveSupply(expectedCEA));
-        calls[1] = Multicall(usdc, 1 ether, abi.encodeCall(IERC20Like.approve, (aavePool, 1)));
+    /// 2.2 — no state is written when a later check fails: `spent` is untouched.
+    function test_P28_spentUnchangedWhenLaterCheckFails() public {
+        _initWithTotal(100e6, 1000e6);
 
-        bytes memory d = _data(_request(_multicallPayload(calls)));
-        vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.ValueOverspend.selector, 2 ether, 1.5 ether));
+        // Passes the amount checks, fails R10 (wrong revertRecipient).
+        UniversalOutboundTxRequest memory req = _request(_multicallPayload(_validCalls()));
+        req.amount = 50e6;
+        req.revertRecipient = address(0xBAD);
+
+        bytes memory d = _data(req);
+        vm.expectRevert();
         vm.prank(smartSession);
-        policy.checkAction(cfgId, account, gateway, 1.5 ether, d);
+        policy.checkAction(cfgId, account, gateway, 0, d);
+
+        (,,,,,,, uint256 spentSoFar,) = policy.getConfig(cfgId, smartSession, account);
+        assertEq(spentSoFar, 0, "effects must not land before all checks pass");
     }
 
     // ── P-16 / P-17 — malformed inner calldata ────────────────────────
@@ -411,7 +663,7 @@ contract ACPActionPolicyTest is Test {
     function test_P17_A12_beneficiaryOffsetOutOfBoundsReverts() public {
         // Allowlist an entry whose offset points past the end of a short blob.
         AllowedCall[] memory allowed = new AllowedCall[](1);
-        allowed[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 60_000, true);
+        allowed[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 60_000, true, 0);
 
         Config memory cfg = Config({
             initialized: false,
@@ -419,6 +671,9 @@ contract ACPActionPolicyTest is Test {
             expectedCEA: expectedCEA,
             asset: asset,
             maxAmountPerCall: MAX_AMOUNT,
+            maxAmountTotal: type(uint256).max,
+            maxPCPerCall: type(uint256).max,
+            spent: 0,
             allowedCalls: allowed
         });
         bytes memory initData3 = abi.encode(cfg);

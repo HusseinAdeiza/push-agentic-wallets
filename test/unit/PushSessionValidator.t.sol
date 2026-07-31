@@ -130,6 +130,43 @@ contract PushSessionValidatorTest is Test {
         validator.validateSignatureWithData(hash, sig, _ed25519Config(pubKey));
     }
 
+    /**
+     * V-12 — REGRESSION GUARD for C-1. Must not use vm.etch.
+     *
+     * A precompile has NO bytecode. A high-level interface call inserts an
+     * `extcodesize(target) > 0` check and reverts when the target is empty, so the
+     * Ed25519 path was non-functional on the real chain while every mocked test
+     * passed. The mock did not merely fail to prove the real path — it masked the bug.
+     *
+     * With the raw staticcall, an empty target must FAIL CLOSED (return false),
+     * never revert. This test fails against the pre-fix implementation.
+     */
+    function test_V12_C1_ed25519FailsClosedWhenUSVHasNoCode() public {
+        // setUp() etches a mock at USV for the rest of the suite. Strip it here to
+        // reproduce the real-chain condition: a precompile address with no bytecode.
+        PushSessionValidator fresh = new PushSessionValidator();
+        address usvAddr = fresh.USV();
+        vm.etch(usvAddr, "");
+
+        uint256 codeLen;
+        assembly {
+            codeLen := extcodesize(usvAddr)
+        }
+        assertEq(codeLen, 0, "precondition: USV must have no code for this test to mean anything");
+
+        bool result =
+            fresh.validateSignatureWithData(keccak256("op"), new bytes(64), _ed25519Config(keccak256("pubkey")));
+        assertFalse(result, "must fail closed, not revert");
+    }
+
+    /// V-12b — the ECDSA path is unaffected by USV having no code.
+    function test_V12b_ecdsaUnaffectedByMissingUSV() public {
+        PushSessionValidator fresh = new PushSessionValidator();
+        bytes32 hash = keccak256("op");
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(signerPk, hash);
+        assertTrue(fresh.validateSignatureWithData(hash, abi.encodePacked(r, s, v), _ecdsaConfig(signer)));
+    }
+
     // ── V-09 / V-10 ───────────────────────────────────────────────────
 
     function test_V09_unknownSchemeReverts() public {
