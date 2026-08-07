@@ -19,7 +19,17 @@ contract ContractSizeTest is Test {
     }
 
     function test_ourContractsFitUnderEIP170() public {
-        assertLt(_size(address(new PushAgentWallet())), EIP170_LIMIT, "PushAgentWallet");
+        assertLt(
+            _size(
+                address(
+                    new PushAgentWallet(
+                        address(0x5511), address(0x6A7E), address(0xAC90), address(0x71FE), address(0x0A11)
+                    )
+                )
+            ),
+            EIP170_LIMIT,
+            "PushAgentWallet"
+        );
         assertLt(_size(address(new AgentWalletFactory(address(0x1)))), EIP170_LIMIT, "AgentWalletFactory");
         assertLt(_size(address(new PushSessionValidator())), EIP170_LIMIT, "PushSessionValidator");
         assertLt(_size(address(new ACPActionPolicy(address(0x1)))), EIP170_LIMIT, "ACPActionPolicy");

@@ -88,15 +88,21 @@ contract SpendingLimitTest is Test {
     function setUp() public {
         provKey = vm.addr(provKeyPk);
 
-        PushAgentWallet impl = new PushAgentWallet();
-        factory = new AgentWalletFactory(address(impl));
         smartSession = new SmartSession();
         sessionValidator = new PushSessionValidator();
         spendPolicy = new ERC20SpendingLimitPolicy();
         token = new TestToken();
 
+        // This suite exercises ERC20SpendingLimitPolicy in ISOLATION (§0.2: it is NOT in
+        // the live session path), and grants via callValidator rather than grantMandate.
+        // The gateway/ACP/TimeFrame/ValueLimit immutables are therefore placeholders.
+        PushAgentWallet impl = new PushAgentWallet(
+            address(smartSession), address(0x6A7E), address(0xAC90), address(0x71FE), address(0x0A11)
+        );
+        factory = new AgentWalletFactory(address(impl));
+
         vm.prank(ownerUEA);
-        wallet = PushAgentWallet(payable(factory.deployAgentWallet(keccak256("spend"))));
+        wallet = PushAgentWallet(payable(factory.deployAgentWallet(address(0))));
         token.mint(address(wallet), 1000e6);
     }
 

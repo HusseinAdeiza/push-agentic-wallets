@@ -10,8 +10,7 @@
 
 It holds no funds, has no admin, and exposes no configuration. The wallet implementation
 address is fixed at construction and can never change. Beyond deployment it keeps one
-piece of state: a registry mapping `(owner, mandateId)` to the wallet that was created for
-it.
+piece of state: a registry mapping each `owner` to the one wallet created for them.
 
 It is the smallest contract in the system, and that is deliberate — a factory with admin
 powers would be a permanent lever over every wallet it ever created.
@@ -26,21 +25,29 @@ never be added — it would let an attacker deploy a wallet on a user's behalf, 
 pointing at an implementation the user never chose.
 
 **Addresses are known before deployment.** Because deployment is `CREATE2` with a salt
-derived from `(owner, mandateId)`, the address can be computed in advance. This is what
-makes the whole inbound flow work as a single signed payload: the SDK computes where the
-wallet *will* be, then builds one transaction that deploys it, configures it, and funds it.
+derived from `owner` alone, the address can be computed in advance. This is what makes the
+whole inbound flow work as a single signed payload: the SDK computes where the wallet *will*
+be, then builds one transaction that deploys it, configures it, and funds it.
 
-**One wallet per mandate.** The salt includes `mandateId`, so each mandate gets a separate
-account with separate funds and its own CEA on the destination chain.
+**One wallet per owner, for life.** The salt is `keccak256(abi.encode(owner))` with no
+mandate input, so a user's wallet address — and therefore their CEA on every external chain —
+is fixed permanently. Mandates are sessions inside that one wallet.
+
+**Deployment is idempotent.** A repeat call returns the existing wallet instead of reverting.
+A duplicate deploy can damage nothing, whereas a revert inside the atomic setup multicall
+would fail an otherwise benign grant.
+
+**The guardian is not in the salt.** It is passed to `deployAgentWallet` and stored, so the
+owner can rotate it later without moving the wallet address.
 
 ## 3. Role in the system
 
 ```mermaid
 graph TB
-    UEA["User's UEA<br/>(the caller)"] -->|"deployAgentWallet(mandateId)"| F["AgentWalletFactory"]
-    F -->|"cloneDeterministic(salt)"| W["PushAgentWallet clone"]
-    F -->|"initialize(msg.sender)"| W
-    F -->|"records"| REG["walletOf[owner][mandateId]"]
+    UEA["User's UEA<br/>(the caller)"] -->|"deployAgentWallet(guardian)"| F["AgentWalletFactory"]
+    F -->|"cloneDeterministic(keccak256(owner))"| W["PushAgentWallet clone"]
+    F -->|"initialize(msg.sender, guardian)"| W
+    F -->|"records"| REG["walletOf[owner]"]
     IMPL["implementation<br/>(immutable, set at construction)"] -.->|"clones delegate to"| W
 
     style F fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
@@ -50,11 +57,12 @@ graph TB
 ## 4. Address derivation
 
 ```
-salt    = keccak256(abi.encode(owner, mandateId))
+salt    = keccak256(abi.encode(owner))
 address = CREATE2(factory, salt, EIP-1167 proxy bytecode for implementation)
 ```
 
-Both inputs matter. Changing either produces a completely different address:
+The owner is the only input. Two different owners get two different addresses; the same
+owner always resolves to the same one:
 
 ```mermaid
 graph LR
@@ -90,17 +98,17 @@ sequenceDiagram
     participant F as AgentWalletFactory
     participant W as New clone
 
-    U->>F: deployAgentWallet(mandateId)
+    U->>F: deployAgentWallet(guardian)
 
-    Note over F: already deployed for this pair?
+    Note over F: already deployed for this owner?
     alt already exists
-        F-->>U: revert WalletAlreadyDeployed
+        F-->>U: the existing wallet (idempotent, no event)
     else fresh
-        Note over F: salt = keccak256(owner, mandateId)
+        Note over F: salt = keccak256(owner)
         F->>W: cloneDeterministic(salt)
-        F->>W: initialize(msg.sender)
+        F->>W: initialize(msg.sender, guardian)
         Note over W: owner set permanently
-        Note over F: walletOf[owner][mandateId] = wallet
+        Note over F: walletOf[owner] = wallet
         F-->>U: wallet address
     end
 ```
@@ -123,7 +131,7 @@ sequenceDiagram
     participant Chain as Push Chain
 
     Note over SDK: before anything is deployed
-    SDK->>F: computeAgentWallet(owner, mandateId)
+    SDK->>F: computeAgentWallet(owner)
     F-->>SDK: 0xbobagw (does not exist yet)
 
     Note over SDK: build ONE payload that:<br/>deploys · configures · funds 0xbobagw
@@ -138,13 +146,12 @@ have to sign twice.
 ## 7. The registry
 
 ```solidity
-mapping(address owner => mapping(bytes32 mandateId => address wallet)) public walletOf;
+mapping(address owner => address wallet) public walletOf;
 ```
 
-Two purposes. It makes deployment idempotent-by-rejection — a repeat call for the same
-pair reverts with `WalletAlreadyDeployed` and reports the existing address, rather than
-failing opaquely at the `CREATE2` level. And it gives off-chain consumers a direct lookup
-without needing to replay the address derivation.
+Two purposes. It makes deployment **idempotent**: a repeat call reads this map, returns the
+existing wallet and stops, rather than failing opaquely at the `CREATE2` level. And it gives
+off-chain consumers a direct lookup without replaying the address derivation.
 
 `isDeployed` is the convenience predicate over the same map.
 
@@ -152,18 +159,17 @@ without needing to replay the address derivation.
 
 | Function | Access | Purpose |
 |---|---|---|
-| `deployAgentWallet(bytes32 mandateId)` | anyone; caller **is** the owner | Deploy and initialize a wallet |
-| `computeAgentWallet(address owner, bytes32 mandateId)` | view | Predict the address before deployment |
-| `isDeployed(address owner, bytes32 mandateId)` | view | Whether that pair has a wallet |
-| `walletOf(address owner, bytes32 mandateId)` | view | The wallet address, or zero |
+| `deployAgentWallet(address guardian)` | anyone; caller **is** the owner | Deploy and initialize a wallet, or return the existing one |
+| `computeAgentWallet(address owner)` | view | Predict the address before deployment |
+| `isDeployed(address owner)` | view | Whether that owner has a wallet |
+| `walletOf(address owner)` | view | The wallet address, or zero |
 | `WALLET_IMPLEMENTATION()` | view | The immutable implementation |
 
 ### Events and errors
 
 | Name | Meaning |
 |---|---|
-| `AgentWalletDeployed(wallet, owner, mandateId)` | A wallet was created |
-| `WalletAlreadyDeployed(owner, mandateId, existing)` | That pair already has a wallet |
+| `AgentWalletDeployed(wallet, owner)` | A wallet was created. Emitted once ever, per owner |
 | `ZeroAddress` | Construction was attempted with a zero implementation |
 
 ## 9. Operational notes

@@ -41,6 +41,7 @@ contract PushAgentWalletTest is Test {
     PushAgentWallet internal wallet;
 
     address internal ownerUEA = address(0xB0B);
+    address internal guardian = address(0x6DA);
     address internal stranger = address(0xBAD);
     bytes32 internal mandateId = keccak256("mandate-1");
 
@@ -54,10 +55,10 @@ contract PushAgentWalletTest is Test {
     event EmergencyRevokeAll(address indexed caller);
 
     function setUp() public {
-        impl = new PushAgentWallet();
+        impl = _newImpl();
         factory = new AgentWalletFactory(address(impl));
         vm.prank(ownerUEA);
-        wallet = PushAgentWallet(payable(factory.deployAgentWallet(mandateId)));
+        wallet = PushAgentWallet(payable(factory.deployAgentWallet(guardian)));
 
         validator = new MockValidator();
         target = new MockTarget();
@@ -68,21 +69,107 @@ contract PushAgentWalletTest is Test {
     function test_U01_initializeSetsOwner_secondCallReverts() public {
         assertEq(wallet.owner(), ownerUEA);
         vm.expectRevert(PushWalletErrors.AlreadyInitialized.selector);
-        wallet.initialize(address(0xdead));
+        wallet.initialize(address(0xdead), address(0));
     }
 
     function test_U02_initializeZeroAddressReverts() public {
-        PushAgentWallet fresh = new PushAgentWallet();
+        PushAgentWallet fresh = _newImpl();
         vm.expectRevert(PushWalletErrors.ZeroAddress.selector);
-        fresh.initialize(address(0));
+        fresh.initialize(address(0), address(0));
     }
 
     function test_U01b_initializeEmitsEvent() public {
-        PushAgentWallet fresh = new PushAgentWallet();
+        PushAgentWallet fresh = _newImpl();
         vm.expectEmit(true, false, false, true);
         emit WalletInitialized(ownerUEA);
-        fresh.initialize(ownerUEA);
+        fresh.initialize(ownerUEA, guardian);
         assertEq(fresh.owner(), ownerUEA);
+        assertEq(fresh.guardian(), guardian, "guardian set at initialize");
+    }
+
+    // ── T-06 / T-07 / T-08 — v2 constructor immutables (PRD Step 3) ───
+
+    /**
+     * T-06 — every immutable getter returns its own constructor argument.
+     *
+     * Deliberately uses five DISTINCT addresses, so this catches a transposition (two
+     * arguments swapped) and not merely a zero. That matters because these five values are
+     * what make the grant guards tamper-proof: `_requireSafeActions` compares action
+     * targets and policies against `SMART_SESSION`, `UNIVERSAL_GATEWAY_PC`,
+     * `ACP_ACTION_POLICY` and `VALUE_LIMIT_POLICY`, and `_requireBoundedSession` compares
+     * against `TIMEFRAME_POLICY`. A swapped pair would leave G2/G3a/G3b comparing against
+     * the wrong contract and silently passing sessions they should reject.
+     *
+     * They are immutables rather than storage precisely so no later write can redefine
+     * what "safe session" means.
+     */
+    function test_T06_immutableGettersReturnConstructorArguments() public {
+        address ss = address(0xAAA1);
+        address gw = address(0xAAA2);
+        address acp = address(0xAAA3);
+        address tf = address(0xAAA4);
+        address vl = address(0xAAA5);
+
+        PushAgentWallet w = new PushAgentWallet(ss, gw, acp, tf, vl);
+
+        assertEq(w.SMART_SESSION(), ss, "SMART_SESSION");
+        assertEq(w.UNIVERSAL_GATEWAY_PC(), gw, "UNIVERSAL_GATEWAY_PC");
+        assertEq(w.ACP_ACTION_POLICY(), acp, "ACP_ACTION_POLICY");
+        assertEq(w.TIMEFRAME_POLICY(), tf, "TIMEFRAME_POLICY");
+        assertEq(w.VALUE_LIMIT_POLICY(), vl, "VALUE_LIMIT_POLICY");
+    }
+
+    /// @dev Clones share the implementation's immutables, because immutables live in the
+    ///      implementation's code rather than in storage. This is what lets one deployed
+    ///      implementation serve every user's wallet with identical, unrewritable guards.
+    function test_T06b_clonesInheritTheImplementationImmutables() public view {
+        assertEq(wallet.SMART_SESSION(), impl.SMART_SESSION());
+        assertEq(wallet.UNIVERSAL_GATEWAY_PC(), impl.UNIVERSAL_GATEWAY_PC());
+        assertEq(wallet.ACP_ACTION_POLICY(), impl.ACP_ACTION_POLICY());
+        assertEq(wallet.TIMEFRAME_POLICY(), impl.TIMEFRAME_POLICY());
+        assertEq(wallet.VALUE_LIMIT_POLICY(), impl.VALUE_LIMIT_POLICY());
+    }
+
+    /**
+     * T-07 — a zero address in ANY of the five constructor positions reverts.
+     *
+     * Tested position by position rather than in aggregate: a single all-zero case would
+     * pass even if only the first check existed, leaving the other four unguarded.
+     */
+    function test_T07_zeroAddressInAnyConstructorPositionReverts() public {
+        address ok1 = address(0xAAA1);
+
+        vm.expectRevert(PushWalletErrors.ZeroAddress.selector);
+        new PushAgentWallet(address(0), ok1, ok1, ok1, ok1);
+
+        vm.expectRevert(PushWalletErrors.ZeroAddress.selector);
+        new PushAgentWallet(ok1, address(0), ok1, ok1, ok1);
+
+        vm.expectRevert(PushWalletErrors.ZeroAddress.selector);
+        new PushAgentWallet(ok1, ok1, address(0), ok1, ok1);
+
+        vm.expectRevert(PushWalletErrors.ZeroAddress.selector);
+        new PushAgentWallet(ok1, ok1, ok1, address(0), ok1);
+
+        vm.expectRevert(PushWalletErrors.ZeroAddress.selector);
+        new PushAgentWallet(ok1, ok1, ok1, ok1, address(0));
+    }
+
+    /// @dev T-08 — `initialize` with a zero guardian succeeds and leaves the guardian unset.
+    ///      No guardian is a valid configuration: `onlyGuardian` compares against
+    ///      `msg.sender`, which can never be address(0), so every guardian entrypoint is
+    ///      inert until the owner sets one via `setGuardian`.
+    function test_T08_initializeWithZeroGuardianSucceeds() public {
+        PushAgentWallet fresh = _newImpl();
+        fresh.initialize(ownerUEA, address(0));
+
+        assertEq(fresh.owner(), ownerUEA);
+        assertEq(fresh.guardian(), address(0), "guardian deliberately unset");
+        assertFalse(fresh.sessionsPaused(), "sessions start unpaused");
+
+        vm.expectRevert(PushWalletErrors.NotGuardian.selector);
+        vm.prank(ownerUEA);
+        fresh.guardianPause();
     }
 
     // ── U-03 / U-04 / U-05 — account config ───────────────────────────
@@ -579,5 +666,11 @@ contract PushAgentWalletTest is Test {
         vm.prank(ownerUEA);
         wallet.installModule(1, address(validator), "");
         assertTrue(wallet.isModuleInstalled(1, address(validator), ""));
+    }
+
+    /// @dev v2 constructor takes five module addresses. This suite tests the wallet's own
+    ///      surface, not the session path, so placeholders suffice.
+    function _newImpl() internal returns (PushAgentWallet) {
+        return new PushAgentWallet(address(0x5511), address(0x6A7E), address(0xAC90), address(0x71FE), address(0x0A11));
     }
 }

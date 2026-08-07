@@ -3,7 +3,7 @@ pragma solidity 0.8.26;
 
 import { PackedUserOperation } from "account-abstraction/interfaces/PackedUserOperation.sol";
 import { IERC7579Module, IERC7579Validator, IERC7579Hook } from "../../src/interfaces/IERC7579Module.sol";
-import { UniversalOutboundTxRequest } from "../../src/libraries/PushWalletTypes.sol";
+import { UniversalOutboundTxRequest, Multicall, MULTICALL_SELECTOR } from "../../src/libraries/PushWalletTypes.sol";
 
 /// @notice Validator that returns a caller-controlled ValidationData word.
 contract MockValidator is IERC7579Validator {
@@ -201,4 +201,100 @@ contract RejectsPC {
     receive() external payable {
         revert("no pc");
     }
+}
+
+/**
+ * @notice Faithful mirror of the FROZEN `CEA` execution paths, for T-54.
+ *
+ * @dev MIRRORS: push-chain-core-contracts/src/cea/CEA.sol
+ *        - `_handleExecution`   lines 164-179  (three-way branch)
+ *        - `_handleMulticall`   lines 188-215  (incl. the value-0 self-call rule, :196)
+ *        - `_handleSingleCall`  lines 225-256  (incl. the park case and InvalidRecipient)
+ *        - `_isMulticall`       lines 281-284
+ *        - `_isMigration`       lines 298-301
+ *
+ *      Rule 1 forbids modifying `CEA.sol`, so its semantics are load-bearing AS-IS: the
+ *      `InvalidRecipient()` revert is what makes ACP's R14 a fail-closed backstop. This
+ *      mock exists to prove that backstop against the real branch structure rather than
+ *      against an assumption about it. If the frozen source ever changes, update the line
+ *      references above in lockstep.
+ */
+contract MockCEA {
+    bytes4 internal constant MIGRATION_SELECTOR = bytes4(keccak256("UEA_MIGRATION"));
+
+    error InvalidTarget();
+    error InvalidInput();
+    error InvalidRecipient();
+    error ExecutionFailed();
+
+    event UniversalTxExecuted(address recipient, bytes payload);
+
+    bool public parked;
+
+    function handleExecution(address recipient, bytes calldata payload) external payable {
+        if (_isMulticall(payload)) {
+            _handleMulticall(abi.decode(payload[4:], (Multicall[])));
+        } else if (_isMigration(payload)) {
+            if (recipient != address(this)) revert InvalidRecipient();
+            emit UniversalTxExecuted(address(this), payload);
+        } else {
+            _handleSingleCall(recipient, payload);
+        }
+    }
+
+    function _handleMulticall(Multicall[] memory calls) internal {
+        for (uint256 i = 0; i < calls.length; i++) {
+            if (calls[i].to == address(0)) revert InvalidTarget();
+            // CEA.sol:196 — self-calls are permitted, but must carry zero value. This is
+            // what makes the inner CEA self-call a viable exit path, and therefore why
+            // ACP R7 must reject `to == expectedCEA` (A-03).
+            if (calls[i].to == address(this) && calls[i].value != 0) revert InvalidInput();
+            (bool ok, bytes memory ret) = calls[i].to.call{ value: calls[i].value }(calls[i].data);
+            if (!ok) {
+                if (ret.length > 0) {
+                    assembly {
+                        revert(add(32, ret), mload(ret))
+                    }
+                }
+                revert ExecutionFailed();
+            }
+        }
+    }
+
+    function _handleSingleCall(address recipient, bytes calldata payload) internal {
+        // The documented "park funds in the caller's CEA" case.
+        if (payload.length == 0 && recipient == address(0)) {
+            parked = true;
+            emit UniversalTxExecuted(address(this), payload);
+            return;
+        }
+        // R14's BACKSTOP: a non-empty payload with a zero recipient reverts here instead
+        // of executing `recipient.call{value: msg.value}(payload)` — which would be direct
+        // theft (A-02).
+        if (recipient == address(0)) revert InvalidRecipient();
+        if (recipient == address(this)) revert InvalidRecipient();
+
+        (bool ok, bytes memory ret) = recipient.call{ value: msg.value }(payload);
+        if (!ok) {
+            if (ret.length > 0) {
+                assembly {
+                    revert(add(32, ret), mload(ret))
+                }
+            }
+            revert ExecutionFailed();
+        }
+        emit UniversalTxExecuted(recipient, payload);
+    }
+
+    function _isMulticall(bytes calldata data) internal pure returns (bool) {
+        if (data.length < 4) return false;
+        return bytes4(data[0:4]) == MULTICALL_SELECTOR;
+    }
+
+    function _isMigration(bytes calldata data) internal pure returns (bool) {
+        if (data.length < 4) return false;
+        return bytes4(data[0:4]) == MIGRATION_SELECTOR;
+    }
+
+    receive() external payable { }
 }

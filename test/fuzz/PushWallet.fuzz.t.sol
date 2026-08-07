@@ -88,10 +88,14 @@ contract PushWalletFuzzTest is Test {
     address internal ownerUEA = address(0xB0B);
 
     function setUp() public {
-        PushAgentWallet impl = new PushAgentWallet();
+        // This suite exercises opHash, nonces, batch decoding and direct execution — none
+        // of which touch SmartSession or the grant guards. The five constructor immutables
+        // only need to be distinct non-zero addresses.
+        PushAgentWallet impl =
+            new PushAgentWallet(address(0x5511), address(0x6A7E), address(0xAC90), address(0x71FE), address(0x0A11));
         factory = new AgentWalletFactory(address(impl));
         vm.prank(ownerUEA);
-        wallet = PushAgentWallet(payable(factory.deployAgentWallet(keccak256("f"))));
+        wallet = PushAgentWallet(payable(factory.deployAgentWallet(address(0))));
 
         validator = new MockValidator();
         target = new MockTarget();
@@ -279,18 +283,26 @@ contract PushWalletFuzzTest is Test {
         assertEq(wallet.nonce(keyB), 0, "other keys unaffected");
     }
 
-    /// The factory address derivation is deterministic and collision-free.
-    function testFuzz_factoryAddressDeterministic(address owner_, bytes32 mandateA, bytes32 mandateB) public {
-        vm.assume(owner_ != address(0));
-        vm.assume(mandateA != mandateB);
+    /// The factory address derivation is deterministic and collision-free ACROSS OWNERS.
+    /// @dev v2 / Rule 2: the salt is keccak256(abi.encode(owner)) with no mandate input,
+    ///      so the property under test changed — distinct OWNERS must not collide, and the
+    ///      same owner must always resolve to the same address no matter how often they
+    ///      deploy. That stability is what fixes one CEA per user per external chain.
+    function testFuzz_factoryAddressDeterministic(address ownerA, address ownerB) public {
+        vm.assume(ownerA != address(0) && ownerB != address(0));
+        vm.assume(ownerA != ownerB);
 
-        address predictedA = factory.computeAgentWallet(owner_, mandateA);
-        address predictedB = factory.computeAgentWallet(owner_, mandateB);
-        assertTrue(predictedA != predictedB, "distinct mandates must not collide");
+        address predictedA = factory.computeAgentWallet(ownerA);
+        address predictedB = factory.computeAgentWallet(ownerB);
+        assertTrue(predictedA != predictedB, "distinct owners must not collide");
 
-        vm.prank(owner_);
-        address actual = factory.deployAgentWallet(mandateA);
+        vm.prank(ownerA);
+        address actual = factory.deployAgentWallet(address(0));
         assertEq(actual, predictedA);
+
+        // Idempotent: a second deploy returns the same wallet rather than reverting.
+        vm.prank(ownerA);
+        assertEq(factory.deployAgentWallet(address(0)), predictedA);
     }
 
     /// Only the owner may ever execute directly.

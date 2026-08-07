@@ -26,10 +26,10 @@ contract AttacksTest is Test {
     address internal attacker = address(0xBAD);
 
     function setUp() public {
-        impl = new PushAgentWallet();
+        impl = _newImpl();
         factory = new AgentWalletFactory(address(impl));
         vm.prank(ownerUEA);
-        wallet = PushAgentWallet(payable(factory.deployAgentWallet(keccak256("atk"))));
+        wallet = PushAgentWallet(payable(factory.deployAgentWallet(address(0))));
 
         validator = new MockValidator();
         target = new MockTarget();
@@ -76,16 +76,17 @@ contract AttacksTest is Test {
      * sealed it is permanently inert.
      */
     function test_A13_implementationSealedAgainstDirectInitialization() public {
-        PushAgentWallet fresh = new PushAgentWallet();
+        PushAgentWallet fresh = _newImpl();
 
-        // Seal it exactly as DeployCore does.
-        fresh.initialize(address(0xdead));
+        // Seal it exactly as Deploy.s.sol does. The burn now takes two arguments; the
+        // guardian is address(0) because the implementation is never used as a wallet.
+        fresh.initialize(address(0xdead), address(0));
         assertEq(fresh.owner(), address(0xdead));
 
         // An attacker can no longer claim it.
         vm.expectRevert(PushWalletErrors.AlreadyInitialized.selector);
         vm.prank(attacker);
-        fresh.initialize(attacker);
+        fresh.initialize(attacker, attacker);
 
         assertEq(fresh.owner(), address(0xdead), "owner must be unchanged");
     }
@@ -96,20 +97,20 @@ contract AttacksTest is Test {
      */
     function test_A13b_clonesUnaffectedBySealedImplementation() public {
         // The production implementation is sealed...
-        PushAgentWallet sealedImpl = new PushAgentWallet();
-        sealedImpl.initialize(address(0xdead));
+        PushAgentWallet sealedImpl = _newImpl();
+        sealedImpl.initialize(address(0xdead), address(0));
 
         AgentWalletFactory f = new AgentWalletFactory(address(sealedImpl));
 
         // ...yet clones initialize normally to their real owner.
         vm.prank(ownerUEA);
-        PushAgentWallet clone = PushAgentWallet(payable(f.deployAgentWallet(keccak256("c"))));
+        PushAgentWallet clone = PushAgentWallet(payable(f.deployAgentWallet(address(0))));
         assertEq(clone.owner(), ownerUEA);
 
         // And the clone itself cannot be re-initialized.
         vm.expectRevert(PushWalletErrors.AlreadyInitialized.selector);
         vm.prank(attacker);
-        clone.initialize(attacker);
+        clone.initialize(attacker, attacker);
     }
 
     /**
@@ -118,39 +119,47 @@ contract AttacksTest is Test {
      * atomically in the same transaction (§5.8).
      */
     function test_A13c_counterfactualAddressCannotBeFrontRunInitialized() public {
-        bytes32 mandate = keccak256("front-run");
-        address predicted = factory.computeAgentWallet(ownerUEA, mandate);
+        // Rule 2: the counterfactual address derives from the owner alone. Use a fresh
+        // owner, since ownerUEA's wallet is already deployed in setUp.
+        address victim = address(0x7135);
+        address predicted = factory.computeAgentWallet(victim);
 
         // Nothing is deployed there yet.
         assertEq(predicted.code.length, 0, "must not exist yet");
 
         // An attacker cannot initialize a non-existent contract.
         vm.prank(attacker);
-        (bool ok,) = predicted.call(abi.encodeCall(PushAgentWallet.initialize, (attacker)));
+        (bool ok,) = predicted.call(abi.encodeCall(PushAgentWallet.initialize, (attacker, attacker)));
         assertTrue(ok, "call to an empty address is a no-op success");
         assertEq(predicted.code.length, 0, "still nothing there");
 
         // The rightful owner deploys and is initialized atomically.
-        vm.prank(ownerUEA);
-        address actual = factory.deployAgentWallet(mandate);
+        vm.prank(victim);
+        address actual = factory.deployAgentWallet(address(0));
         assertEq(actual, predicted);
-        assertEq(PushAgentWallet(payable(actual)).owner(), ownerUEA, "owner must be the deployer");
+        assertEq(PushAgentWallet(payable(actual)).owner(), victim, "owner must be the deployer");
     }
 
     /// Only the true owner may deploy under their own identity — there is no deployFor.
     function test_A13d_noThirdPartyDeploymentPath() public {
-        bytes32 mandate = keccak256("victim");
+        address victim = address(0x7135);
 
         // The attacker deploying only ever creates a wallet owned by the attacker.
         vm.prank(attacker);
-        address attackerWallet = factory.deployAgentWallet(mandate);
+        address attackerWallet = factory.deployAgentWallet(address(0));
         assertEq(PushAgentWallet(payable(attackerWallet)).owner(), attacker);
 
         // The victim's own slot is untouched and still available to them.
-        assertFalse(factory.isDeployed(ownerUEA, mandate));
-        vm.prank(ownerUEA);
-        address victimWallet = factory.deployAgentWallet(mandate);
-        assertEq(PushAgentWallet(payable(victimWallet)).owner(), ownerUEA);
+        assertFalse(factory.isDeployed(victim));
+        vm.prank(victim);
+        address victimWallet = factory.deployAgentWallet(address(0));
+        assertEq(PushAgentWallet(payable(victimWallet)).owner(), victim);
         assertTrue(victimWallet != attackerWallet);
+    }
+
+    /// @dev v2 constructor takes five module addresses. This suite tests the wallet's own
+    ///      guards, not the session path, so placeholders suffice.
+    function _newImpl() internal returns (PushAgentWallet) {
+        return new PushAgentWallet(address(0x5511), address(0x6A7E), address(0xAC90), address(0x71FE), address(0x0A11));
     }
 }

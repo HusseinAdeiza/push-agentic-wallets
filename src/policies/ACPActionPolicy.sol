@@ -12,14 +12,25 @@ uint256 constant VALIDATION_SUCCESS = 0;
 struct AllowedCall {
     address target; // e.g. Morpho Blue pool on Ethereum
     bytes4 selector; // e.g. supply(...)
-    uint16 beneficiaryOffset; // byte offset of the beneficiary word within the inner calldata
-    bool hasBeneficiary; // false for calls with no beneficiary arg (e.g. approve)
+    uint16 beneficiaryOffset; // byte offset of the pinned address word within the inner calldata
+    bool hasBeneficiary; // false only for calls with no address argument worth pinning
     /// @dev Ceiling on this entry's native `value`, denominated in DESTINATION-chain
     ///      native token. Zero means no native value may be attached, which is correct
     ///      for every v1 target (all are non-payable). A future payable target — e.g.
     ///      the CEA attestation callback, which must fund an inbound protocol fee — is
     ///      then a config change rather than a contract change.
     uint256 maxValue;
+    /// @dev R9-ext (A-15). The address the word at `beneficiaryOffset` MUST equal.
+    ///
+    ///      `address(0)` is a SENTINEL meaning "the wallet's own CEA", which preserves the
+    ///      original semantics for every deposit-style entry (supply / withdraw / repay)
+    ///      unchanged — those must land in the user's own CEA.
+    ///
+    ///      A non-zero value pins the argument to that exact address, which is what an
+    ///      ERC-20 `approve` spender needs: it must be the PROTOCOL, never the CEA. Without
+    ///      this, an approve entry could only ship with `hasBeneficiary = false` and its
+    ///      spender was completely unchecked — see CV-1.
+    address expectedArg;
 }
 
 /// @notice Per-(configId, multiplexer, account) mandate configuration.
@@ -70,12 +81,29 @@ contract ACPActionPolicy is IActionPolicy {
     bytes4 public constant SEND_OUTBOUND_SELECTOR =
         bytes4(keccak256("sendUniversalTxOutbound((bytes,address,uint256,uint256,uint256,uint256,bytes,address))"));
 
+    /// @dev ERC-20 approval selectors for CV-1, hardcoded rather than imported.
+    ///      `IERC20.approve.selector` would work, but `increaseAllowance` has never been
+    ///      part of OpenZeppelin's `IERC20` interface — it lived on the ERC20
+    ///      implementation and was removed in OZ v5 — so importing would cover only one
+    ///      of the two and leave them asymmetric. Hardcoding both keeps the pair
+    ///      symmetric and drops the dependency. Recomputed from their signatures by T-67:
+    ///      a hardcoded magic value in a security check must always carry a drift test.
+    bytes4 internal constant APPROVE_SELECTOR = 0x095ea7b3; // approve(address,uint256)
+    bytes4 internal constant INCREASE_ALLOWANCE_SELECTOR = 0x39509351; // increaseAllowance(address,uint256)
+
     address public immutable UNIVERSAL_GATEWAY_PC;
 
     /// @dev configId => multiplexer (SmartSession) => account (wallet) => config
     mapping(ConfigId => mapping(address => mapping(address => Config))) internal $configs;
 
     event ACPPolicySet(ConfigId indexed id, address indexed multiplexer, address indexed account);
+
+    /// @notice F-11 — emitted for every authorised action. `payloadHash` joins to the
+    ///         `subTxId` preimage, so an indexer can attribute a destination-chain
+    ///         execution back to the exact mandate config that permitted it.
+    event MandateActionAuthorized(
+        ConfigId indexed configId, address indexed account, bytes32 payloadHash, uint256 amount
+    );
 
     error NotInitialized(ConfigId id, address multiplexer, address account);
     error InvalidTarget(address target);
@@ -92,6 +120,12 @@ contract ACPActionPolicy is IActionPolicy {
     error BeneficiaryMismatch(address expected, address actual);
     error InvalidRevertRecipient(address expected, address actual);
     error MalformedInnerCalldata();
+    /// @dev R14 — the destination recipient must be empty on the session path.
+    error NonEmptyRecipient(uint256 length);
+    /// @dev CV-1 (A-15) — an approval-shaped entry whose spender is not pinned.
+    error UnpinnedApprovalEntry(address target, bytes4 selector);
+    /// @dev CV-2 — a config committing a zero CEA, which would collapse R9-ext's sentinel.
+    error ZeroExpectedCEA();
 
     constructor(address universalGatewayPC_) {
         UNIVERSAL_GATEWAY_PC = universalGatewayPC_;
@@ -150,6 +184,22 @@ contract ACPActionPolicy is IActionPolicy {
 
         if (req.token != cfg.asset) revert AssetMismatch(cfg.asset, req.token); // R4
 
+        // R14 — the destination recipient must be empty.
+        //
+        // SESSION PATH ONLY (Q5). `checkAction` never runs on the owner path, and the
+        // owner path DELIBERATELY permits a non-empty recipient: FUNDS-type withdrawals to
+        // an external address and exit-leg composition depend on it. Do NOT "harden"
+        // `execute()` with this rule — it would break owner withdrawals.
+        //
+        // bytes("") is the gateway's own documented "park funds in the caller's CEA"
+        // convention, so this is the canonical encoding, not a hack. It is also a
+        // FAIL-CLOSED backstop for R6 (P-4): if the multicall prefix check were ever
+        // bypassed, `CEA._handleSingleCall` would receive recipient == address(0) with a
+        // non-empty payload and revert `CEAErrors.InvalidRecipient()` (CEA.sol:237)
+        // instead of executing `recipient.call{value: msg.value}(payload)` — which would
+        // be direct theft (A-02).
+        if (req.recipient.length != 0) revert NonEmptyRecipient(req.recipient.length);
+
         // R13 — zero-amount outbounds are rejected outright.
         //
         // With `req.amount == 0` the gateway infers TX_TYPE.GAS_AND_PAYLOAD and skips
@@ -183,6 +233,20 @@ contract ACPActionPolicy is IActionPolicy {
 
         // EFFECTS LAST — every check above has passed before any state is written.
         cfg.spent = newSpent;
+
+        // F-11 — attribution. The contract that AUTHORIZED the action names the config
+        // that authorized it, with zero gateway footprint (P-6: the outbound stays
+        // byte-indistinguishable from an ordinary UEA outbound).
+        //
+        // Why the event cannot outlive a failed op (Q11): if any later policy in the
+        // intersection returns VALIDATION_FAILED, the failed bit propagates through
+        // `vd.intersect` and the wallet's own `_requireValidationData` reverts
+        // `SignatureValidationFailed` — the whole transaction reverts and this emit is
+        // erased, because events are transaction state. A policy that REVERTS becomes
+        // `PolicyCheckReverted`; execution failure bubbles. Same outcome in all three.
+        // So: event present in a mined tx ⟹ every policy passed AND the gateway call
+        // executed, including the ACP-passes-then-ValueLimit-fails case.
+        emit MandateActionAuthorized(id, account, keccak256(req.payload), req.amount);
 
         return VALIDATION_SUCCESS;
     }
@@ -250,20 +314,31 @@ contract ACPActionPolicy is IActionPolicy {
         for (uint256 i; i < calls.length;) {
             address to = calls[i].to;
 
-            // R7 — forbidden inner targets
-            if (to == account || to == address(this) || to == UNIVERSAL_GATEWAY_PC) {
+            // R7 — forbidden inner targets.
+            //
+            // The first three are defence-in-depth for A-04 and MUST be retained.
+            // `cfg.expectedCEA` is the load-bearing v2 addition (A-03, P-5): an inner entry
+            // targeting the CEA executes with `msg.sender == CEA`, which SATISFIES
+            // `CEA.sendUniversalTxToUEA`'s self-call check (CEA.sol:114), and
+            // `CEA._handleMulticall` explicitly permits value-0 self-calls (CEA.sol:196).
+            // The inner CEA self-call IS the exit mechanism — it would let a compromised
+            // key bridge value out with an agent-controlled `revertRecipient`. Sessions are
+            // ENTRY-ONLY in v2.0 (P-5); exits are owner-path.
+            if (to == account || to == address(this) || to == UNIVERSAL_GATEWAY_PC || to == cfg.expectedCEA) {
                 revert ForbiddenInnerTarget(to);
             }
             if (calls[i].data.length < 4) revert MalformedInnerCalldata();
             bytes4 innerSel = bytes4(calls[i].data);
 
-            // R8 + R9
+            // R8 + R9 / R9-ext
             AllowedCall memory rule = _requireAllowed(cfg, to, innerSel);
             if (rule.hasBeneficiary) {
-                address beneficiary = _extractBeneficiary(calls[i].data, rule.beneficiaryOffset);
-                if (beneficiary != cfg.expectedCEA) {
-                    revert BeneficiaryMismatch(cfg.expectedCEA, beneficiary);
-                }
+                // R9-ext (A-15) — `expectedArg == address(0)` is the sentinel for "the
+                // wallet's own CEA", preserving deposit-entry semantics. A non-zero value
+                // pins the argument exactly, which is what an approve spender requires.
+                address expected = rule.expectedArg == address(0) ? cfg.expectedCEA : rule.expectedArg;
+                address actual = _extractBeneficiary(calls[i].data, rule.beneficiaryOffset);
+                if (actual != expected) revert BeneficiaryMismatch(expected, actual);
             }
 
             // R11 — per-entry native value ceiling, denominated in DESTINATION-chain
@@ -303,8 +378,19 @@ contract ACPActionPolicy is IActionPolicy {
         for (uint256 i; i < len;) {
             AllowedCall storage rule = cfg.allowedCalls[i];
             if (rule.target == to && rule.selector == selector) {
-                return
-                    AllowedCall(rule.target, rule.selector, rule.beneficiaryOffset, rule.hasBeneficiary, rule.maxValue);
+                // NAMED-FIELD construction, deliberately (N2). Solidity requires every
+                // field to be present in named form, so adding a field to `AllowedCall`
+                // later breaks the build here instead of silently defaulting the new field
+                // to zero. For a struct where a zero field can mean "check disabled", that
+                // is the difference between a loud failure and a silent one.
+                return AllowedCall({
+                    target: rule.target,
+                    selector: rule.selector,
+                    beneficiaryOffset: rule.beneficiaryOffset,
+                    hasBeneficiary: rule.hasBeneficiary,
+                    maxValue: rule.maxValue,
+                    expectedArg: rule.expectedArg
+                });
             }
             unchecked {
                 ++i;
@@ -319,6 +405,19 @@ contract ACPActionPolicy is IActionPolicy {
     ///      a new mandate or silently preserve a cap the owner meant to reset.
     ///      Any value supplied in `incoming.spent` is deliberately ignored.
     function _store(Config storage cfg, Config memory incoming) internal {
+        // CV-2 (L-2) — the committed CEA must be a real address.
+        //
+        // `AllowedCall.expectedArg == address(0)` is the R9-ext SENTINEL for "the wallet's
+        // own CEA", so every deposit-style entry resolves its pin through `cfg.expectedCEA`.
+        // If that field were itself zero the sentinel would collapse: R9-ext would compare
+        // the extracted beneficiary against address(0), and an inner
+        // `supply(..., onBehalf = 0, ...)` would pass the beneficiary check entirely.
+        //
+        // Same reasoning as CV-1: the SDK is supposed to commit a correct CEA (S-8), but
+        // "supposed to" is not a guarantee. P-7 — validate on-chain at grant time what the
+        // SDK could otherwise get silently wrong.
+        if (incoming.expectedCEA == address(0)) revert ZeroExpectedCEA();
+
         cfg.destChainHash = incoming.destChainHash;
         cfg.expectedCEA = incoming.expectedCEA;
         cfg.asset = incoming.asset;
@@ -330,7 +429,33 @@ contract ACPActionPolicy is IActionPolicy {
         delete cfg.allowedCalls;
         uint256 len = incoming.allowedCalls.length;
         for (uint256 i; i < len;) {
-            cfg.allowedCalls.push(incoming.allowedCalls[i]);
+            AllowedCall memory entry = incoming.allowedCalls[i];
+
+            // CV-1 (A-15, F-29) — config-time validation. Runs once per grant; zero
+            // hot-path gas.
+            //
+            // Without it, an ERC-20 approval entry could ship with
+            // `hasBeneficiary = false` and its spender COMPLETELY UNCHECKED. A compromised
+            // key then bridges 1 wei (satisfying R13) carrying an inner
+            // `USDC.approve(attacker, type(uint256).max)` and drains the CEA directly on
+            // the destination chain via `transferFrom`. The approve entry is MANDATORY for
+            // any Aave/Morpho flow, so this was not hypothetical.
+            //
+            // P-7 applied: the pin is now a contract guarantee, not SDK discipline. The
+            // mis-configured shape is UNREPRESENTABLE — and because this guard lives in the
+            // policy rather than the wallet, it fires identically via `grantMandate`,
+            // `reconfigureMandate`, and the `callValidator(enableSessions)` escape hatch.
+            //
+            // A GENERAL rule is impossible: ACP cannot know which argument of an arbitrary
+            // selector grants authority (`permit`, `setAuthorizationWithSig`,
+            // `setApprovalForAll` all differ). That exotic class stays S-10's job.
+            if (entry.selector == APPROVE_SELECTOR || entry.selector == INCREASE_ALLOWANCE_SELECTOR) {
+                if (!entry.hasBeneficiary || entry.beneficiaryOffset != 4 || entry.expectedArg == address(0)) {
+                    revert UnpinnedApprovalEntry(entry.target, entry.selector);
+                }
+            }
+
+            cfg.allowedCalls.push(entry);
             unchecked {
                 ++i;
             }

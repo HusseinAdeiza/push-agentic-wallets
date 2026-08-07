@@ -48,6 +48,7 @@ contract ACPActionPolicyTest is Test {
     address internal aavePool = address(0xAAAE);
     address internal morpho = address(0x0817);
     address internal usdc = address(0x115DC);
+    address internal attacker = address(0xBAD);
 
     ConfigId internal cfgId = ConfigId.wrap(keccak256("cfg"));
 
@@ -62,12 +63,37 @@ contract ACPActionPolicyTest is Test {
 
     function _defaultAllowedCalls() internal view returns (AllowedCall[] memory calls) {
         calls = new AllowedCall[](3);
-        // Aave v3 supply(address,uint256,address,uint16) — onBehalfOf at offset 68
-        calls[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 68, true, 0);
+        // Aave v3 supply(address,uint256,address,uint16) — onBehalfOf at offset 68.
+        // expectedArg == address(0) is the R9-ext sentinel for "the wallet's own CEA".
+        calls[0] = AllowedCall({
+            target: aavePool,
+            selector: IAaveV3Pool.supply.selector,
+            beneficiaryOffset: 68,
+            hasBeneficiary: true,
+            maxValue: 0,
+            expectedArg: address(0)
+        });
         // Morpho Blue supply(MarketParams,uint256,uint256,address,bytes) — onBehalf at 228
-        calls[1] = AllowedCall(morpho, IMorphoBlue.supply.selector, 228, true, 0);
-        // ERC-20 approve — no beneficiary
-        calls[2] = AllowedCall(usdc, IERC20Like.approve.selector, 0, false, 0);
+        calls[1] = AllowedCall({
+            target: morpho,
+            selector: IMorphoBlue.supply.selector,
+            beneficiaryOffset: 228,
+            hasBeneficiary: true,
+            maxValue: 0,
+            expectedArg: address(0)
+        });
+        // ERC-20 approve(address,uint256) — spender at offset 4, PINNED to the protocol.
+        // CV-1 makes this shape MANDATORY: the pre-v2.3 config
+        // (hasBeneficiary = false, offset 0) is now unrepresentable, because an unpinned
+        // spender let a compromised key hand the CEA's balance to an attacker (A-15).
+        calls[2] = AllowedCall({
+            target: usdc,
+            selector: IERC20Like.approve.selector,
+            beneficiaryOffset: 4,
+            hasBeneficiary: true,
+            maxValue: 0,
+            expectedArg: aavePool
+        });
     }
 
     function _initConfig() internal {
@@ -162,7 +188,14 @@ contract ACPActionPolicyTest is Test {
 
     function test_P02_initializeOverwritesExistingConfig() public {
         AllowedCall[] memory one = new AllowedCall[](1);
-        one[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 68, true, 0);
+        one[0] = AllowedCall({
+            target: aavePool,
+            selector: IAaveV3Pool.supply.selector,
+            beneficiaryOffset: 68,
+            hasBeneficiary: true,
+            maxValue: 0,
+            expectedArg: address(0)
+        });
 
         Config memory cfg = Config({
             initialized: false,
@@ -185,8 +218,7 @@ contract ACPActionPolicyTest is Test {
             address cea,
             address a,
             uint256 maxAmt,
-            uint256 maxTotal,
-            uint256 maxPC,
+            uint256 maxTotal,, // maxPCPerCall — asserted by the R12 tests, not here
             uint256 spentSoFar,
             AllowedCall[] memory allowed
         ) = policy.getConfig(cfgId, smartSession, account);
@@ -333,7 +365,6 @@ contract ACPActionPolicyTest is Test {
 
     /// P-12 / A-05 — the provider cannot redirect the deposit beneficiary.
     function test_P12_A05_beneficiaryMismatchReverts() public {
-        address attacker = address(0xA77ACc);
         Multicall[] memory calls = new Multicall[](1);
         calls[0] = Multicall(aavePool, 0, _aaveSupply(attacker));
 
@@ -353,7 +384,6 @@ contract ACPActionPolicyTest is Test {
     }
 
     function test_P13c_morphoBeneficiaryMismatchReverts() public {
-        address attacker = address(0xA77ACc);
         Multicall[] memory calls = new Multicall[](1);
         calls[0] = Multicall(morpho, 0, _morphoSupply(attacker));
 
@@ -412,7 +442,14 @@ contract ACPActionPolicyTest is Test {
     /// to that ceiling. This is the CEA-attestation-callback shape.
     function test_P15d_valueWithinConfiguredAllowancePasses() public {
         AllowedCall[] memory allowed = new AllowedCall[](1);
-        allowed[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 68, true, 2 ether);
+        allowed[0] = AllowedCall({
+            target: aavePool,
+            selector: IAaveV3Pool.supply.selector,
+            beneficiaryOffset: 68,
+            hasBeneficiary: true,
+            maxValue: 2 ether,
+            expectedArg: address(0)
+        });
 
         Config memory cfg = Config({
             initialized: false,
@@ -663,7 +700,14 @@ contract ACPActionPolicyTest is Test {
     function test_P17_A12_beneficiaryOffsetOutOfBoundsReverts() public {
         // Allowlist an entry whose offset points past the end of a short blob.
         AllowedCall[] memory allowed = new AllowedCall[](1);
-        allowed[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 60_000, true, 0);
+        allowed[0] = AllowedCall({
+            target: aavePool,
+            selector: IAaveV3Pool.supply.selector,
+            beneficiaryOffset: 60_000,
+            hasBeneficiary: true,
+            maxValue: 0,
+            expectedArg: address(0)
+        });
 
         Config memory cfg = Config({
             initialized: false,
@@ -724,10 +768,85 @@ contract ACPActionPolicyTest is Test {
         assertEq(address(uint160(uint256(word))), onBehalf, "offset 228 must extract onBehalf");
     }
 
+    // ══════════════════════════════════════════════════════════════════
+    //  v2 STEP 14 — beneficiary-offset HARD GATE (T-64 / T-65)
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * T-64 — every shipping `AllowedCall` entry, encoded with the protocol's REAL ABI,
+     * must extract the planted address at its configured offset.
+     *
+     * RULE: no `allowedCalls` entry ships without both T-64 and T-65 coverage. A wrong
+     * offset does not fail loudly — it reads the wrong 32-byte word and can silently pass
+     * on an attacker-controlled address. Verify offsets against DEPLOYED ABIs, never
+     * against documentation.
+     *
+     * Reference offsets: Aave v3 / Spark `supply` -> 68. Morpho Blue `supply` -> 228.
+     * ERC-20 `approve` -> 4.
+     */
+    function test_T64_everyShippingOffsetExtractsThePlantedAddress() public view {
+        address planted = address(0xBEEF99);
+
+        // ERC-20 approve(address spender, uint256) -> spender is arg 0 -> offset 4.
+        assertEq(
+            _extractVia(abi.encodeCall(IERC20Like.approve, (planted, 1e6)), 4), planted, "approve spender at offset 4"
+        );
+
+        // Aave v3 / Spark supply -> onBehalfOf at 4 + 32 + 32 = 68.
+        assertEq(
+            _extractVia(abi.encodeCall(IAaveV3Pool.supply, (usdc, 1e6, planted, 0)), 68),
+            planted,
+            "aave onBehalfOf at offset 68"
+        );
+
+        // Morpho Blue supply -> onBehalf at 4 + 160 + 32 + 32 = 228.
+        MarketParams memory mp = MarketParams(usdc, address(0x2), address(0x3), address(0x4), 86e16);
+        assertEq(
+            _extractVia(abi.encodeCall(IMorphoBlue.supply, (mp, 1e6, 0, planted, "")), 228),
+            planted,
+            "morpho onBehalf at offset 228"
+        );
+    }
+
+    /**
+     * T-65 — NEGATIVE CONTROL. Without this, T-64 can pass vacuously.
+     *
+     * For each entry a deliberately WRONG offset must NOT return the planted address. This
+     * is what proves the offsets are load-bearing rather than coincidental — e.g. if a
+     * struct were all-zero, several offsets would agree by accident.
+     */
+    function test_T65_wrongOffsetsDoNotReturnThePlantedAddress() public view {
+        address planted = address(0xBEEF99);
+
+        // approve: the amount word (36) is not the spender.
+        assertTrue(_extractVia(abi.encodeCall(IERC20Like.approve, (planted, 1e6)), 36) != planted);
+
+        // aave: 4 is the asset, 36 the amount, 100 the referralCode word.
+        bytes memory aave = abi.encodeCall(IAaveV3Pool.supply, (usdc, 1e6, planted, 0));
+        assertTrue(_extractVia(aave, 4) != planted, "offset 4 is the asset");
+        assertTrue(_extractVia(aave, 36) != planted, "offset 36 is the amount");
+        assertTrue(_extractVia(aave, 100) != planted, "offset 100 is referralCode");
+
+        // morpho: 196 is `shares`, 164 is `assets`; neither is onBehalf.
+        MarketParams memory mp = MarketParams(usdc, address(0x2), address(0x3), address(0x4), 86e16);
+        bytes memory morphoCd = abi.encodeCall(IMorphoBlue.supply, (mp, 1e6, 0, planted, ""));
+        assertTrue(_extractVia(morphoCd, 164) != planted, "offset 164 is assets");
+        assertTrue(_extractVia(morphoCd, 196) != planted, "offset 196 is shares");
+    }
+
+    /// @dev Mirrors `_extractBeneficiary` exactly: read the 32-byte word at `offset`, take
+    ///      the low 20 bytes.
+    function _extractVia(bytes memory cd, uint256 offset) internal pure returns (address) {
+        bytes32 word;
+        assembly {
+            word := mload(add(add(cd, 0x20), offset))
+        }
+        return address(uint160(uint256(word)));
+    }
+
     // ── P-20 — mixed batch ────────────────────────────────────────────
 
     function test_P20_oneValidOneInvalidEntryReverts() public {
-        address attacker = address(0xA77ACc);
         Multicall[] memory calls = new Multicall[](3);
         calls[0] = Multicall(usdc, 0, abi.encodeCall(IERC20Like.approve, (aavePool, 100e6)));
         calls[1] = Multicall(aavePool, 0, _aaveSupply(expectedCEA)); // valid
@@ -772,6 +891,317 @@ contract ACPActionPolicyTest is Test {
 
     function test_gatewayImmutable() public view {
         assertEq(policy.UNIVERSAL_GATEWAY_PC(), gateway);
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  v2 STEP 8 — R7 extension: the CEA is a forbidden inner target
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * T-42 — A-03 / P-5. The inner CEA self-call IS the exit mechanism.
+     *
+     * An inner entry targeting the CEA executes with `msg.sender == CEA`, which SATISFIES
+     * `CEA.sendUniversalTxToUEA`'s own self-call check (CEA.sol:114), and
+     * `CEA._handleMulticall` explicitly permits value-0 self-calls (CEA.sol:196). So
+     * without this rule a compromised key could bridge value out of the CEA with an
+     * agent-chosen `revertRecipient`. Sessions are ENTRY-ONLY in v2.0; exits are
+     * owner-path.
+     */
+    function test_T42_innerCEATargetIsForbidden() public {
+        Multicall[] memory calls = new Multicall[](1);
+        calls[0] = Multicall(
+            expectedCEA,
+            0,
+            abi.encodeWithSignature(
+                "sendUniversalTxToUEA(address,uint256,bytes,address)", usdc, 100e6, bytes(""), address(0xBAD)
+            )
+        );
+        bytes memory d = _encode(calls);
+
+        vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.ForbiddenInnerTarget.selector, expectedCEA));
+        _call(d);
+    }
+
+    /**
+     * T-43 — the rule is STRUCTURAL, not allowlist-dependent.
+     *
+     * Even with (expectedCEA, sendUniversalTxToUEA) explicitly allowlisted, R7 rejects it.
+     * That matters because allowlist omission is one SDK bug away, whereas a structural
+     * rule cannot be configured off (F-02).
+     */
+    function test_T43_ceaTargetRejectedEvenWhenAllowlisted() public {
+        bytes4 sel = bytes4(keccak256("sendUniversalTxToUEA(address,uint256,bytes,address)"));
+
+        AllowedCall[] memory allowed = new AllowedCall[](1);
+        allowed[0] = AllowedCall({
+            target: expectedCEA,
+            selector: sel,
+            beneficiaryOffset: 0,
+            hasBeneficiary: false,
+            maxValue: 0,
+            expectedArg: address(0)
+        });
+        _reinit(allowed);
+
+        Multicall[] memory calls = new Multicall[](1);
+        calls[0] = Multicall(expectedCEA, 0, abi.encodeWithSelector(sel, usdc, 100e6, bytes(""), address(0xBAD)));
+        bytes memory d = _encode(calls);
+
+        vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.ForbiddenInnerTarget.selector, expectedCEA));
+        _call(d);
+    }
+
+    /// @dev T-44 — the three pre-existing R7 members still revert. A-04 has three
+    ///      independent defences and none may be dropped as "redundant".
+    function test_T44_preExistingForbiddenTargetsStillRevert() public {
+        address[3] memory forbidden = [account, address(policy), gateway];
+        for (uint256 i; i < forbidden.length; ++i) {
+            Multicall[] memory calls = new Multicall[](1);
+            calls[0] = Multicall(forbidden[i], 0, abi.encodeCall(IERC20Like.approve, (aavePool, 1)));
+            bytes memory d = _encode(calls);
+            vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.ForbiddenInnerTarget.selector, forbidden[i]));
+            _call(d);
+        }
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  v2 STEP 9 — R9-ext (expectedArg) + CV-1. Closes A-15.
+    // ══════════════════════════════════════════════════════════════════
+
+    /// @dev T-45 — the attack. An approve whose spender is not the pinned protocol is
+    ///      rejected, so `approve(attacker, max)` cannot ride along inside a valid bridge.
+    function test_T45_approveToAttackerReverts() public {
+        Multicall[] memory calls = new Multicall[](1);
+        calls[0] = Multicall(usdc, 0, abi.encodeCall(IERC20Like.approve, (attacker, type(uint256).max)));
+        bytes memory d = _encode(calls);
+
+        vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.BeneficiaryMismatch.selector, aavePool, attacker));
+        _call(d);
+    }
+
+    /// @dev T-46 — the legitimate approve passes.
+    function test_T46_approveToPinnedProtocolPasses() public {
+        Multicall[] memory calls = new Multicall[](1);
+        calls[0] = Multicall(usdc, 0, abi.encodeCall(IERC20Like.approve, (aavePool, 100e6)));
+        assertEq(_check(calls), 0);
+    }
+
+    /**
+     * T-47 — BACKWARD COMPATIBILITY of the sentinel.
+     *
+     * `expectedArg == address(0)` must still mean "the wallet's own CEA", so every
+     * deposit-style entry keeps its original semantics. Both directions asserted.
+     */
+    function test_T47_zeroExpectedArgStillMeansCEA() public {
+        // Pass: beneficiary is the CEA.
+        Multicall[] memory good = new Multicall[](1);
+        good[0] = Multicall(aavePool, 0, _aaveSupply(expectedCEA));
+        assertEq(_check(good), 0);
+
+        // Fail: beneficiary is anyone else.
+        Multicall[] memory bad = new Multicall[](1);
+        bad[0] = Multicall(aavePool, 0, _aaveSupply(attacker));
+        bytes memory d = _encode(bad);
+        vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.BeneficiaryMismatch.selector, expectedCEA, attacker));
+        _call(d);
+    }
+
+    /**
+     * T-48 — THE DOOR IS LOCKED (CV-1, F-29). NEVER DELETE.
+     *
+     * A-15 (unpinned approve -> attacker drains the CEA via transferFrom) has no
+     * exploit-demo test because CV-1 makes the vulnerable config UNCONSTRUCTIBLE: the
+     * guard lives in `ACPActionPolicy.initializeWithMultiplexer`, so it fires on
+     * `grantMandate`, `reconfigureMandate`, AND the `callValidator(enableSessions)` escape
+     * hatch alike. This revert test IS the demonstration — it proves the door is locked.
+     *
+     * Do NOT add a mock ACP without CV-1 to "show the attack"; that would test a contract
+     * we do not ship.
+     */
+    function test_CV1_unpinnedApprovalEntryReverts() public {
+        bytes4 approveSel = IERC20Like.approve.selector;
+        bytes4 increaseSel = bytes4(keccak256("increaseAllowance(address,uint256)"));
+
+        // hasBeneficiary = false — the pre-v2.3 shape that left the spender unchecked.
+        _expectUnpinned(usdc, approveSel, 0, false, aavePool);
+        // Wrong offset — would read the wrong 32-byte word.
+        _expectUnpinned(usdc, approveSel, 36, true, aavePool);
+        // expectedArg == 0 — the CEA sentinel is meaningless for a spender; the CEA
+        // approving itself is not the pin we need.
+        _expectUnpinned(usdc, approveSel, 4, true, address(0));
+        // increaseAllowance is covered identically.
+        _expectUnpinned(usdc, increaseSel, 0, false, aavePool);
+        _expectUnpinned(usdc, increaseSel, 4, true, address(0));
+    }
+
+    /**
+     * CV-2 — a config committing a ZERO `expectedCEA` is rejected at grant time.
+     *
+     * WHY THIS MATTERS. `AllowedCall.expectedArg == address(0)` is the R9-ext sentinel for
+     * "the wallet's own CEA", so every deposit-style entry resolves its pin through
+     * `cfg.expectedCEA`. A zero `expectedCEA` collapses that sentinel: R9-ext would compare
+     * the extracted beneficiary against address(0), and an inner `supply(onBehalf = 0)`
+     * would sail through the beneficiary check.
+     *
+     * The SDK is obliged to commit a correct CEA (S-8), but P-7 says anything the SDK could
+     * silently get wrong is validated on-chain. Same reasoning as CV-1.
+     */
+    function test_CV2_zeroExpectedCEAReverts() public {
+        AllowedCall[] memory allowed = new AllowedCall[](1);
+        allowed[0] = AllowedCall({
+            target: aavePool,
+            selector: IAaveV3Pool.supply.selector,
+            beneficiaryOffset: 68,
+            hasBeneficiary: true,
+            maxValue: 0,
+            expectedArg: address(0) // the CEA sentinel
+        });
+        Config memory cfg = Config({
+            initialized: false,
+            destChainHash: keccak256("eip155:1"),
+            expectedCEA: address(0), // the defect
+            asset: asset,
+            maxAmountPerCall: MAX_AMOUNT,
+            maxAmountTotal: type(uint256).max,
+            maxPCPerCall: type(uint256).max,
+            spent: 0,
+            allowedCalls: allowed
+        });
+        bytes memory initData = abi.encode(cfg);
+
+        vm.expectRevert(ACPActionPolicy.ZeroExpectedCEA.selector);
+        vm.prank(smartSession);
+        policy.initializeWithMultiplexer(account, cfgId, initData);
+    }
+
+    /// @dev CV-2 fires on an EMPTY allowlist too: the check precedes the copy loop, so a
+    ///      config cannot slip through by carrying no entries.
+    function test_CV2_zeroExpectedCEARejectedEvenWithEmptyAllowlist() public {
+        Config memory cfg = Config({
+            initialized: false,
+            destChainHash: keccak256("eip155:1"),
+            expectedCEA: address(0),
+            asset: asset,
+            maxAmountPerCall: MAX_AMOUNT,
+            maxAmountTotal: type(uint256).max,
+            maxPCPerCall: type(uint256).max,
+            spent: 0,
+            allowedCalls: new AllowedCall[](0)
+        });
+        bytes memory initData = abi.encode(cfg);
+
+        vm.expectRevert(ACPActionPolicy.ZeroExpectedCEA.selector);
+        vm.prank(smartSession);
+        policy.initializeWithMultiplexer(account, cfgId, initData);
+    }
+
+    /// @dev The compliant shape is accepted, so CV-1 is not simply rejecting everything.
+    function test_CV1_pinnedApprovalEntryAccepted() public {
+        AllowedCall[] memory allowed = new AllowedCall[](1);
+        allowed[0] = AllowedCall({
+            target: usdc,
+            selector: IERC20Like.approve.selector,
+            beneficiaryOffset: 4,
+            hasBeneficiary: true,
+            maxValue: 0,
+            expectedArg: aavePool
+        });
+        _reinit(allowed); // must not revert
+    }
+
+    /// @dev T-67 — drift protection. A hardcoded magic value in a security check must
+    ///      always carry a test that recomputes it from the signature.
+    function test_T67_approvalSelectorsMatchSignatures() public pure {
+        assertEq(bytes4(0x095ea7b3), bytes4(keccak256("approve(address,uint256)")), "approve");
+        assertEq(bytes4(0x39509351), bytes4(keccak256("increaseAllowance(address,uint256)")), "increaseAllowance");
+    }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  v2 STEP 10 — R14 + the attribution event
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * T-49 — R14. A non-empty `req.recipient` is rejected.
+     *
+     * This is a FAIL-CLOSED backstop for R6 (P-4): if the multicall prefix check were ever
+     * bypassed, `CEA._handleSingleCall` would receive recipient == address(0) with a
+     * non-empty payload and revert `InvalidRecipient()` (CEA.sol:237) rather than execute
+     * `recipient.call{value: msg.value}(payload)` — direct theft (A-02).
+     */
+    function test_T49_nonEmptyRecipientReverts() public {
+        UniversalOutboundTxRequest memory req = _request(_multicallPayload(_validCalls()));
+        req.recipient = abi.encodePacked(attacker);
+        bytes memory d = _data(req);
+
+        vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.NonEmptyRecipient.selector, uint256(20)));
+        _call(d);
+    }
+
+    function test_T50_emptyRecipientPasses() public {
+        assertEq(_check(_validCalls()), 0);
+    }
+
+    /**
+     * T-51 — F-11 attribution. The event names the config that authorized the action, and
+     * the ConfigId must match the value an indexer recomputes off-chain.
+     */
+    function test_T51_emitsMandateActionAuthorized() public {
+        Multicall[] memory calls = _validCalls();
+        bytes memory payload = _multicallPayload(calls);
+        bytes memory d = _data(_request(payload));
+
+        vm.expectEmit(true, true, false, true);
+        emit ACPActionPolicy.MandateActionAuthorized(cfgId, account, keccak256(payload), 100e6);
+        _call(d);
+    }
+
+    // ── v2 helpers ────────────────────────────────────────────────────
+
+    function _reinit(AllowedCall[] memory allowed) internal {
+        Config memory cfg = Config({
+            initialized: false,
+            destChainHash: keccak256("eip155:1"),
+            expectedCEA: expectedCEA,
+            asset: asset,
+            maxAmountPerCall: MAX_AMOUNT,
+            maxAmountTotal: type(uint256).max,
+            maxPCPerCall: type(uint256).max,
+            spent: 0,
+            allowedCalls: allowed
+        });
+        bytes memory initData = abi.encode(cfg);
+        vm.prank(smartSession);
+        policy.initializeWithMultiplexer(account, cfgId, initData);
+    }
+
+    function _expectUnpinned(address target, bytes4 selector, uint16 offset, bool hasBeneficiary, address expectedArg)
+        internal
+    {
+        AllowedCall[] memory allowed = new AllowedCall[](1);
+        allowed[0] = AllowedCall({
+            target: target,
+            selector: selector,
+            beneficiaryOffset: offset,
+            hasBeneficiary: hasBeneficiary,
+            maxValue: 0,
+            expectedArg: expectedArg
+        });
+        Config memory cfg = Config({
+            initialized: false,
+            destChainHash: keccak256("eip155:1"),
+            expectedCEA: expectedCEA,
+            asset: asset,
+            maxAmountPerCall: MAX_AMOUNT,
+            maxAmountTotal: type(uint256).max,
+            maxPCPerCall: type(uint256).max,
+            spent: 0,
+            allowedCalls: allowed
+        });
+        bytes memory initData = abi.encode(cfg);
+
+        vm.expectRevert(abi.encodeWithSelector(ACPActionPolicy.UnpinnedApprovalEntry.selector, target, selector));
+        vm.prank(smartSession);
+        policy.initializeWithMultiplexer(account, cfgId, initData);
     }
 }
 

@@ -11,7 +11,7 @@ alongside them — when a contract changes, its document changes in the same pul
 |---|---|---|
 | 1 | **[architecture.md](./architecture.md)** | **Start here.** The problem, the design, the full system diagram, and the end-to-end flow showing which contract is touched at each step |
 | 2 | [agent-wallet.md](./agent-wallet.md) | `PushAgentWallet` — the account that holds funds and performs every action |
-| 3 | [factory.md](./factory.md) | `AgentWalletFactory` — deterministic per-mandate deployment |
+| 3 | [factory.md](./factory.md) | `AgentWalletFactory` — deterministic one-per-owner deployment |
 | 4 | [modules.md](./modules.md) | `ACPActionPolicy`, `PushSessionValidator`, plus the adopted `SmartSession` engine and limit policies |
 | 5 | [libraries-and-types.md](./libraries-and-types.md) | Encoding libraries, mirrored Push Chain structs, shared errors, interfaces |
 

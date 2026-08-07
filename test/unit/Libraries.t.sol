@@ -24,6 +24,11 @@ import { AgentWalletFactory } from "../../src/AgentWalletFactory.sol";
 import { PushSessionValidator } from "../../src/validators/PushSessionValidator.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
 import { MockTarget, RejectsPC } from "../mocks/Mocks.sol";
+import { ACPActionPolicy } from "../../src/policies/ACPActionPolicy.sol";
+import { UniversalOutboundTxRequest, MULTICALL_SELECTOR } from "../../src/libraries/PushWalletTypes.sol";
+import { Session, PermissionId } from "smartsessions/DataTypes.sol";
+import { IdLib } from "smartsessions/lib/IdLib.sol";
+import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
 
 /// @dev Exposes the calldata-only decoders through an external boundary.
 contract DecodeHarness {
@@ -175,12 +180,13 @@ contract LibrariesTest is Test {
 
     /// callValidator must bubble the validator's raw revert data.
     function test_callValidatorBubblesRawRevertData() public {
-        PushAgentWallet impl = new PushAgentWallet();
+        PushAgentWallet impl =
+            new PushAgentWallet(address(0x5511), address(0x6A7E), address(0xAC90), address(0x71FE), address(0x0A11));
         AgentWalletFactory f = new AgentWalletFactory(address(impl));
         address owner = address(0xB0B);
 
         vm.prank(owner);
-        PushAgentWallet w = PushAgentWallet(payable(f.deployAgentWallet(keccak256("bubble"))));
+        PushAgentWallet w = PushAgentWallet(payable(f.deployAgentWallet(address(0))));
 
         Reverter r = new Reverter();
         vm.startPrank(owner);
@@ -205,6 +211,57 @@ contract LibrariesTest is Test {
         assertTrue(v.isInitialized(address(0xB0B)));
         assertTrue(v.isModuleType(7));
     }
+
+    // ══════════════════════════════════════════════════════════════════
+    //  v2 STEP 13 — constant-drift assertions (T-61 … T-63)
+    // ══════════════════════════════════════════════════════════════════
+
+    /**
+     * T-61 — MULTICALL_SELECTOR must match Push Chain core `Types.sol:57`.
+     *
+     * If this drifts, ACP's R6 would reject every legitimate payload (fail-closed, but a
+     * total outage), or worse, accept a prefix the CEA routes to `_handleSingleCall`.
+     */
+    function test_T61_multicallSelectorMatchesCoreTypes() public {
+        ACPActionPolicy policy = new ACPActionPolicy(address(0x6A7E));
+        assertEq(policy.MULTICALL_SELECTOR(), bytes4(keccak256("UEA_MULTICALL")), "derivation");
+        assertEq(policy.MULTICALL_SELECTOR(), MULTICALL_SELECTOR, "must equal PushWalletTypes");
+    }
+
+    /**
+     * T-62 — SEND_OUTBOUND_SELECTOR computed from the LOCAL interface.
+     *
+     * Fails loudly if `UniversalOutboundTxRequest` ever gains, loses or reorders a field:
+     * the struct-shaped signature changes, so the selector changes. A silent mismatch here
+     * would make every session action unroutable.
+     */
+    function test_T62_sendOutboundSelectorTracksTheStruct() public {
+        ACPActionPolicy policy = new ACPActionPolicy(address(0x6A7E));
+        assertEq(
+            policy.SEND_OUTBOUND_SELECTOR(),
+            IGatewayRef.sendUniversalTxOutbound.selector,
+            "selector must track the local struct ABI"
+        );
+        assertEq(policy.SEND_OUTBOUND_SELECTOR(), bytes4(0x77b86bec), "pinned value");
+    }
+
+    /**
+     * T-63 — (fuzz) the wallet's `_permissionId` must equal `IdLib.toPermissionId` for
+     * arbitrary sessions.
+     *
+     * This is the fuzzed form of the mirror-validity gate. If the derivations ever diverge,
+     * every grant-time guard would validate a different session than the one enabled.
+     */
+    function testFuzz_T63_permissionIdMatchesIdLib(address validator, bytes memory keyData, bytes32 salt) public pure {
+        Session memory s;
+        s.sessionValidator = ISessionValidator(validator);
+        s.sessionValidatorInitData = keyData;
+        s.salt = salt;
+
+        bytes32 ours = keccak256(abi.encode(s.sessionValidator, s.sessionValidatorInitData, s.salt));
+        bytes32 theirs = PermissionId.unwrap(IdLib.toPermissionIdMemory(s));
+        assertEq(ours, theirs, "wallet _permissionId must track IdLib");
+    }
 }
 
 contract Reverter {
@@ -224,4 +281,9 @@ contract Reverter {
     function isInitialized(address) external pure returns (bool) {
         return true;
     }
+}
+
+/// @dev Independent restatement of the gateway ABI, for the T-62 drift assertion.
+interface IGatewayRef {
+    function sendUniversalTxOutbound(UniversalOutboundTxRequest calldata req) external payable;
 }

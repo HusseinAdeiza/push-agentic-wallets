@@ -25,4 +25,49 @@ library PushWalletErrors {
     error ExecutionFailed();
     error NativeTransferFailed();
     error DelegatecallNotSupported();
+
+    // ==============================
+    //   v2 — MANDATE LIFECYCLE
+    // ==============================
+
+    /// @dev `session.salt` carries the mandateId; bytes32(0) would make mandates
+    ///      indistinguishable and is rejected at grant time.
+    error InvalidMandateId();
+    /// @dev A-04. Re-granting an existing PermissionId would silently reset ACP `spent`
+    ///      and every cap. `reconfigureMandate` is the explicit, authorised form.
+    error MandateAlreadyExists(bytes32 permissionId);
+    error MandateNotFound(bytes32 permissionId);
+    /// @dev F-17. Enabling a session before SmartSession is installed recreates the
+    ///      `onInstall` brick through the front door.
+    error SessionModuleNotInstalled();
+
+    // ── grant-time session shape guards ──
+    error MissingTimeFramePolicy();
+    /// @dev A-11. `validUntil == 0` means NO EXPIRY in TimeFramePolicy — on a shared
+    ///      one-per-user wallet that is a permanent unrevoked key.
+    error NonExpiringSessionForbidden();
+    error MissingValueLimitPolicy();
+    error MalformedPolicyInitData();
+    /// @dev Q9. ValueLimitPolicy reverts on a zero limit three calls deep as an opaque
+    ///      `PolicyNotInitialized`; reject it here with a clean grant-time error.
+    error ZeroValueLimit();
+    /// @dev W-1. Both fallback ActionIds are configured with actionTarget == address(1).
+    error FallbackActionForbidden();
+    /// @dev W-2. SmartSession as an action target maps to
+    ///      FALLBACK_ACTIONID_SMARTSESSION_CALL, which would expose enableSessions /
+    ///      removeSession to the session key.
+    error SmartSessionActionForbidden();
+    /// @dev G3a. v2.0 scope lock (P-5, F-25): the gateway is the only session target.
+    error ActionTargetNotGateway(address target);
+    /// @dev W-3. `minPolicies == 1` is satisfied by any single policy, so an action
+    ///      carrying only TimeFramePolicy would bypass ACP entirely.
+    error GatewayActionMissingACP();
+    /// @dev Q8. Duplicate (target, selector) entries collapse to one ConfigId and
+    ///      ConfigLib overwrites config per entry — the loose entry would win by array
+    ///      position. G3a pins the only legal target, so one action is the only shape.
+    error ExactlyOneActionRequired(uint256 provided);
+
+    // ── guardian (F-06, P-8) ──
+    error NotGuardian();
+    error SessionsArePaused();
 }

@@ -35,10 +35,10 @@ contract ExecuteWithSessionTest is Test {
     event SessionExecuted(address indexed validator, uint192 indexed nonceKey, uint64 nonceSeq, bytes32 opHash);
 
     function setUp() public {
-        impl = new PushAgentWallet();
+        impl = new PushAgentWallet(address(0x5511), address(0x6A7E), address(0xAC90), address(0x71FE), address(0x0A11));
         factory = new AgentWalletFactory(address(impl));
         vm.prank(ownerUEA);
-        wallet = PushAgentWallet(payable(factory.deployAgentWallet(mandateId)));
+        wallet = PushAgentWallet(payable(factory.deployAgentWallet(address(0))));
 
         validator = new MockValidator();
         target = new MockTarget();
@@ -211,10 +211,13 @@ contract ExecuteWithSessionTest is Test {
         wallet.executeWithSession(address(validator), mode, cd, "", 0, 0);
         bytes32 h1 = validator.lastOpHash();
 
-        // A second wallet, same owner, different mandate.
-        vm.prank(ownerUEA);
-        PushAgentWallet w2 = PushAgentWallet(payable(factory.deployAgentWallet(keccak256("m2"))));
-        vm.prank(ownerUEA);
+        // A second wallet. Under Rule 2 one owner has exactly one wallet, so a DIFFERENT
+        // OWNER is now what produces a second account — which is precisely the
+        // cross-account replay this test guards against (A-03).
+        address alice = address(0xA11CE0);
+        vm.prank(alice);
+        PushAgentWallet w2 = PushAgentWallet(payable(factory.deployAgentWallet(address(0))));
+        vm.prank(alice);
         w2.installModule(1, address(validator), "");
         w2.executeWithSession(address(validator), mode, cd, "", 0, 0);
 

@@ -25,6 +25,7 @@ import {
 } from "smartsessions/DataTypes.sol";
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
 import { TimeFramePolicy } from "smartsessions/external/policies/TimeFramePolicy.sol";
+import { ValueLimitPolicy } from "smartsessions/external/policies/ValueLimitPolicy.sol";
 
 import { MockUniversalGatewayPC, MockUSV } from "../mocks/Mocks.sol";
 
@@ -42,12 +43,18 @@ contract FullFlowTest is Test {
     PushSessionValidator internal sessionValidator;
     ACPActionPolicy internal acp;
     TimeFramePolicy internal timeFrame;
+    ValueLimitPolicy internal valueLimit;
 
     MockUniversalGatewayPC internal gateway;
 
     address internal constant USV_ADDR = 0xEC00000000000000000000000000000000000001;
 
+    /// @dev v2 §C.5 defaults for the canonical session template.
+    uint48 internal constant DEFAULT_VALID_UNTIL = 2_000_000_000;
+    uint256 internal constant DEFAULT_VALUE_LIMIT = 100 ether;
+
     address internal ownerUEA = address(0xB0B);
+    address internal guardian = address(0x6DA);
     address internal provider = address(0x9209);
     address internal expectedCEA = address(0xCEA);
     address internal asset = address(0xA55E7);
@@ -63,26 +70,47 @@ contract FullFlowTest is Test {
     function setUp() public {
         provKey = vm.addr(provKeyPk);
 
-        impl = new PushAgentWallet();
-        factory = new AgentWalletFactory(address(impl));
+        // v2 deployment order (Step 15): the session engine and every mandatory policy
+        // must exist BEFORE the wallet implementation, which pins them as immutables.
         smartSession = new SmartSession();
         sessionValidator = new PushSessionValidator();
         gateway = new MockUniversalGatewayPC();
         acp = new ACPActionPolicy(address(gateway));
         timeFrame = new TimeFramePolicy();
+        valueLimit = new ValueLimitPolicy();
+
+        impl = new PushAgentWallet(
+            address(smartSession), address(gateway), address(acp), address(timeFrame), address(valueLimit)
+        );
+        factory = new AgentWalletFactory(address(impl));
 
         MockUSV usv = new MockUSV();
         vm.etch(USV_ADDR, address(usv).code);
 
+        // Rule 2: one wallet per owner. `mandateId` is no longer a deploy input — it is
+        // the session salt.
         vm.prank(ownerUEA);
-        wallet = PushAgentWallet(payable(factory.deployAgentWallet(mandateId)));
+        wallet = PushAgentWallet(payable(factory.deployAgentWallet(guardian)));
     }
 
     // ── helpers ───────────────────────────────────────────────────────
 
+    /// @dev The canonical Aave supply entry. `expectedArg = address(0)` is the R9-ext
+    ///      sentinel for "the wallet's own CEA", which is correct for a deposit.
+    function _supplyEntry() internal view returns (AllowedCall memory) {
+        return AllowedCall({
+            target: aavePool,
+            selector: IAaveV3Pool.supply.selector,
+            beneficiaryOffset: 68,
+            hasBeneficiary: true,
+            maxValue: 0,
+            expectedArg: address(0)
+        });
+    }
+
     function _acpConfigWithTotal(uint256 total) internal view returns (bytes memory) {
         AllowedCall[] memory allowed = new AllowedCall[](1);
-        allowed[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 68, true, 0);
+        allowed[0] = _supplyEntry();
 
         Config memory cfg = Config({
             initialized: false,
@@ -99,32 +127,23 @@ contract FullFlowTest is Test {
     }
 
     function _acpConfig() internal view returns (bytes memory) {
-        AllowedCall[] memory allowed = new AllowedCall[](1);
-        allowed[0] = AllowedCall(aavePool, IAaveV3Pool.supply.selector, 68, true, 0);
-
-        Config memory cfg = Config({
-            initialized: false,
-            destChainHash: keccak256("eip155:1"),
-            expectedCEA: expectedCEA,
-            asset: asset,
-            maxAmountPerCall: MAX_AMOUNT,
-            maxAmountTotal: type(uint256).max,
-            maxPCPerCall: type(uint256).max,
-            spent: 0,
-            allowedCalls: allowed
-        });
-        return abi.encode(cfg);
+        return _acpConfigWithTotal(type(uint256).max);
     }
 
-    /// Builds a session granting `provKey` the right to call the gateway,
-    /// gated by ACPActionPolicy (and optionally TimeFramePolicy).
-    function _session(uint8 scheme, bytes memory key, uint48 validUntil) internal view returns (Session memory s) {
-        PolicyData[] memory actionPolicies = new PolicyData[](validUntil == 0 ? 1 : 2);
-        actionPolicies[0] = PolicyData({ policy: address(acp), initData: _acpConfig() });
-        if (validUntil != 0) {
-            actionPolicies[1] =
-                PolicyData({ policy: address(timeFrame), initData: abi.encodePacked(validUntil, uint48(0)) });
-        }
+    /**
+     * @dev The NORMATIVE v2.0 session template (§C.5). Every field is load-bearing:
+     *      TimeFramePolicy in `userOpPolicies` with a real expiry (A-11), and exactly ONE
+     *      gateway action carrying BOTH ACPActionPolicy and ValueLimitPolicy (G3b).
+     *      `grantMandate` rejects anything else.
+     */
+    function _v2Session(uint8 scheme, bytes memory key, bytes32 salt, uint48 validUntil, uint256 total)
+        internal
+        view
+        returns (Session memory s)
+    {
+        PolicyData[] memory actionPolicies = new PolicyData[](2);
+        actionPolicies[0] = PolicyData({ policy: address(acp), initData: _acpConfigWithTotal(total) });
+        actionPolicies[1] = PolicyData({ policy: address(valueLimit), initData: abi.encode(DEFAULT_VALUE_LIMIT) });
 
         ActionData[] memory actions = new ActionData[](1);
         actions[0] = ActionData({
@@ -133,54 +152,58 @@ contract FullFlowTest is Test {
             actionPolicies: actionPolicies
         });
 
+        PolicyData[] memory userOpPolicies = new PolicyData[](1);
+        // 12 bytes: validUntil in the HIGH 6, validAfter in the LOW 6.
+        userOpPolicies[0] =
+            PolicyData({ policy: address(timeFrame), initData: abi.encodePacked(validUntil, uint48(0)) });
+
         s = Session({
             sessionValidator: ISessionValidator(address(sessionValidator)),
             sessionValidatorInitData: abi.encode(scheme, key),
-            salt: bytes32(0),
-            userOpPolicies: new PolicyData[](0),
+            salt: salt,
+            userOpPolicies: userOpPolicies,
             erc7739Policies: ERC7739Data({
                 allowedERC7739Content: new ERC7739Context[](0), erc1271Policies: new PolicyData[](0)
             }),
             actions: actions,
             permitERC4337Paymaster: true
         });
+    }
+
+    /// @dev Default-shaped session for `provKey`, ECDSA scheme, no cumulative ceiling.
+    function _session(uint8 scheme, bytes memory key, uint48 validUntil) internal view returns (Session memory) {
+        return _v2Session(scheme, key, mandateId, validUntil == 0 ? DEFAULT_VALID_UNTIL : validUntil, type(uint256).max);
     }
 
     /// Session whose ACP config carries an explicit cumulative ceiling (C-2).
-    function _sessionWithTotal(uint256 total) internal view returns (Session memory s) {
-        PolicyData[] memory actionPolicies = new PolicyData[](1);
-        actionPolicies[0] = PolicyData({ policy: address(acp), initData: _acpConfigWithTotal(total) });
-
-        ActionData[] memory actions = new ActionData[](1);
-        actions[0] = ActionData({
-            actionTargetSelector: bytes4(0x77b86bec), actionTarget: address(gateway), actionPolicies: actionPolicies
-        });
-
-        s = Session({
-            sessionValidator: ISessionValidator(address(sessionValidator)),
-            sessionValidatorInitData: abi.encode(uint8(0), abi.encodePacked(provKey)),
-            salt: bytes32(0),
-            userOpPolicies: new PolicyData[](0),
-            erc7739Policies: ERC7739Data({
-                allowedERC7739Content: new ERC7739Context[](0), erc1271Policies: new PolicyData[](0)
-            }),
-            actions: actions,
-            permitERC4337Paymaster: true
-        });
+    function _sessionWithTotal(uint256 total) internal view returns (Session memory) {
+        return _v2Session(uint8(0), abi.encodePacked(provKey), mandateId, DEFAULT_VALID_UNTIL, total);
     }
 
+    /// @dev Grants through the PRODUCTION path (`grantMandate`), so every guard runs.
     function _grantSession(Session memory s) internal returns (PermissionId permissionId) {
+        _installSmartSession();
+        vm.prank(ownerUEA);
+        permissionId = PermissionId.wrap(wallet.grantMandate(s));
+    }
+
+    function _installSmartSession() internal {
+        if (!wallet.isModuleInstalled(1, address(smartSession), "")) {
+            vm.prank(ownerUEA);
+            wallet.installModule(1, address(smartSession), "");
+        }
+    }
+
+    /// @dev DELIBERATE guard bypass for negative tests that must enable a malformed
+    ///      session. `callValidator` skips every `grantMandate` guard (S-14 forbids this
+    ///      in production). Each caller documents why it needs the raw path.
+    function _grantRaw(Session memory s) internal returns (PermissionId permissionId) {
         Session[] memory sessions = new Session[](1);
         sessions[0] = s;
-
+        _installSmartSession();
         vm.prank(ownerUEA);
-        wallet.installModule(1, address(smartSession), "");
-
-        bytes memory ret;
-        bytes memory callData = abi.encodeCall(ISmartSession.enableSessions, (sessions));
-        vm.prank(ownerUEA);
-        ret = wallet.callValidator(address(smartSession), callData);
-
+        bytes memory ret =
+            wallet.callValidator(address(smartSession), abi.encodeCall(ISmartSession.enableSessions, (sessions)));
         PermissionId[] memory ids = abi.decode(ret, (PermissionId[]));
         permissionId = ids[0];
     }
@@ -233,39 +256,47 @@ contract FullFlowTest is Test {
     // ── I-01 … I-03 — factory ─────────────────────────────────────────
 
     function test_I01_deploysAtPredictedAddress() public {
-        bytes32 m = keccak256("m2");
-        address predicted = factory.computeAgentWallet(ownerUEA, m);
+        address alice = address(0xA11CE0);
+        address predicted = factory.computeAgentWallet(alice);
 
-        vm.prank(ownerUEA);
-        address actual = factory.deployAgentWallet(m);
+        vm.prank(alice);
+        address actual = factory.deployAgentWallet(guardian);
 
         assertEq(actual, predicted, "counterfactual address must be correct");
-        assertEq(PushAgentWallet(payable(actual)).owner(), ownerUEA);
-        assertTrue(factory.isDeployed(ownerUEA, m));
-        assertEq(factory.walletOf(ownerUEA, m), actual);
+        assertEq(PushAgentWallet(payable(actual)).owner(), alice);
+        assertEq(PushAgentWallet(payable(actual)).guardian(), guardian);
+        assertTrue(factory.isDeployed(alice));
+        assertEq(factory.walletOf(alice), actual);
     }
 
-    function test_I02_duplicateMandateReverts() public {
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                AgentWalletFactory.WalletAlreadyDeployed.selector, ownerUEA, mandateId, address(wallet)
-            )
-        );
+    /// @dev v2 / Rule 2: a repeat deploy is IDEMPOTENT, not a revert (F-13). A revert
+    ///      inside the atomic Stage B multicall would fail an otherwise benign grant,
+    ///      and under one-wallet-per-user a duplicate deploy can damage nothing.
+    function test_I02_repeatDeployIsIdempotent() public {
         vm.prank(ownerUEA);
-        factory.deployAgentWallet(mandateId);
-    }
+        address again = factory.deployAgentWallet(guardian);
+        assertEq(again, address(wallet), "must return the existing wallet");
 
-    function test_I03_differentMandateYieldsDifferentWallet() public {
+        // A different guardian argument cannot re-point an existing wallet.
         vm.prank(ownerUEA);
-        address second = factory.deployAgentWallet(keccak256("other"));
-        assertTrue(second != address(wallet), "blast-radius containment");
-        assertEq(PushAgentWallet(payable(second)).owner(), ownerUEA);
+        address third = factory.deployAgentWallet(address(0xDEAD));
+        assertEq(third, address(wallet));
+        assertEq(wallet.guardian(), guardian, "guardian must not be overwritten");
     }
 
-    function test_I03b_sameMandateDifferentOwnersAreDistinct() public {
+    /// @dev v2 / Rule 2: the mandateId is NO LONGER a deploy input. The same owner always
+    ///      resolves to the same wallet — that is the whole point, since it fixes one CEA
+    ///      per user per external chain. Mandates multiply as sessions instead.
+    function test_I03_oneWalletPerOwnerRegardlessOfMandate() public {
+        vm.prank(ownerUEA);
+        address second = factory.deployAgentWallet(guardian);
+        assertEq(second, address(wallet), "one wallet per owner, for life");
+    }
+
+    function test_I03b_differentOwnersAreDistinct() public {
         address alice = address(0xA11CE0);
         vm.prank(alice);
-        address aliceWallet = factory.deployAgentWallet(mandateId);
+        address aliceWallet = factory.deployAgentWallet(guardian);
         assertTrue(aliceWallet != address(wallet));
         assertEq(PushAgentWallet(payable(aliceWallet)).owner(), alice);
     }

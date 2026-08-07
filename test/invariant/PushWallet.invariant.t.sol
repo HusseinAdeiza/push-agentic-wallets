@@ -117,7 +117,7 @@ contract WalletHandler is Test {
     }
 
     function tryReinitialize(address newOwner) external {
-        try wallet.initialize(newOwner) { } catch { }
+        try wallet.initialize(newOwner, newOwner) { } catch { }
     }
 
     function fund(uint96 amount) external {
@@ -141,10 +141,14 @@ contract PushWalletInvariantTest is Test {
     address internal ownerUEA = address(0xB0B);
 
     function setUp() public {
-        PushAgentWallet impl = new PushAgentWallet();
+        // Invariants target the wallet's own state machine (owner immutability, module
+        // type separation, nonce monotonicity), not the grant guards, so the constructor
+        // immutables only need to be distinct non-zero addresses.
+        PushAgentWallet impl =
+            new PushAgentWallet(address(0x5511), address(0x6A7E), address(0xAC90), address(0x71FE), address(0x0A11));
         factory = new AgentWalletFactory(address(impl));
         vm.prank(ownerUEA);
-        wallet = PushAgentWallet(payable(factory.deployAgentWallet(keccak256("inv"))));
+        wallet = PushAgentWallet(payable(factory.deployAgentWallet(address(0))));
 
         validator = new MockValidator();
         target = new MockTarget();

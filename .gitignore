@@ -21,3 +21,6 @@ DEVIATIONS.md
 # Per-developer Claude Code config. Hooks here point at absolute paths on one
 # machine, so committing it breaks every other clone.
 .claude/
+
+# Throwaway archives created to hand the tree to a reviewer.
+.review_bundle.tgz

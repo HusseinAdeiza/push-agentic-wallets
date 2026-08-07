@@ -67,10 +67,10 @@ Each wallet is an **EIP-1167 minimal clone** delegating to one shared implementa
 
 ```mermaid
 graph LR
-    subgraph clones["One clone per mandate — ~50k gas each"]
+    subgraph clones["One clone per USER — ~50k gas each"]
         C1["0xbobagw"]
         C2["0xalicagw"]
-        C3["0xbobagw2"]
+        C3["0xcarolagw"]
     end
     IMPL["PushAgentWallet<br/>implementation<br/>(logic only, never holds funds)"]
     C1 -->|delegatecall| IMPL
