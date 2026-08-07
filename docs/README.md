@@ -17,13 +17,27 @@ alongside them — when a contract changes, its document changes in the same pul
 
 ## The one-paragraph version
 
-A user grants an AI agent a **session key** on a dedicated smart account
-(`PushAgentWallet`) owned by their existing UEA. The agent can compose and submit
-cross-chain transactions, but every action must survive a chain of policy checks — spend
-cap, time window, target allowlist, and an action policy that forces the beneficiary of
-any deposit to be the wallet's own CEA. Because the **wallet** is always `msg.sender` at
-the gateway, the resulting position is always owned by the user. The agent moves value
-without ever custodying it, and the owner can revoke everything instantly.
+A user has **one** smart account (`PushAgentWallet`), owned for life by their existing UEA.
+They grant an AI agent a **mandate**: a session key on that account, scoped and expiring.
+The agent can compose and submit cross-chain transactions, but every action must survive a
+chain of policy checks — per-call and lifetime spend caps, a time window, a gas budget, a
+target allowlist, and an action policy that forces the beneficiary of any deposit to be the
+wallet's own CEA. Because the **wallet** is always `msg.sender` at the gateway, the
+resulting position is always owned by the user. The agent moves value without ever
+custodying it; the owner can revoke everything at any time, and a designated **guardian**
+can pause every session in a single Push transaction.
+
+## What changed in v2
+
+v1 gave each mandate its own wallet. That meant a new CEA on every external chain per
+mandate, which fragmented protocol rewards, approvals and identity. **v2 collapses the fleet
+into one wallet per user**, and a mandate becomes a session rather than a contract.
+
+The consequence is worth stating plainly, because it changes how you should read these docs:
+**isolation is now configured, not structural.** v1 could say "two mandates cannot touch each
+other because they are different contracts." That claim is withdrawn. The replacement is the
+**Mandate Bound** — a table of caps readable directly from policy state, described in
+[architecture.md §8.1](./architecture.md#81-one-wallet-per-user).
 
 ## Conventions
 

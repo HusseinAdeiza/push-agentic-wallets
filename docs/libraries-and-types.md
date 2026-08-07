@@ -7,6 +7,7 @@ interface declarations.
 src/libraries/     ModeLib · ExecutionLib · PushWalletTypes · PushWalletErrors
 src/interfaces/    IERC7579Account · IERC7579Module · IPushAgentWallet
                    IAgentWalletFactory · IUniversalGatewayPC · IUSigVerifier
+                   ISmartSessionMandate
 ```
 
 None of these hold state or make decisions. They are the vocabulary the rest of the system
@@ -135,6 +136,27 @@ struct Multicall {
 }
 ```
 
+### `AllowedCall` and `Config`
+
+Declared in `ACPActionPolicy.sol` rather than `PushWalletTypes`, because they are the
+policy's own configuration rather than a mirror of an upstream struct.
+
+```solidity
+struct AllowedCall {
+    address target;             // e.g. the Aave pool on the destination chain
+    bytes4  selector;           // e.g. supply(...)
+    uint16  beneficiaryOffset;  // byte offset of the pinned address word
+    bool    hasBeneficiary;     // false only when nothing needs pinning
+    uint256 maxValue;           // destination-chain native value ceiling for this entry
+    address expectedArg;        // address(0) = "the wallet's own CEA"; otherwise pin exactly
+}
+```
+
+`expectedArg` is the field that makes approvals safe. A deposit entry uses the zero sentinel
+so the beneficiary must be the user's CEA; an ERC-20 `approve` sets it to the protocol
+address, because the spender must be the protocol and never the CEA. The policy refuses to
+store an approval entry that leaves it unset.
+
 ### `MULTICALL_SELECTOR`
 
 ```solidity
@@ -183,14 +205,43 @@ graph TB
         S3["OperationNotYetValid"]
         S4["OperationExpired"]
     end
+    subgraph mand["Mandate lifecycle"]
+        D1["InvalidMandateId"]
+        D2["MandateAlreadyExists"]
+        D3["MandateNotFound"]
+        D4["SessionModuleNotInstalled"]
+    end
+    subgraph guards["Grant-time guards"]
+        G1["MissingTimeFramePolicy"]
+        G2["NonExpiringSessionForbidden"]
+        G3["MissingValueLimitPolicy · ZeroValueLimit"]
+        G4["MalformedPolicyInitData"]
+        G5["FallbackActionForbidden"]
+        G6["SmartSessionActionForbidden"]
+        G7["ActionTargetNotGateway"]
+        G8["GatewayActionMissingACP"]
+        G9["ExactlyOneActionRequired"]
+    end
+    subgraph guard["Guardian"]
+        N1["NotGuardian"]
+        N2["SessionsArePaused"]
+    end
 
     style auth fill:#4a1d1d,stroke:#ef4444,color:#fbe8e8
     style sess fill:#1e3a5f,stroke:#3b82f6,color:#e8f1fb
+    style guards fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
+    style guard fill:#3f2d10,stroke:#f59e0b,color:#fdf3e0
 ```
 
 Most carry the offending values as parameters — `InvalidNonce(key, expected, provided)`
 tells you immediately what went wrong, which matters for an agent that must decide whether
 to retry.
+
+The **grant-time guard** errors are worth reading as a group: each one names a specific way
+a session could be weaker than the user intended, and every one of them is refused before
+the mandate exists rather than tolerated at execution time. `ACPActionPolicy` declares its
+own errors separately, including `UnpinnedApprovalEntry` and `ZeroExpectedCEA` for the
+config-time checks.
 
 ---
 
@@ -204,7 +255,12 @@ are declared.
 | Interface | Describes | Why local |
 |---|---|---|
 | `IUniversalGatewayPC` | Push Chain's outbound gateway | Avoids a cross-repo build dependency |
-| `IUSigVerifier` | The USV precompile at `0xEC00...0001` | Same |
+| `IUSigVerifier` | The USV precompile at `0xEC00...0001` | Same. **Documentation only** — the validator calls the precompile with a raw `staticcall`, because a high-level call inserts an `extcodesize` check that reverts on a codeless target |
+| `ISmartSessionMandate` | The four SmartSession functions the wallet's mandate lifecycle calls | A narrow local slice makes the wallet's authority over the session engine auditable at a glance |
+
+`ISmartSessionMandate` declares only `enableSessions`, `removeSession`,
+`isPermissionEnabled` and `getPermissionIDs`. All four are `msg.sender`-scoped upstream, so
+the wallet cannot reach another account's sessions through it.
 
 ### ERC-7579 interfaces
 

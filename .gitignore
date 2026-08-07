@@ -24,3 +24,8 @@ DEVIATIONS.md
 
 # Throwaway archives created to hand the tree to a reviewer.
 .review_bundle.tgz
+
+
+  # Generated knowledge graph. Regenerate with `graphify update .` — the manifest
+  # and cache key off absolute local paths, so they are not portable across clones.
+graphify-out/

@@ -113,7 +113,7 @@ superseded by `ACPActionPolicy`.
 
 ## Tests
 
-194 tests, all passing. `forge test` and `grep -rhoE "function (test|invariant)[A-Za-z0-9_]*" test/ | wc -l` both report 194.
+282 tests, all passing. `forge test` and `grep -rhoE "function (test|invariant)[A-Za-z0-9_]*" test/ | wc -l` both report 282.
 
 | Suite | Tests | Covers |
 |---|---|---|
@@ -144,7 +144,7 @@ Senior review found two critical defects, both now fixed:
 - **No cumulative spend cap** — the mandate ceiling was per-call only, so an agent could
   drain the wallet across repeated in-cap calls. `ACPActionPolicy` now accumulates.
 
-`DEVIATIONS.md` records the full resolved/open split. Four items remain open, none
+`docs-internal/DEVIATIONS.md` records the full resolved/open split. Four items remain open, none
 blocking code: coverage justification, the V-11 fork test, deployment addresses, and an
 escalation to the gateway team about freezing the CEA implementation setter.
 

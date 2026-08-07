@@ -31,16 +31,22 @@ graph TB
     style LIM fill:#1e3a5f,stroke:#3b82f6,color:#e8f1fb
 ```
 
-| Module | Origin | Question it answers |
-|---|---|---|
-| `SmartSession` | adopted | Is there a valid session, and does every check pass? |
-| `PushSessionValidator` | **ours** | Did the session key actually sign this hash? |
-| `ACPActionPolicy` | **ours** | Is this specific cross-chain action permitted? |
-| `ERC20SpendingLimitPolicy` | adopted | Has the cumulative spend cap been exhausted? |
-| `TimeFramePolicy` | adopted | Are we inside the session's validity window? |
-| `ValueLimitPolicy` | adopted | Is the native value within bounds? |
-| `UsageLimitPolicy` | adopted | Has the session been used too many times? |
-| `ContractWhitelistPolicy` | adopted | Is the target on the allowlist? |
+| Module | Origin | Status | Question it answers |
+|---|---|---|---|
+| `SmartSession` | adopted | required | Is there a valid session, and does every check pass? |
+| `PushSessionValidator` | **ours** | required | Did the session key actually sign this hash? |
+| `ACPActionPolicy` | **ours** | **mandatory** | Is this specific cross-chain action permitted? |
+| `TimeFramePolicy` | adopted | **mandatory** | Are we inside the session's validity window? |
+| `ValueLimitPolicy` | adopted | **mandatory** | Is the pooled PC gas budget exhausted? |
+| `UsageLimitPolicy` | adopted | optional | Has the session been used too many times? |
+| `ContractWhitelistPolicy` | adopted | optional | Is the target on the allowlist? |
+| `ERC20SpendingLimitPolicy` | adopted | **not used** | — the asset cap lives in `ACPActionPolicy` |
+| `SimpleGasPolicy` | adopted | ⛔ **never attach** | See the warning in §14 |
+
+The three **mandatory** policies are enforced on-chain at grant time: `grantMandate` refuses
+any session missing `TimeFramePolicy` with a real expiry, or missing either
+`ACPActionPolicy` or `ValueLimitPolicy` on its single gateway action. They are guarantees,
+not conventions.
 
 Adopted contracts are deployed **unmodified** and pinned to an exact upstream commit. They
 are audited upstream; forking them would discard that.
@@ -97,10 +103,17 @@ grants the session:
 | `allowedCalls[]` | Exhaustive allowlist of permitted inner calls |
 
 Each `allowedCalls` entry is a `(target, selector, beneficiaryOffset, hasBeneficiary,
-maxValue)` tuple: which contract, which function, where the beneficiary sits in the
-calldata, whether it has one at all (`approve`, for instance, does not), and how much
-destination-chain native value that call may carry (`0` for every v1 target, since all
-are non-payable).
+maxValue, expectedArg)` tuple: which contract, which function, where the pinned address sits
+in the calldata, whether there is one at all, how much destination-chain native value that
+call may carry (`0` for every current target, since all are non-payable), and **which
+address that word must equal**.
+
+`expectedArg` is what makes the allowlist safe for approvals:
+
+| `expectedArg` | Meaning |
+|---|---|
+| `address(0)` | Sentinel: "the wallet's own CEA". Correct for every deposit-style entry (`supply`, `repay`) |
+| any other address | Pin the argument to exactly that address. Required for an ERC-20 `approve`, whose spender must be the **protocol**, never the CEA |
 
 The two amount ceilings are deliberately redundant and bound different things:
 
@@ -113,7 +126,7 @@ Without the per-call ceiling a 1,000 USDC mandate empties in a single call. With
 attacker needs N transactions — each an observable on-chain event the owner can revoke
 against mid-sequence.
 
-## 5. The eleven rules
+## 5. The rules
 
 `checkAction` applies these in order, cheapest first.
 
@@ -122,25 +135,31 @@ flowchart TD
     R1["R1 · config initialized?"] --> R2["R2 · target == UniversalGatewayPC?"]
     R2 --> R3["R3 · selector == sendUniversalTxOutbound?"]
     R3 --> R4["R4 · req.token == configured asset?"]
-    R4 --> R5["R5 · req.amount <= per-call cap?"]
+    R4 --> R14["R14 · req.recipient is EMPTY?"]
+    R14 --> R13["R13 · req.amount != 0?"]
+    R13 --> R5["R5 · req.amount <= per-call cap?"]
     R5 --> R5B["R5b · spent + amount <= total cap?"]
     R5B --> R12["R12 · forwarded PC <= maxPCPerCall?"]
-    R12 --> R13["R13 · req.amount != 0?"]
-    R13 --> R10["R10 · revertRecipient == the account?"]
+    R12 --> R10["R10 · revertRecipient == the account?"]
     R10 --> R6["R6 · payload is a multicall?"]
 
     R6 --> LOOP["for each inner call"]
-    LOOP --> R7["R7 · target is not the account,<br/>the policy, or the gateway"]
+    LOOP --> R7["R7 · target is not the account, the policy,<br/>the gateway, or THE CEA"]
     R7 --> R8["R8 · (target, selector) on the allowlist?"]
-    R8 --> R9["R9 · beneficiary == expectedCEA?"]
+    R8 --> R9["R9 · pinned word == expectedArg,<br/>or the CEA if expectedArg is 0"]
     R9 --> R11["R11 · entry value <= its allowed maxValue"]
     R11 --> LOOP
-    LOOP --> OK["VALIDATION_SUCCESS"]
+    LOOP --> WRITE["write spent · emit MandateActionAuthorized"]
+    WRITE --> OK["VALIDATION_SUCCESS"]
 
     style OK fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
     style R9 fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
+    style R14 fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
     style R7 fill:#3f3a1e,stroke:#eab308,color:#fbf7e8
 ```
+
+Rule numbers are **not sequential** and are never renumbered — existing tests and audit
+notes reference them by number, so new rules are appended rather than inserted.
 
 Three of these carry most of the security weight.
 
@@ -148,13 +167,37 @@ Three of these carry most of the security weight.
 requires it to equal the committed CEA. This is what stops redirection.
 
 **R7 — forbidden inner targets.** An inner call may not target the account itself, the
-policy, or the gateway. The account is the important one: without R7 an agent could route
-a call back into the wallet and reach `installModule`, taking control of the whole
-account. This is defence-in-depth — SmartSession rejects self-calls upstream and the
-wallet's own authorization rejects them too — and all three layers are kept deliberately.
+policy, the gateway, **or the wallet's own CEA**.
+
+The first three are defence-in-depth against reaching `installModule` through a call routed
+back into the wallet — SmartSession rejects self-calls upstream and the wallet's own
+authorization rejects them too, and all three layers are kept deliberately.
+
+The fourth is load-bearing on its own. An inner call targeting the CEA executes with
+`msg.sender == CEA`, which **satisfies** the CEA's own self-call check, and the frozen CEA
+explicitly permits value-0 self-calls. That makes the inner CEA self-call a working **exit
+path**: a compromised key could bridge value out with an agent-chosen revert recipient.
+Sessions are entry-only — they open positions and never close them — so the target is
+refused structurally rather than left to the allowlist. An allowlist omission is one SDK bug
+away; a structural rule is not.
+
+**R9 — the pinned argument.** Reads the configured word out of the inner calldata and
+requires it to equal `expectedArg`, or the committed CEA when `expectedArg` is the zero
+sentinel. This is what stops both deposit redirection *and* an approval handing the CEA's
+balance to an attacker.
 
 **R10 — revert recipient.** If the cross-chain transaction fails, funds return to the
 account, never to a third party.
+
+**R14 — the destination recipient must be empty.** An empty `recipient` is the gateway's own
+documented "park the funds in the caller's CEA" convention, so this is the canonical
+encoding rather than a restriction. It is also a **fail-closed backstop for R6**: if the
+multicall prefix check were ever bypassed, the frozen CEA would receive a zero recipient
+with a non-empty payload and revert `InvalidRecipient()` — instead of executing that payload
+as a raw call, which would be direct theft.
+
+R14 is **session-path only**. The owner path deliberately permits a non-empty recipient,
+because withdrawals to an external address depend on it.
 
 **R5b — the cumulative cap.** `spent` accumulates across the session's lifetime, so an
 agent cannot make repeated individually-legal calls until the wallet is empty. The
@@ -173,7 +216,36 @@ R13 rejects zero-amount outbounds outright, closing the class. R12 caps the per-
 outflow for the shapes that remain. The two together mean the PC gas budget is bounded in
 both shape and size.
 
-## 6. Reading the beneficiary
+## 6. Config-time validation
+
+Two checks run when the config is stored, not when an action is checked. They cost nothing
+on the hot path and make a dangerous configuration **unrepresentable** rather than merely
+inadvisable.
+
+**CV-1 — approval entries must pin their spender.** Any `allowedCalls` entry whose selector
+is `approve` or `increaseAllowance` must carry `hasBeneficiary = true`, `beneficiaryOffset =
+4`, and a non-zero `expectedArg`. Otherwise the config reverts at grant time.
+
+Without it, the mandatory destination-chain `approve` would ship with a completely unchecked
+spender. A compromised key could then bridge one wei — satisfying every amount rule — with
+an inner `approve(attacker, type(uint256).max)`, and drain the CEA directly on the
+destination chain via `transferFrom`.
+
+**CV-2 — the committed CEA cannot be zero.** Because `expectedArg == address(0)` is the
+sentinel for "the wallet's own CEA", a zero `expectedCEA` would collapse that sentinel: R9
+would compare the extracted beneficiary against the zero address, and a `supply(onBehalf =
+0)` would pass.
+
+Both follow the same principle: anything the SDK could silently get wrong is validated
+on-chain. And because they live in the **policy** rather than the wallet, they fire on every
+path that stores a config — `grantMandate`, `reconfigureMandate`, and the owner's
+`callValidator` escape hatch alike. There is no route that builds a mis-pinned config.
+
+A general rule is not possible here: the policy cannot know which argument of an arbitrary
+selector grants authority, since `permit`, `setApprovalForAll` and protocol-specific
+authorizations all differ. Those remain an SDK obligation.
+
+## 7. Reading the beneficiary
 
 The policy extracts the beneficiary by reading a 32-byte word at a configured byte offset
 and taking its low 20 bytes.
@@ -191,7 +263,7 @@ graph LR
 |---|---|---|---|---|
 | Aave v3 / Spark | `supply(address,uint256,address,uint16)` | `onBehalfOf` | **68** | `4 + 32 + 32` |
 | Morpho Blue | `supply(MarketParams,uint256,uint256,address,bytes)` | `onBehalf` | **228** | `4 + 160 + 32 + 32` |
-| ERC-20 | `approve(address,uint256)` | none | — | `hasBeneficiary = false` |
+| ERC-20 | `approve(address,uint256)` | `spender` | **4** | first argument — **required** by CV-1 |
 
 Morpho's `MarketParams` is five static fields encoded inline, hence 160 bytes.
 
@@ -201,7 +273,7 @@ because offsets are **configuration**, every protocol added to an allowlist need
 asserting its offset extracts the right address from a real encoded call. A wrong offset
 reads the wrong word and would pass silently.
 
-## 7. Where the policy sits in the nesting
+## 8. Where the policy sits in the nesting
 
 ```mermaid
 graph TB
@@ -222,7 +294,7 @@ own loop is over the inner multicall, the instructions destined for the other ch
 
 # Part II — `PushSessionValidator`
 
-## 8. What it does
+## 9. What it does
 
 A stateless validator answering one question: **did this key sign this hash?**
 
@@ -231,7 +303,7 @@ It supports two signature schemes:
 - **secp256k1 (ECDSA)** — standard EVM signing, verified with `ecrecover`
 - **Ed25519** — Solana-style keys, verified through the USV precompile
 
-## 9. Why it matters
+## 10. Why it matters
 
 This is what makes a Solana-keyed agent a first-class operator on an EVM account. An agent
 holding only an Ed25519 keypair can drive a Push Chain smart account without ever
@@ -252,7 +324,7 @@ graph LR
     style V fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
 ```
 
-## 10. How it is configured
+## 11. How it is configured
 
 The session config carries `abi.encode(uint8 scheme, bytes key)`:
 
@@ -263,7 +335,7 @@ The session config carries `abi.encode(uint8 scheme, bytes key)`:
 
 Signature lengths are enforced: 65 bytes for ECDSA, 64 for Ed25519.
 
-## 11. Verification flow
+## 12. Verification flow
 
 ```mermaid
 flowchart TD
@@ -304,7 +376,7 @@ verifies over the ASCII of a hex string, which is oriented toward wallet display
 headless agent signing with a standard library produces a raw-bytes signature, so the raw
 variant is the correct one.
 
-## 12. USV precompile notes
+## 13. USV precompile notes
 
 Fixed at `0xEC00000000000000000000000000000000000001`, chain-level.
 
@@ -316,7 +388,7 @@ Fixed at `0xEC00000000000000000000000000000000000001`, chain-level.
 
 # Part III — Adopted modules
 
-## 13. SmartSession
+## 14. SmartSession
 
 The session engine, adopted unmodified from `erc7579/smartsessions` at a pinned commit.
 
@@ -348,37 +420,47 @@ Only **USE mode** is exercised: sessions are always granted by the owner in adva
 enabled inline by the agent as part of its own transaction. The agent can therefore never
 widen its own permissions.
 
-## 14. The limit policies
+## 15. The limit policies
 
 Five adopted policies, each enforcing an orthogonal constraint. They compose — a session
 typically installs several.
 
-| Policy | Constrains | Typical use |
-|---|---|---|
-| `ERC20SpendingLimitPolicy` | Cumulative ERC-20 spend | "at most 500 USDC in total" |
-| `TimeFramePolicy` | Validity window | "expires in 30 days" |
-| `ValueLimitPolicy` | Native value per use | Caps gas forwarded per action |
-| `UsageLimitPolicy` | Number of uses | "at most 10 operations" |
-| `ContractWhitelistPolicy` | Target address | Restricts which contracts are reachable |
+| Policy | Constrains | Status | Typical use |
+|---|---|---|---|
+| `TimeFramePolicy` | Validity window | **mandatory** | "expires in 30 days" |
+| `ValueLimitPolicy` | Cumulative native value | **mandatory** | The mandate's lifetime PC gas budget |
+| `UsageLimitPolicy` | Number of uses | optional | "at most 10 operations" |
+| `ContractWhitelistPolicy` | Target address | optional | Restricts which contracts are reachable |
+| `ERC20SpendingLimitPolicy` | Cumulative ERC-20 spend | **not used** | Superseded by `ACPActionPolicy.maxAmountTotal` |
 
-The spend limit is worth highlighting because it is **cumulative**, not per-call: it tracks
-what has already been spent, so an agent cannot make repeated small transfers that
-individually pass but collectively exceed the mandate.
+`ValueLimitPolicy` is the mandate's **gas budget**, and it matters more under one shared
+wallet than it would under many: native PC is pooled across every mandate, so without a
+lifetime cap a compromised key could drain the pool through repeated in-cap calls. It
+accumulates the action-level value directly, which makes the bound a single readable number
+rather than the product of two parameters.
 
-```mermaid
-graph LR
-    C["cap: 100 USDC"]
-    T1["transfer 60<br/>total 60 ✓"] --> T2["transfer 60<br/>total 120 ✗"]
-    T2 --> REV["revert"]
-
-    style REV fill:#4a1d1d,stroke:#ef4444,color:#fbe8e8
-```
+`ERC20SpendingLimitPolicy` is deliberately unused. The cumulative asset cap lives in
+`ACPActionPolicy.maxAmountTotal` instead, because the real flow is
+`(gateway, sendUniversalTxOutbound)` rather than `(token, transfer)` — and the spend policy
+does not check the *spender*, which would make a session-path `approve` an exfiltration
+vector.
 
 Two upstream policies, `UniActionPolicy` and `ArgPolicy`, are deliberately **not** adopted:
 both require a newer compiler than this project pins, and `ACPActionPolicy` supersedes
 their functionality for our use case.
 
-## 15. How a session is granted
+> ### ⛔ Never attach `SimpleGasPolicy` on Push Chain
+>
+> It reads gas fields out of the `PackedUserOperation`. Because Push Chain has no EntryPoint,
+> the wallet builds that struct in memory with **every gas field zero** — so the policy
+> computes a zero cost, passes everything forever, and still satisfies SmartSession's
+> "at least one policy" floor while *appearing* in the session as a gas control.
+>
+> A policy that enforces nothing but looks like it does is worse than no policy. Use
+> `ValueLimitPolicy` for gas budgeting. This is a natural mistake when porting a standard
+> ERC-4337 session template, which is why it is called out here rather than left implicit.
+
+## 16. How a session is granted
 
 Sessions are always established by the owner, in advance.
 
@@ -390,22 +472,33 @@ sequenceDiagram
     participant P as Policies
 
     O->>W: installModule(1, SmartSession)
-    O->>W: callValidator(enableSessions(sessions))
-    Note over W: wallet forwards, so SmartSession<br/>sees msg.sender == the account
-    W->>SS: enableSessions(...)
+    O->>W: grantMandate(session)
+    Note over W: guards: salt != 0 · module installed<br/>TimeFrame with real expiry<br/>exactly ONE gateway action<br/>carrying ACP + ValueLimit
+    Note over W: duplicate PermissionId? REVERT
+    W->>SS: enableSessions([session])
     SS->>P: initializeWithMultiplexer(account, configId, initData)
-    Note over P: per-session config stored<br/>(cap, window, allowlist, expectedCEA)
+    Note over P: CV-1 / CV-2 fire here<br/>config stored per ConfigId
     SS-->>W: permissionId
+    Note over W: mirror check: does it match ours?
 ```
 
-The `permissionId` returned identifies the session; the agent includes it in every
-signature it produces.
+The `permissionId` returned identifies the mandate; the agent includes it in every signature
+it produces. The wallet asserts that SmartSession's derivation matches its own — if the two
+ever diverged, every guard above would have been validating a different session than the one
+actually enabled.
 
-Revocation is the reverse and equally available to the owner at any time — either by
-removing the individual session, or by `emergencyRevokeAll` on the wallet, which detaches
-the whole engine at once.
+**`ConfigId` is what keeps mandates independent.** It is derived from the account, the
+`PermissionId` and the action, so two mandates on the same wallet resolve to different
+configs and hold separate `spent` and `limitUsed` counters. Under one-wallet-per-user this
+keying *is* the isolation guarantee.
 
-## 16. Related documents
+Revocation is available to the owner at any time — `revokeMandate` for one, or
+`emergencyRevokeAll` to detach the whole engine — and to the guardian through
+`guardianRevoke` / `guardianRevokeAll`. See
+[agent-wallet.md](./agent-wallet.md#12-the-mandate-lifecycle) for the full lifecycle,
+including recovery from the `onInstall` brick.
+
+## 17. Related documents
 
 - [architecture.md](./architecture.md) — how the whole system fits together
 - [agent-wallet.md](./agent-wallet.md) — the account these modules are installed into
