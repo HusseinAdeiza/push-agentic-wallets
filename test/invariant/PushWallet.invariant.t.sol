@@ -7,7 +7,7 @@ import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { AgentWalletFactory } from "../../src/AgentWalletFactory.sol";
 import { ModeLib } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib } from "../../src/libraries/ExecutionLib.sol";
-import { MockValidator, MockTarget } from "../mocks/Mocks.sol";
+import { MockValidator, MockTarget, MockHook } from "../mocks/Mocks.sol";
 
 /**
  * @notice Drives the wallet through arbitrary sequences of every state-changing
@@ -27,11 +27,26 @@ contract WalletHandler is Test {
     uint256 public ghost_valueIn;
     mapping(uint192 => uint64) public ghost_maxNonceSeen;
 
-    constructor(PushAgentWallet w, MockValidator v, MockTarget t, address o) {
+    address public hookA;
+    address public hookB;
+
+    constructor(PushAgentWallet w, MockValidator v, MockTarget t, address o, address a, address b) {
         wallet = w;
         validator = v;
         target = t;
         owner = o;
+        hookA = a;
+        hookB = b;
+    }
+
+    /// Candidate modules, including two hooks so the single-active-hook invariant
+    /// (N-02b) is genuinely exercised rather than vacuously true.
+    function _moduleFor(uint256 seed) internal view returns (address) {
+        uint256 k = seed % 4;
+        if (k == 0) return address(validator);
+        if (k == 1) return address(target);
+        if (k == 2) return hookA;
+        return hookB;
     }
 
     function _track(uint192 key) internal {
@@ -49,8 +64,7 @@ contract WalletHandler is Test {
 
     function executeSingle(uint256 v, uint96 value) external {
         value = uint96(bound(value, 0, address(wallet).balance));
-        bytes memory cd =
-            ExecutionLib.encodeSingle(address(target), value, abi.encodeCall(MockTarget.setValue, (v)));
+        bytes memory cd = ExecutionLib.encodeSingle(address(target), value, abi.encodeCall(MockTarget.setValue, (v)));
         vm.prank(owner);
         try wallet.execute(ModeLib.encodeSimpleSingle(), cd) {
             ghost_valueOut += value;
@@ -60,8 +74,7 @@ contract WalletHandler is Test {
     function executeWithSession(uint192 key, uint256 v, uint96 value) external {
         value = uint96(bound(value, 0, address(wallet).balance));
         uint64 seq = wallet.nonce(key);
-        bytes memory cd =
-            ExecutionLib.encodeSingle(address(target), value, abi.encodeCall(MockTarget.setValue, (v)));
+        bytes memory cd = ExecutionLib.encodeSingle(address(target), value, abi.encodeCall(MockTarget.setValue, (v)));
         try wallet.executeWithSession(address(validator), ModeLib.encodeSimpleSingle(), cd, "", key, seq) {
             ghost_valueOut += value;
         } catch { }
@@ -69,23 +82,21 @@ contract WalletHandler is Test {
     }
 
     function executeWithBadNonce(uint192 key, uint64 seq) external {
-        bytes memory cd =
-            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
-        try wallet.executeWithSession(address(validator), ModeLib.encodeSimpleSingle(), cd, "", key, seq) { }
-        catch { }
+        bytes memory cd = ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
+        try wallet.executeWithSession(address(validator), ModeLib.encodeSimpleSingle(), cd, "", key, seq) { } catch { }
         _track(key);
     }
 
     function installModule(uint256 typeId, uint256 moduleSeed) external {
         typeId = bound(typeId, 0, 8);
-        address module = moduleSeed % 2 == 0 ? address(validator) : address(target);
+        address module = _moduleFor(moduleSeed);
         vm.prank(owner);
         try wallet.installModule(typeId, module, "") { } catch { }
     }
 
     function uninstallModule(uint256 typeId, uint256 moduleSeed) external {
         typeId = bound(typeId, 0, 8);
-        address module = moduleSeed % 2 == 0 ? address(validator) : address(target);
+        address module = _moduleFor(moduleSeed);
         vm.prank(owner);
         try wallet.uninstallModule(typeId, module, "") { } catch { }
     }
@@ -100,8 +111,7 @@ contract WalletHandler is Test {
 
     function tryUnauthorizedExecute(address caller, uint256 v) external {
         if (caller == owner || caller == address(wallet)) return;
-        bytes memory cd =
-            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (v)));
+        bytes memory cd = ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (v)));
         vm.prank(caller);
         try wallet.execute(ModeLib.encodeSimpleSingle(), cd) { } catch { }
     }
@@ -144,7 +154,8 @@ contract PushWalletInvariantTest is Test {
 
         vm.deal(address(wallet), 100 ether);
 
-        handler = new WalletHandler(wallet, validator, target, ownerUEA);
+        handler =
+            new WalletHandler(wallet, validator, target, ownerUEA, address(new MockHook()), address(new MockHook()));
         targetContract(address(handler));
     }
 
@@ -167,6 +178,23 @@ contract PushWalletInvariantTest is Test {
             assertFalse(wallet.isModuleInstalled(t, address(target), ""));
         }
         assertFalse(wallet.isModuleInstalled(0, address(validator), ""));
+    }
+
+    /**
+     * N-02b — AT MOST ONE address may be installed as a hook at any time (Q8).
+     *
+     * This is the property that makes the emergencyRevokeAll fix correct: because
+     * installModule rejects a second hook, `_hook` is provably the only address with
+     * _modules[4][.] == true, so clearing it is complete. Machine-checked rather
+     * than argued.
+     */
+    function invariant_N02b_atMostOneActiveHook() public view {
+        uint256 count;
+        if (wallet.isModuleInstalled(4, handler.hookA(), "")) ++count;
+        if (wallet.isModuleInstalled(4, handler.hookB(), "")) ++count;
+        if (wallet.isModuleInstalled(4, address(handler.validator()), "")) ++count;
+        if (wallet.isModuleInstalled(4, address(handler.target()), "")) ++count;
+        assertLe(count, 1, "at most one hook may ever be installed");
     }
 
     /**

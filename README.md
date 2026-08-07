@@ -32,10 +32,11 @@ AgentWalletFactory ──clones──▶ PushAgentWallet  (ERC-7579 account)
 
 | Contract | Type | Runtime size | Purpose |
 |---|---|---|---|
-| `PushAgentWallet` | ERC-7579 account | 8,870 B | Holds funds; native-AA entry point |
-| `ACPActionPolicy` | `IActionPolicy` | 6,894 B | **The anti-custody boundary** |
-| `PushSessionValidator` | Stateless validator (type 7) | 2,067 B | secp256k1 + Ed25519 via USV |
-| `AgentWalletFactory` | Factory | 1,401 B | Deterministic per-mandate clones |
+| `PushAgentWallet` | ERC-7579 account | 6,594 B | Holds funds; native-AA entry point |
+| `ACPActionPolicy` | `IActionPolicy` | 5,034 B | **The anti-custody boundary** |
+| `PushSessionValidator` | Stateless validator (type 7) | 1,581 B | secp256k1 + Ed25519 via USV |
+| `AgentWalletFactory` | Factory | 1,050 B | Deterministic per-mandate clones |
+| `SmartSession` (adopted) | Session engine | 22,581 B | Pinned upstream, deployed unmodified |
 
 ### Key security properties
 
@@ -44,6 +45,8 @@ AgentWalletFactory ──clones──▶ PushAgentWallet  (ERC-7579 account)
 - **No self-call escalation** — R7 forbids inner calls back into the account.
 - **Full replay binding** — `opHash` binds domain, chain id, account, validator, mode,
   payload hash, and a 2D nonce.
+- **Two spend ceilings** — a per-call cap bounds single-transaction blast radius; a
+  cumulative cap bounds lifetime mandate exposure.
 - **Owner is root** — the UEA can uninstall any module or revoke any session at any time,
   and is never constrained by session policies.
 
@@ -51,7 +54,14 @@ AgentWalletFactory ──clones──▶ PushAgentWallet  (ERC-7579 account)
 
 ## Toolchain
 
-`solc 0.8.26` · `evm_version = cancun` · `via_ir = true` · `optimizer_runs = 99999`
+`solc 0.8.26` · `evm_version = cancun` · `via_ir = true` · `optimizer_runs = 833`
+
+`optimizer_runs = 833` matches the setting `smartsessions` is built and audited at
+upstream. Raising it pushes `SmartSession` over the EIP-170 limit and makes it
+undeployable — `test_allDeployedContractsFitUnderEIP170` guards this.
+
+`evm_version = cancun` is **required**: `ACPActionPolicy._slice` uses `MCOPY`. Lowering
+the EVM target breaks the build at deploy time rather than at compile time.
 
 ```bash
 forge build
@@ -103,19 +113,20 @@ superseded by `ACPActionPolicy`.
 
 ## Tests
 
-149 tests, all passing.
+194 tests, all passing. `forge test` and `grep -rhoE "function (test|invariant)[A-Za-z0-9_]*" test/ | wc -l` both report 194.
 
 | Suite | Tests | Covers |
 |---|---|---|
-| `test/unit/PushAgentWallet.t.sol` | 40 | U-01 … U-23 |
+| `test/unit/PushAgentWallet.t.sol` | 45 | U-01 … U-26 |
+| `test/unit/ACPActionPolicy.t.sol` | 45 | P-01 … P-28 |
 | `test/unit/ExecuteWithSession.t.sol` | 22 | S-01 … S-16 |
-| `test/unit/ACPActionPolicy.t.sol` | 34 | P-01 … P-20 |
-| `test/unit/PushSessionValidator.t.sol` | 17 | V-01 … V-10 |
-| `test/integration/FullFlow.t.sol` | 16 | I-01 … I-11 (real SmartSession) |
-| `test/integration/SpendingLimit.t.sol` | 3 | I-08 (real spend-limit policy) |
-| `test/fuzz/PushWallet.fuzz.t.sol` | 10 | F-01 … F-04 |
-| `test/invariant/PushWallet.invariant.t.sol` | 5 | N-01 … N-05 |
-| `test/unit/Libraries.t.sol` | 10 | shared libraries |
+| `test/unit/PushSessionValidator.t.sol` | 19 | V-01 … V-12 |
+| `test/integration/FullFlow.t.sol` | 18 | I-01 … I-13 (real SmartSession) |
+| `test/unit/Libraries.t.sol` | 17 | shared libraries, decodeBatch bounds |
+| `test/fuzz/PushWallet.fuzz.t.sol` | 12 | F-01 … F-05 |
+| `test/invariant/PushWallet.invariant.t.sol` | 6 | N-01 … N-05, N-02b |
+| `test/unit/Attacks.t.sol` | 5 | A-01, A-13 |
+| `test/integration/SpendingLimit.t.sol` | 3 | adopted policy in isolation (see file header) |
 | `test/unit/ContractSize.t.sol` | 2 | EIP-170 guard |
 
 Integration tests run against the **real** `SmartSession` and adopted policies, not
@@ -123,17 +134,19 @@ mocks. Every attack in PRD §12 (A-01 … A-16) has a test demonstrating prevent
 
 ---
 
-## ⚠ Read `DEVIATIONS.md` before review
+## Review status
 
-Six items are recorded there. Three need a human decision:
+Senior review found two critical defects, both now fixed:
 
-- **D-3** — the wallet→self config path in §5.7 / Stage B is unreachable: `execute` and
-  `installModule` are both `nonReentrant`, so the self-call reverts.
-- **D-4** — `ExecutionLib.decodeBatch` silently no-ops on mode/encoding mismatch, so a
-  batch-mode call over single-encoded calldata succeeds having done nothing.
-- **D-5** — **blocker.** `SmartSession` is 28,737 B at the mandated
-  `optimizer_runs = 99999`, i.e. 4,161 B over EIP-170. It fits (22,581 B) at upstream's
-  `runs = 833`. §3.2 and §4.1 cannot both hold as written.
+- **Ed25519 reverted on-chain** — the precompile was called through a high-level
+  interface, which inserts an `extcodesize` check and reverts on a codeless target. Now a
+  raw staticcall, mirroring the audited `UEA_SVM`.
+- **No cumulative spend cap** — the mandate ceiling was per-call only, so an agent could
+  drain the wallet across repeated in-cap calls. `ACPActionPolicy` now accumulates.
+
+`DEVIATIONS.md` records the full resolved/open split. Four items remain open, none
+blocking code: coverage justification, the V-11 fork test, deployment addresses, and an
+escalation to the gateway team about freezing the CEA implementation setter.
 
 ---
 

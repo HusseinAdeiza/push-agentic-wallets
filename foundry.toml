@@ -9,8 +9,14 @@ extra_output = ["storageLayout"]
 
 solc = "0.8.26"
 optimizer = true
-optimizer_runs = 99999
+# 833 matches the setting smartsessions is built and audited at upstream. At the
+# PRD's original 99999, SmartSession compiles to 28,737 B — over the EIP-170 limit
+# and undeployable. Bytecode equivalence with the audited artifact is worth more
+# than our gas profile (DEVIATIONS D-5).
+optimizer_runs = 833
 auto_detect_solc = false
+# cancun is REQUIRED: ACPActionPolicy._slice uses MCOPY. Lowering this breaks the
+# build at deploy time rather than at compile time.
 evm_version = "cancun"
 via_ir = true
 

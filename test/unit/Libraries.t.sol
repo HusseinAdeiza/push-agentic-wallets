@@ -119,6 +119,58 @@ contract LibrariesTest is Test {
         assertEq(h.decodeBatch(ExecutionLib.encodeBatch(execs)).length, 0);
     }
 
+    // ── D-4 — decodeBatch bounds validation ───────────────────────────
+
+    /// Blob shorter than one word cannot contain an offset.
+    function test_D4_decodeBatchRejectsTooShort() public {
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        h.decodeBatch(hex"1122");
+    }
+
+    /// Offset pointing past the end of the blob.
+    function test_D4_decodeBatchRejectsOutOfRangeOffset() public {
+        bytes memory bad = abi.encodePacked(uint256(type(uint128).max));
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        h.decodeBatch(bad);
+    }
+
+    /// Offset in range, but no room for the length word after it.
+    function test_D4_decodeBatchRejectsNoRoomForLength() public {
+        // offset = 32, but the blob is only 32 bytes, so nothing follows.
+        bytes memory bad = abi.encodePacked(uint256(32));
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        h.decodeBatch(bad);
+    }
+
+    /// A length larger than the remaining calldata could possibly hold.
+    function test_D4_decodeBatchRejectsImpossibleLength() public {
+        bytes memory bad = abi.encodePacked(uint256(32), uint256(1000));
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        h.decodeBatch(bad);
+    }
+
+    /// Single-encoded calldata decoded as a batch — the original D-4 silent no-op.
+    function test_D4_decodeBatchRejectsSingleEncoding() public {
+        bytes memory single = ExecutionLib.encodeSingle(address(0xBEEF), 0, hex"12345678");
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        h.decodeBatch(single);
+    }
+
+    /// A well-formed batch still decodes correctly after the added checks.
+    function test_D4_wellFormedBatchStillDecodes() public view {
+        Execution[] memory execs = new Execution[](1);
+        execs[0] = Execution(address(0xAAA1), 7, hex"1122");
+        Execution[] memory got = h.decodeBatch(ExecutionLib.encodeBatch(execs));
+        assertEq(got.length, 1);
+        assertEq(got[0].value, 7);
+    }
+
+    /// _slice handles a zero-length request (MCOPY edge case, M-3).
+    function test_M3_sliceZeroLength() public view {
+        Execution[] memory execs = new Execution[](0);
+        assertEq(h.decodeBatch(ExecutionLib.encodeBatch(execs)).length, 0);
+    }
+
     // ── remaining wallet revert paths ─────────────────────────────────
 
     /// callValidator must bubble the validator's raw revert data.

@@ -8,7 +8,7 @@ import { PushSessionValidator } from "../../src/validators/PushSessionValidator.
 import { ACPActionPolicy } from "../../src/policies/ACPActionPolicy.sol";
 import { SmartSession } from "smartsessions/SmartSession.sol";
 
-/// @notice Guards the EIP-170 limit for everything we deploy.
+/// @notice EIP-170 guard for every contract we deploy.
 contract ContractSizeTest is Test {
     uint256 internal constant EIP170_LIMIT = 24_576;
 
@@ -26,18 +26,19 @@ contract ContractSizeTest is Test {
     }
 
     /**
-     * ⚠ DEVIATIONS.md D-5 — SmartSession exceeds EIP-170 at the PRD-mandated
-     * `optimizer_runs = 99999` (§3.2), which conflicts with §4.1's requirement to
-     * deploy it unmodified.
+     * D-5 RESOLVED — SmartSession now fits.
      *
-     * This test asserts the CURRENT measured reality so the conflict cannot be
-     * lost. When D-5 is resolved (e.g. by lowering optimizer_runs), SmartSession
-     * will fit and this test must be flipped to assertLt.
+     * At the PRD's original `optimizer_runs = 99999` it compiled to 28,737 B, i.e.
+     * 4,161 B over EIP-170 and undeployable, which conflicted with §4.1's
+     * requirement to deploy it unmodified. `optimizer_runs` is now 833 — the setting
+     * smartsessions is built and audited at upstream — giving 22,581 B.
+     *
+     * This assertion is the guard: if `optimizer_runs` is ever raised again,
+     * SmartSession silently becomes undeployable and this test catches it.
      */
-    function test_D5_smartSessionExceedsEIP170AtMandatedOptimizerRuns() public {
+    function test_allDeployedContractsFitUnderEIP170() public {
         uint256 size = _size(address(new SmartSession()));
-        assertGt(size, EIP170_LIMIT, "if this now fits, resolve D-5 and flip this assertion");
         emit log_named_uint("SmartSession runtime size", size);
-        emit log_named_uint("bytes over EIP-170", size - EIP170_LIMIT);
+        assertLt(size, EIP170_LIMIT, "SmartSession must fit; check optimizer_runs (see DEVIATIONS D-5)");
     }
 }

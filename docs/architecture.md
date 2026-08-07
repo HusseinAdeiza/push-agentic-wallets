@@ -251,74 +251,241 @@ sequenceDiagram
 Once set up, each further action is just Stage C → D → E. The wallet persists, the
 session persists until it expires or is revoked, and Bob signs nothing further.
 
-## 8. How a single action is validated
+## 8. Creation of an agentic wallet
 
-Stage D compressed into one picture — this is the enforcement core.
+A wallet comes into existence exactly once per mandate, and it is created **by the user's
+own UEA** — never by the agent, never by an operator.
+
+### The deployment flow
 
 ```mermaid
-flowchart TD
-    START["executeWithSession"] --> INST{"validator installed<br/>as type 1?"}
-    INST -->|no| R1["revert ValidatorNotInstalled"]
-    INST -->|yes| NONCE{"nonceSeq == expected?"}
-    NONCE -->|no| R2["revert InvalidNonce"]
-    NONCE -->|yes| CONSUME["consume nonce"]
+sequenceDiagram
+    autonumber
+    participant SDK as SDK (off-chain)
+    participant UEA as Bob's UEA
+    participant F as AgentWalletFactory
+    participant W as PushAgentWallet clone
 
-    CONSUME --> HASH["compute opHash<br/>binds 8 fields"]
-    HASH --> SIG{"session key<br/>signed opHash?"}
-    SIG -->|no| R3["revert — signature invalid"]
+    SDK->>SDK: build the mandate<br/>(agent key, cap, duration, allowed protocols)
+    SDK->>SDK: mandateId = hash of those terms
+    SDK->>F: computeAgentWallet(uea, mandateId)
+    F-->>SDK: 0xbobagw — address known BEFORE deployment
 
-    SIG -->|yes| POLICIES["SmartSession runs policies"]
-    POLICIES --> TIME{"within<br/>validAfter/validUntil?"}
-    TIME -->|no| R4["revert — expired"]
-    TIME -->|yes| SPEND{"within<br/>cumulative spend cap?"}
-    SPEND -->|no| R5["revert — cap exceeded"]
-    SPEND -->|yes| ACP["ACPActionPolicy.checkAction"]
+    Note over SDK: the funding tx can now be built<br/>against an address that does not exist yet
 
-    ACP --> R6{"target == gateway?<br/>selector correct?<br/>asset + amount ok?<br/>every inner call allowed?<br/>beneficiary == our CEA?"}
-    R6 -->|any check fails| R7["revert"]
-    R6 -->|all pass| EXEC["execute the call"]
-
-    style R1 fill:#4a1d1d,stroke:#ef4444,color:#fbe8e8
-    style R2 fill:#4a1d1d,stroke:#ef4444,color:#fbe8e8
-    style R3 fill:#4a1d1d,stroke:#ef4444,color:#fbe8e8
-    style R4 fill:#4a1d1d,stroke:#ef4444,color:#fbe8e8
-    style R5 fill:#4a1d1d,stroke:#ef4444,color:#fbe8e8
-    style R7 fill:#4a1d1d,stroke:#ef4444,color:#fbe8e8
-    style EXEC fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
+    UEA->>F: deployAgentWallet(mandateId)
+    Note over F: salt = keccak256(owner, mandateId)<br/>owner is msg.sender — never a parameter
+    F->>W: cloneDeterministic(salt)
+    F->>W: initialize(msg.sender)
+    Note over W: owner set once, forever
+    F-->>UEA: 0xbobagw (equals the predicted address)
 ```
 
-Checks are ordered cheapest-first, so a malformed or unauthorized request fails before
-the expensive payload walk.
+Three properties are worth holding onto.
 
-## 9. Two levels of nesting
+**The caller is the owner.** `deployAgentWallet` reads the owner from `msg.sender` and
+takes no owner parameter. There is deliberately no `deployFor(owner, …)` variant — such a
+path would let an attacker deploy a wallet on a user's behalf, against an implementation
+the user never chose.
 
-A recurring source of confusion: `ACPActionPolicy` deals with **two different** layers of
-batching, and they are not the same thing.
+**Deployment happens inside the user's inbound multicall.** In the end-to-end flow
+(Stage B), `deployAgentWallet` is one call in the atomic multicall the UEA executes after
+Bob's single Ethereum signature. Wallet creation, module installation, session grant, and
+funding all land in one transaction.
+
+**Deploying twice is an error, not a no-op.** If a wallet already exists for that
+`(owner, mandateId)` pair, the call reverts. Repeat use of an existing mandate skips
+deployment entirely — the SDK checks `isDeployed` first and builds a shorter multicall.
+
+### The address is deterministic
+
+```
+salt    = keccak256(abi.encode(owner, mandateId))
+address = CREATE2(factory, salt, EIP-1167 clone of the implementation)
+```
+
+Because the address depends only on the owner and the mandate id, it can be computed
+before anything is deployed. That is what makes the one-signature flow possible: the
+payload Bob signs on Ethereum can reference a wallet address that will not exist for
+several more steps, and can commit to the CEA derived from it.
+
+It also means the address is **not** front-runnable. An attacker who calls
+`deployAgentWallet` first would be deploying with themselves as `msg.sender`, producing a
+different salt and therefore a different address — not Bob's.
+
+### 8.1 One wallet per mandate
+
+A **mandate** is a standing grant of bounded authority: *"this agent may run this strategy
+for me, up to this much, until this date."* It is not a single job. Many jobs run under
+one mandate, and that is the point — the second job needs no new signature from the user.
+
+One UEA can own **many** wallets, one per mandate:
 
 ```mermaid
 graph TB
-    subgraph outer["Outer: ERC-7579 batch — handled by SmartSession"]
-        A1["action 1"]
-        A2["action 2 · the gateway call"]
-    end
+    UEA["Bob's UEA<br/>one identity"]
+    UEA -->|mandate 'yield'| W1["0xbobagw1<br/>own funds · own CEA<br/>own session · own policies"]
+    UEA -->|mandate 'trading'| W2["0xbobagw2<br/>own funds · own CEA<br/>own session · own policies"]
+    UEA -->|mandate 'payments'| W3["0xbobagw3<br/>own funds · own CEA<br/>own session · own policies"]
 
-    A2 --> REQ["UniversalOutboundTxRequest"]
-
-    subgraph inner["Inner: the cross-chain multicall — walked by ACPActionPolicy"]
-        I1["approve(pool, amount)"]
-        I2["supply(asset, amount, onBehalf)"]
-    end
-
-    REQ -->|"req.payload"| inner
-
-    style outer fill:#1e3a5f,stroke:#3b82f6,color:#e8f1fb
-    style inner fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
+    style W1 fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
+    style W2 fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
+    style W3 fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
 ```
 
-SmartSession destructures the **outer** batch and calls `checkAction` once per action, so
-the policy never iterates it. The policy's own loop walks the **inner** multicall inside
-`req.payload` — the instructions that will run on the destination chain. That inner loop
-is where the beneficiary check applies.
+**Jobs are not mandates.** Running the yield strategy three times uses one wallet three
+times. What bounds exposure across those repeated runs is not a fresh signature — it is
+the *cumulative* spend cap and the mandate expiry, both fixed when the session was
+granted.
+
+**This is blast-radius containment by construction.** If the trading mandate's session key
+leaks, the attacker reaches exactly one wallet. The yield and payments wallets are
+separate accounts with separate funds, separate CEAs, and separate policy configurations.
+There is no code path that would let one mandate's session reach another's wallet, because
+they are different contracts.
+
+**What `mandateId` means is an off-chain decision.** The contracts treat it as an opaque
+`bytes32` salt and never interpret it. Deriving it by hashing the mandate terms means any
+change to the terms yields a new wallet and therefore a fresh user signature; using a
+stable label instead lets one wallet's policies be reconfigured over time. That trade-off
+belongs to the SDK, not to the contracts.
+
+## 9. The wallet and its modules
+
+### What `PushAgentWallet` is
+
+An ERC-7579 modular smart account, deployed as an EIP-1167 minimal clone. It is the
+contract that **holds the mandate's funds** and, critically, the contract that appears as
+`msg.sender` when the outbound gateway is called.
+
+Its own storage is deliberately small:
+
+| Slot | Holds | Meaning |
+|---|---|---|
+| 0 | `owner` + `_initialized` | the UEA that owns this wallet; set once, never changes |
+| 1 | `_hook` | the single active hook, if any |
+| 2 | `_modules[type][module]` | which modules are installed, keyed **type-first** |
+| 3 | `_nonces[key]` | 2D nonce sequences for session operations |
+
+That is the whole of it. No caps, no allowlists, no expiry, no session keys — none of the
+mandate's rules live in the wallet.
+
+**The UEA is the sole root authority.** Only the owner can install or remove modules, grant
+or reconfigure sessions, sweep funds, or execute directly. There is no admin key, no
+pause, no upgrade path, and no `transferOwnership` — the wallet's address is derived from
+its owner, so a mutable owner would make that derivation lie. The agent is never the
+owner and can never become it.
+
+**The wallet's code is fixed forever.** Clones share the implementation's bytecode and it
+cannot be upgraded. All extensibility comes from modules — which is exactly why ERC-7579
+exists.
+
+### What installing a module means
+
+Installation is two distinct writes, in two different contracts:
+
+```mermaid
+sequenceDiagram
+    participant UEA as Owner (UEA)
+    participant W as PushAgentWallet
+    participant M as The module
+
+    UEA->>W: installModule(type, module, initData)
+    Note over W: ① record it: _modules[type][module] = true<br/>(state written BEFORE the external call)
+    W->>M: onInstall(initData)
+    Note over M: ② module configures ITSELF for this account<br/>msg.sender is the WALLET, so it knows whose row to write
+    M-->>W: done
+```
+
+The wallet stores a **yes/no**. The module stores the **details**.
+
+`initData` is opaque bytes the wallet forwards without inspecting — its meaning is defined
+entirely by the module receiving it. That opacity is deliberate: it is what lets one
+account interface serve modules that had not been written when the account was deployed.
+
+The key mechanic is that `msg.sender` inside `onInstall` is the **wallet**. A single
+deployed module therefore serves every account on the chain, keeping one configuration row
+per account. Nothing is deployed per user.
+
+### The account vs. SmartSession — two different registries
+
+This is the distinction that most often trips people up. There are **two** levels of
+registration, and only the first is "installation".
+
+```mermaid
+graph TB
+    W["PushAgentWallet<br/>0xbobagw"]
+    SS["SmartSession<br/>the session engine"]
+
+    W -->|"installModule — ONE module, ever"| SS
+
+    SS -->|"listed in a session"| PSV["PushSessionValidator<br/>is this the agent's key?"]
+    SS -->|"listed in a session"| SPEND["ERC20SpendingLimitPolicy<br/>under the cumulative cap?"]
+    SS -->|"listed in a session"| TIME["TimeFramePolicy<br/>within the window?"]
+    SS -->|"listed in a session"| ACP["ACPActionPolicy<br/>allowed action? right beneficiary?"]
+
+    style W fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
+    style SS fill:#1e3a5f,stroke:#3b82f6,color:#e8f1fb
+```
+
+A live wallet has **exactly one entry** in its module registry: SmartSession, as type 1.
+Everything expressive lives one layer down.
+
+| | The account | SmartSession |
+|---|---|---|
+| Written by | `installModule` | `enableSessions` |
+| Stores | one boolean per module | sessions, each listing several policies |
+| How many | **1** in practice | many sessions per account |
+| Changes when a rule changes? | never | yes |
+| Knows the spend cap exists? | **no** | yes |
+
+**Installing is plumbing; granting a session is permission.** The owner installs
+SmartSession once, then writes one session per mandate — each with its own key, cap,
+expiry, and allowlist. Adding a rule never touches the account.
+
+This layering buys three things. The wallet stays permanent and minimal. One account can
+carry several independent grants. And revocation is a single storage write:
+`emergencyRevokeAll` clears the SmartSession entry, and every session dies at once — not
+because the sessions were deleted, but because the wallet stops asking.
+
+### Modules in use today
+
+| Module | ERC-7579 type | Installed on the account? | Origin |
+|---|---|---|---|
+| `SmartSession` | 1 — validator | ✅ **yes, the only one** | adopted |
+| `PushSessionValidator` | 7 — stateless validator | ❌ referenced inside a session | **ours** |
+| *(hook slot)* | 4 — hook | ❌ supported, none installed in v1 | — |
+
+`PushSessionValidator` is type **7**, and the account only accepts types 1 and 4 — so it
+is never installed on the wallet. SmartSession calls it during validation. It is stateless
+by design: every parameter arrives as calldata, so one deployment serves every account,
+and it supports both secp256k1 and Ed25519 (the latter via Push Chain's USV precompile,
+which is what lets a Solana-keyed agent operate an EVM account).
+
+Executor modules (type 2) and fallback handlers (type 3) are permanently unsupported —
+see the design-decisions table below.
+
+### Policies available today
+
+Policies are not ERC-7579 modules. They are listed inside a session and called by
+SmartSession during validation.
+
+| Policy | Enforces | Origin |
+|---|---|---|
+| `ACPActionPolicy` | the action is the gateway call; the asset, amount, destination protocols and **beneficiary** are all as mandated | **ours** |
+| `ERC20SpendingLimitPolicy` | cumulative token spend across the whole mandate | adopted |
+| `TimeFramePolicy` | the session's validity window | adopted |
+| `ValueLimitPolicy` | native-value ceiling | adopted, available |
+| `UsageLimitPolicy` | number of uses | adopted, available |
+| `ContractWhitelistPolicy` | callable contracts | adopted, available |
+
+`ACPActionPolicy` is the anti-custody boundary and the one policy that could not be
+adopted: it understands Push Chain's outbound request format and enforces that the
+beneficiary of any cross-chain deposit is the wallet's own CEA. The others are generic and
+audited upstream.
+
+Every policy must pass. SmartSession does not take a vote — a single rejection reverts the
+whole operation.
 
 ## 10. Why the agent cannot steal
 
@@ -353,29 +520,7 @@ Above all of it sits the owner. The UEA can call `emergencyRevokeAll` and cut ev
 session instantly — and that path deliberately skips module callbacks, so a buggy or
 hostile module cannot refuse to be removed.
 
-## 11. One wallet per mandate
-
-The wallet address is derived from `keccak256(abi.encode(owner, mandateId))`, so each
-mandate gets a distinct account.
-
-```mermaid
-graph TB
-    UEA["Bob's UEA"]
-    UEA --> W1["wallet · mandate 'yield'<br/>own CEA · own funds"]
-    UEA --> W2["wallet · mandate 'trading'<br/>own CEA · own funds"]
-    UEA --> W3["wallet · mandate 'payments'<br/>own CEA · own funds"]
-
-    style W1 fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
-    style W2 fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
-    style W3 fill:#0b3d2e,stroke:#10b981,color:#e7f9f1
-```
-
-This is blast-radius containment. A compromised session key on the trading mandate cannot
-touch the yield mandate's funds — different account, different CEA, different policy set.
-Addresses are also computable before deployment, so the funding transaction and the
-deployment can be built in a single signed payload.
-
-## 12. Design decisions worth knowing
+## 11. Design decisions worth knowing
 
 These are settled choices. Each removes a class of risk rather than adding a feature.
 
@@ -390,7 +535,7 @@ These are settled choices. Each removes a class of risk rather than adding a fea
 | **Sessions granted by the owner only** | The agent can never widen its own permissions |
 | Module registry keyed **type-first** | A validator can never be mistaken for an executor |
 
-## 13. Where to read next
+## 12. Where to read next
 
 | Document | What it covers |
 |---|---|

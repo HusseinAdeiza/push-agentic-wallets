@@ -4,6 +4,9 @@ pragma solidity 0.8.26;
 import { ModeCode } from "../libraries/ModeLib.sol";
 
 /// @notice The subset of the ERC-7579 account interface implemented by PushAgentWallet.
+/// @dev MUST NOT be advertised via supportsInterface. ERC-7579 defines no single
+///      account interfaceId; discovery is via `accountId()`. This is a deliberate
+///      local subset and claiming conformance from it would be wrong.
 /// @dev `executeFromExecutor` is deliberately absent — executor modules are
 ///      unsupported in v1 (D-04), and `supportsModule(2)` returns false.
 interface IERC7579Account {

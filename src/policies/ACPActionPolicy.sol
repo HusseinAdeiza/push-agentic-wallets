@@ -7,7 +7,6 @@ import { IERC165 } from "@openzeppelin/contracts/utils/introspection/IERC165.sol
 import { UniversalOutboundTxRequest, Multicall } from "../libraries/PushWalletTypes.sol";
 
 uint256 constant VALIDATION_SUCCESS = 0;
-uint256 constant VALIDATION_FAILED = 1;
 
 /// @notice One permitted inner call within the cross-chain multicall payload.
 struct AllowedCall {
@@ -15,15 +14,41 @@ struct AllowedCall {
     bytes4 selector; // e.g. supply(...)
     uint16 beneficiaryOffset; // byte offset of the beneficiary word within the inner calldata
     bool hasBeneficiary; // false for calls with no beneficiary arg (e.g. approve)
+    /// @dev Ceiling on this entry's native `value`, denominated in DESTINATION-chain
+    ///      native token. Zero means no native value may be attached, which is correct
+    ///      for every v1 target (all are non-payable). A future payable target — e.g.
+    ///      the CEA attestation callback, which must fund an inbound protocol fee — is
+    ///      then a config change rather than a contract change.
+    uint256 maxValue;
 }
 
 /// @notice Per-(configId, multiplexer, account) mandate configuration.
 struct Config {
     bool initialized;
-    bytes32 destChainHash; // keccak256("eip155:1")
+    /// @dev NOT ENFORCED ON-CHAIN. The destination chain is pinned transitively by
+    ///      `asset` (R4) — UniversalGatewayPC derives the destination from the PRC20,
+    ///      and P-05 pins that dependency. This field is asserted by the SDK at grant
+    ///      time and exists for off-chain verification and event indexing only.
+    bytes32 destChainHash;
     address expectedCEA; // D-13 — committed at grant time
     address asset; // PRC20 token permitted as req.token
-    uint256 maxAmountPerCall; // ceiling on req.amount
+    /// @dev Per-call ceiling. Bounds single-transaction blast radius: without it a
+    ///      compromised key drains the whole mandate in ONE transaction, before any
+    ///      monitor can react. Deliberately redundant with `maxAmountTotal`.
+    uint256 maxAmountPerCall;
+    /// @dev Cumulative mandate ceiling across the session's whole lifetime.
+    uint256 maxAmountTotal;
+    /// @dev Ceiling on the PUSH CHAIN native value forwarded to the gateway on each
+    ///      call — the protocol fee plus the destination-gas swap budget.
+    ///
+    ///      Distinct from `AllowedCall.maxValue`, which bounds DESTINATION-chain native
+    ///      value on inner entries. Without this, a session key could drain the wallet's
+    ///      PC balance through repeated zero-amount (GAS_AND_PAYLOAD) outbounds: the
+    ///      gateway takes `protocolFee` from msg.value unconditionally but skips
+    ///      `_burnPRC20` when `req.amount == 0`, so the amount caps never see it.
+    uint256 maxPCPerCall;
+    /// @dev Running total of `req.amount` authorised so far. Reset on re-initialization.
+    uint256 spent;
     AllowedCall[] allowedCalls; // exhaustive allowlist of inner multicall entries
 }
 
@@ -53,17 +78,19 @@ contract ACPActionPolicy is IActionPolicy {
     event ACPPolicySet(ConfigId indexed id, address indexed multiplexer, address indexed account);
 
     error NotInitialized(ConfigId id, address multiplexer, address account);
-    error AlreadyInitialized(ConfigId id, address multiplexer, address account);
     error InvalidTarget(address target);
     error InvalidSelector(bytes4 selector);
     error AssetMismatch(address expected, address actual);
     error AmountExceedsCap(uint256 amount, uint256 cap);
+    error TotalSpendCapExceeded(uint256 wouldBeTotal, uint256 cap);
+    error PCValueExceedsCap(uint256 value, uint256 cap);
+    error ZeroAmountNotPermitted();
+    error InnerValueExceedsAllowance(uint256 index, uint256 value, uint256 maxValue);
     error PayloadNotMulticall();
     error ForbiddenInnerTarget(address target);
     error CallNotAllowed(address target, bytes4 selector);
     error BeneficiaryMismatch(address expected, address actual);
     error InvalidRevertRecipient(address expected, address actual);
-    error ValueOverspend(uint256 requested, uint256 available);
     error MalformedInnerCalldata();
 
     constructor(address universalGatewayPC_) {
@@ -81,13 +108,30 @@ contract ACPActionPolicy is IActionPolicy {
         emit PolicySet(configId, msg.sender, account);
     }
 
-    /// @notice Authorise a single action the wallet is about to perform.
-    /// @dev    Not `view` — the IActionPolicy interface declares this as
-    ///         state-mutating so policies may update usage counters. This
-    ///         implementation happens not to mutate, but MUST keep the
-    ///         non-view mutability to match the interface (PRD §8.2). solc's
-    ///         "can be restricted to view" advisory is therefore expected here
-    ///         and is recorded in DEVIATIONS.md.
+    /**
+     * @notice Authorise a single action the wallet is about to perform.
+     *
+     * @dev Not `view` — `IActionPolicy` declares this state-mutating precisely so
+     *      policies can accumulate. We use that for the cumulative spend cap (R5b).
+     *
+     * @dev ACCUMULATION IS OPTIMISTIC BUT ATOMIC. `spent` is incremented during
+     *      *validation*, before execution. If execution later reverts, the increment
+     *      reverts with it — but ONLY because validation and execution happen in one
+     *      transaction. A future maintainer who splits them across transactions would
+     *      silently break this accounting.
+     *
+     * @dev SmartSession invokes policies with a real `call` (PolicyLib.callPolicy uses
+     *      excessivelySafeCall, not staticcall), so these writes genuinely persist.
+     *
+     * @dev No griefing vector via the open `executeWithSession`: a replayed signature
+     *      carries a stale `nonceSeq` and reverts at the nonce gate before reaching
+     *      this function, so a third party cannot burn mandate budget (see S-04).
+     *
+     * @dev REVERT DATA IS TRUNCATED. PolicyLib copies at most 32 bytes of revert data
+     *      and rewraps it as `PolicyCheckReverted(bytes32)`. The 4-byte selector
+     *      survives; multi-argument errors such as `BeneficiaryMismatch(address,address)`
+     *      do NOT round-trip to the caller.
+     */
     function checkAction(ConfigId id, address account, address target, uint256 value, bytes calldata data)
         external
         override
@@ -105,14 +149,40 @@ contract ACPActionPolicy is IActionPolicy {
         UniversalOutboundTxRequest memory req = abi.decode(data[4:], (UniversalOutboundTxRequest));
 
         if (req.token != cfg.asset) revert AssetMismatch(cfg.asset, req.token); // R4
+
+        // R13 — zero-amount outbounds are rejected outright.
+        //
+        // With `req.amount == 0` the gateway infers TX_TYPE.GAS_AND_PAYLOAD and skips
+        // `_burnPRC20`, so `spent` never increases and the cumulative cap is
+        // STRUCTURALLY BLIND to the call — while `protocolFee` is still taken from
+        // msg.value. Rejecting the shape closes that class rather than merely capping
+        // it. The v1 lending flow always carries a non-zero amount; revisit only if a
+        // CEA-balance-only flow is ever required.
+        if (req.amount == 0) revert ZeroAmountNotPermitted();
+
         if (req.amount > cfg.maxAmountPerCall) {
             revert AmountExceedsCap(req.amount, cfg.maxAmountPerCall); // R5
         }
+
+        // R5b — cumulative mandate ceiling. Solidity 0.8.x reverts on overflow.
+        uint256 newSpent = cfg.spent + req.amount;
+        if (newSpent > cfg.maxAmountTotal) {
+            revert TotalSpendCapExceeded(newSpent, cfg.maxAmountTotal);
+        }
+
+        // R12 — ceiling on the PUSH CHAIN native value forwarded to the gateway.
+        // Defence in depth with R13: bounds the per-call PC outflow even for the
+        // non-zero-amount shapes that R13 permits.
+        if (value > cfg.maxPCPerCall) revert PCValueExceedsCap(value, cfg.maxPCPerCall);
+
         if (req.revertRecipient != account) {
             revert InvalidRevertRecipient(account, req.revertRecipient); // R10
         }
 
-        _validateMulticallPayload(cfg, account, req.payload, value); // R6–R9, R11
+        _validateMulticallPayload(cfg, account, req.payload); // R6–R9, R11
+
+        // EFFECTS LAST — every check above has passed before any state is written.
+        cfg.spent = newSpent;
 
         return VALIDATION_SUCCESS;
     }
@@ -133,28 +203,40 @@ contract ACPActionPolicy is IActionPolicy {
             address expectedCEA,
             address asset,
             uint256 maxAmountPerCall,
+            uint256 maxAmountTotal,
+            uint256 maxPCPerCall,
+            uint256 spent,
             AllowedCall[] memory allowedCalls
         )
     {
         Config storage cfg = $configs[id][multiplexer][account];
-        return (cfg.initialized, cfg.destChainHash, cfg.expectedCEA, cfg.asset, cfg.maxAmountPerCall, cfg.allowedCalls);
+        return (
+            cfg.initialized,
+            cfg.destChainHash,
+            cfg.expectedCEA,
+            cfg.asset,
+            cfg.maxAmountPerCall,
+            cfg.maxAmountTotal,
+            cfg.maxPCPerCall,
+            cfg.spent,
+            cfg.allowedCalls
+        );
     }
 
     // ==============================
     //          INTERNALS
     // ==============================
 
-    /// @dev Walks the nested multicall payload enforcing R6–R9 and R11.
-    ///      ⚠ REVIEW REQUIRED — R7. `PushAgentWallet.execute` accepts
-    ///      msg.sender == address(this) to permit batched self-configuration.
-    ///      Without R7, a session key could route a call back into the wallet and
-    ///      invoke installModule, taking full control.
-    function _validateMulticallPayload(
-        Config storage cfg,
-        address account,
-        bytes memory payload,
-        uint256 valueAvailable
-    ) internal view {
+    /**
+     * @dev Walks the nested multicall payload enforcing R6–R9 and R11.
+     *
+     *      ⚠ R7 — forbidding `to == account` stops a session key routing a call back
+     *      into the wallet to reach `installModule`. A-04 has three independent
+     *      defences: SmartSession's own `InvalidSelfCall` check, this rule, and the
+     *      wallet's `onlyOwner` modifier. R7 MUST NOT be removed as "redundant" — it
+     *      must not depend on either of the others for its safety property.
+     */
+    function _validateMulticallPayload(Config storage cfg, address account, bytes memory payload) internal view {
         if (payload.length < 4) revert PayloadNotMulticall();
         bytes4 sel;
         assembly {
@@ -165,7 +247,6 @@ contract ACPActionPolicy is IActionPolicy {
         bytes memory inner = _slice(payload, 4, payload.length - 4);
         Multicall[] memory calls = abi.decode(inner, (Multicall[]));
 
-        uint256 valueSum;
         for (uint256 i; i < calls.length;) {
             address to = calls[i].to;
 
@@ -185,13 +266,19 @@ contract ACPActionPolicy is IActionPolicy {
                 }
             }
 
-            valueSum += calls[i].value;
+            // R11 — per-entry native value ceiling, denominated in DESTINATION-chain
+            // native token. The previous rule summed these and compared against the
+            // Push Chain `value` forwarded to the gateway: two different assets on two
+            // different chains, so the comparison was meaningless (and a silent no-op,
+            // since ERC-20 flows carry value == 0 on every entry).
+            if (calls[i].value > rule.maxValue) {
+                revert InnerValueExceedsAllowance(i, calls[i].value, rule.maxValue);
+            }
+
             unchecked {
                 ++i;
             }
         }
-
-        if (valueSum > valueAvailable) revert ValueOverspend(valueSum, valueAvailable); // R11
     }
 
     /// @dev Reads the 32-byte word at `offset` and returns its low 20 bytes.
@@ -216,7 +303,8 @@ contract ACPActionPolicy is IActionPolicy {
         for (uint256 i; i < len;) {
             AllowedCall storage rule = cfg.allowedCalls[i];
             if (rule.target == to && rule.selector == selector) {
-                return AllowedCall(rule.target, rule.selector, rule.beneficiaryOffset, rule.hasBeneficiary);
+                return
+                    AllowedCall(rule.target, rule.selector, rule.beneficiaryOffset, rule.hasBeneficiary, rule.maxValue);
             }
             unchecked {
                 ++i;
@@ -226,11 +314,18 @@ contract ACPActionPolicy is IActionPolicy {
     }
 
     /// @dev Copy a decoded config into storage, replacing any prior allowlist.
+    ///      `spent` is RESET to zero: `initializeWithMultiplexer` represents a fresh
+    ///      grant by the owner, so carrying a stale counter forward would either brick
+    ///      a new mandate or silently preserve a cap the owner meant to reset.
+    ///      Any value supplied in `incoming.spent` is deliberately ignored.
     function _store(Config storage cfg, Config memory incoming) internal {
         cfg.destChainHash = incoming.destChainHash;
         cfg.expectedCEA = incoming.expectedCEA;
         cfg.asset = incoming.asset;
         cfg.maxAmountPerCall = incoming.maxAmountPerCall;
+        cfg.maxAmountTotal = incoming.maxAmountTotal;
+        cfg.maxPCPerCall = incoming.maxPCPerCall;
+        cfg.spent = 0;
 
         delete cfg.allowedCalls;
         uint256 len = incoming.allowedCalls.length;
@@ -246,11 +341,10 @@ contract ACPActionPolicy is IActionPolicy {
     function _slice(bytes memory data, uint256 start, uint256 len) internal pure returns (bytes memory out) {
         if (start + len > data.length) revert MalformedInnerCalldata();
         out = new bytes(len);
-        for (uint256 i; i < len;) {
-            out[i] = data[start + i];
-            unchecked {
-                ++i;
-            }
+        // MCOPY requires evm_version = "cancun". Lowering the EVM target breaks this
+        // silently at deploy time rather than loudly at compile time — see README.
+        assembly ("memory-safe") {
+            mcopy(add(out, 0x20), add(add(data, 0x20), start), len)
         }
     }
 }

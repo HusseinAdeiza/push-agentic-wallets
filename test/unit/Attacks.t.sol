@@ -63,9 +63,8 @@ contract AttacksTest is Test {
         wallet.installModule(2, address(validator), "");
 
         // There is no executor entry point at all.
-        (bool ok,) = address(wallet).call(
-            abi.encodeWithSignature("executeFromExecutor(bytes32,bytes)", bytes32(0), bytes(""))
-        );
+        (bool ok,) =
+            address(wallet).call(abi.encodeWithSignature("executeFromExecutor(bytes32,bytes)", bytes32(0), bytes("")));
         assertFalse(ok, "executeFromExecutor must not exist");
     }
 

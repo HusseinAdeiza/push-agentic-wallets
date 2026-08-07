@@ -13,3 +13,11 @@ docs-internal
 # whatever anvil run happened last.
 deployments/*.json
 !deployments/.gitkeep
+DEVIATIONS.md
+
+# macOS Finder metadata.
+.DS_Store
+
+# Per-developer Claude Code config. Hooks here point at absolute paths on one
+# machine, so committing it breaks every other clone.
+.claude/
