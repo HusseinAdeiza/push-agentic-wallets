@@ -5,15 +5,10 @@ broadcast/
 lcov.info
 node_modules/
 
-# forge doc output. Hand-written docs live in docs/ and ARE tracked.
-docs/book/
-docs-internal
-
 # Local deploy artifacts. Real deployments are recorded deliberately, not by
 # whatever anvil run happened last.
 deployments/*.json
 !deployments/.gitkeep
-DEVIATIONS.md
 
 # macOS Finder metadata.
 .DS_Store
@@ -21,3 +16,9 @@ DEVIATIONS.md
 # Per-developer Claude Code config. Hooks here point at absolute paths on one
 # machine, so committing it breaks every other clone.
 .claude/
+
+# Staging area for the v1/v2 files removed at the start of v3. Delete the folder.
+_to_delete/
+
+# Docs
+docs-internal/
