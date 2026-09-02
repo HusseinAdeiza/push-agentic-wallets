@@ -8,7 +8,7 @@
 2. **One contract per phase, its tests in the same phase.** No contract ships without its suite.
 3. **The PRDs are locked.** A PRD error is *reported with evidence and waited on* — never fixed in place, never coded around.
 4. **`src/libraries/` and `src/interfaces/` may change only via a diff proposed at the start of the phase that needs it.** Never edited opportunistically.
-5. **Branch `v3-build`, one commit per phase.** Never commit local deployment records (`deployments/*.json`), `out/`, `cache/`, or `.env`.
+5. **Branch `pushAgenticWallet_v3`.** All build work lives there. **Zaryab alone commits and pushes** — prepare the change, report what is ready, and print the commands; never run `git commit` or `git push`. Never commit local deployment records (`deployments/*.json`), `out/`, `cache/`, or `.env`.
 6. **Gate report format:** what was built · what was verified and how · what deviated and why · what you are unsure of · `forge test` and `forge build --sizes` output verbatim.
 
 ## Standing test rules
@@ -41,8 +41,10 @@
   gate report.** That is the reproducibility mechanism — do not invent a config key for it.
   CI uses `foundry-toolchain` with an explicit `version:` matching the recorded line.
 
-  Version recorded at Gate 0: **PENDING** — awaiting `foundryup` to stable; Steps 1–2 re-run and
-  the SmartSession row re-confirmed at 22,581 B / +1,995 before this line is filled in.
+  **Recorded at Gate 0:** `forge 1.5.1-stable` (`b0a9dd9ceda36f63e2326ce530c10e6916f4b8a2`,
+  2025-12-22). Confirmed on this version: SmartSession runtime 22,581 B / +1,995 margin —
+  byte-identical to the figure measured on 1.6.0-nightly, which is the evidence that the driver
+  does not move bytecode.
 
 **`optimizer_runs` and `evm_version` are load-bearing.** The vendored engine exceeds EIP-170 above ~833 runs and becomes undeployable; `cancun` is required for `MCOPY` in UCEP's slice helper. A local `anvil` deploy will not catch the size problem — anvil does not enforce EIP-170.
 
@@ -69,4 +71,4 @@ make test     # forge test -vv
 make sizes    # forge build --sizes — the S-06 gate, exits non-zero over 24,576 B
 ```
 
-`make sizes` is the size gate. Note it must build the vendored engine explicitly: `forge build --sizes` alone covers `src/` only, and the engine (1,995 B of margin) lives in `lib/`.
+`make sizes` is the size gate. It runs `--sizes` twice — once for the build, once for the vendored engine explicitly. That is deliberate: **which contracts the default table covers is forge-version-dependent** (1.5.1-stable includes `lib/`; 1.6.0-nightly did not), and SmartSession has the smallest margin in the build. The gate must not rest on a reporting default that has already changed once.

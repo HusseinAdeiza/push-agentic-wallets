@@ -4,16 +4,8 @@ pragma solidity 0.8.26;
 import { Test } from "forge-std/Test.sol";
 
 import { SmartSession } from "smartsessions/SmartSession.sol";
-import {
-    Session,
-    ActionData,
-    PolicyData,
-    ERC7739Data,
-    ERC7739Context,
-    PermissionId
-} from "smartsessions/DataTypes.sol";
+import { Session, ActionData, PolicyData, ERC7739Data, ERC7739Context } from "smartsessions/DataTypes.sol";
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
-import { IdLib } from "smartsessions/lib/IdLib.sol";
 
 import { PushSessionValidator } from "../src/validators/PushSessionValidator.sol";
 import { UniversalOutboundTxRequest, Multicall, MULTICALL_SELECTOR } from "../src/libraries/PushWalletTypes.sol";
