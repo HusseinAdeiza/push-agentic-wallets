@@ -36,9 +36,9 @@ contract BaseSmokeTest is BaseTest {
 
     /// Proves the harness's session matches the engine's id derivation — including the
     /// abi.encode (NOT encodePacked) choice at IdLib.sol:79.
-    function test_canonicalSessionDerivesPermissionId() public {
+    function test_canonicalSessionDerivesPermissionId() public view {
         bytes memory initData = ecdsaConfig(AGENT);
-        Session memory s = canonicalSession(initData, makeAddr("ucepPlaceholder"), hex"");
+        Session memory s = canonicalSession(initData, hex"");
 
         bytes32 fromEngine = PermissionId.unwrap(IdLib.toPermissionIdMemory(s));
         bytes32 byHand = keccak256(abi.encode(address(validator), initData, bytes32(0)));
@@ -50,8 +50,7 @@ contract BaseSmokeTest is BaseTest {
     /// Which method was called is proven by vm.expectCall, at the assertion site.
     function test_usvObserverAnswersStaticcallAndRecordsViaExpectCall() public {
         etchUSVObserver();
-        bytes memory expected =
-            abi.encodeWithSignature("verifyEd25519RawMessage(bytes,bytes,bytes)", "", "", "");
+        bytes memory expected = abi.encodeWithSignature("verifyEd25519RawMessage(bytes,bytes,bytes)", "", "", "");
 
         expectUSVCall(expected);
         (bool ok, bytes memory ret) = USV.staticcall(expected);

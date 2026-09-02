@@ -8,6 +8,7 @@ import { Session, ActionData, PolicyData, ERC7739Data, ERC7739Context } from "sm
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
 
 import { PushSessionValidator } from "../src/validators/PushSessionValidator.sol";
+import { UCEP } from "../src/policies/UCEP.sol";
 import { UniversalOutboundTxRequest, Multicall, MULTICALL_SELECTOR } from "../src/libraries/PushWalletTypes.sol";
 
 /**
@@ -20,6 +21,7 @@ abstract contract BaseTest is Test {
 
     SmartSession internal engine;
     PushSessionValidator internal validator;
+    UCEP internal ucep;
 
     // ─────────────────────────── named addresses ───────────────────────────
 
@@ -50,17 +52,20 @@ abstract contract BaseTest is Test {
     // ─────────────────────────────── setUp ───────────────────────────────
 
     function setUp() public virtual {
-        engine = new SmartSession();
-        validator = new PushSessionValidator();
-
-        vm.label(address(engine), "SmartSession");
-        vm.label(address(validator), "PushSessionValidator");
-
+        // Named addresses first — UCEP's constructor consumes two of them.
         GATEWAY = makeAddr("universalGatewayPC");
         EXECUTOR_MODULE = makeAddr("universalExecutorModule");
         RELAYER = makeAddr("relayer");
         OWNER = makeAddr("owner");
         AGENT = makeAddr("agent");
+
+        engine = new SmartSession();
+        validator = new PushSessionValidator();
+        ucep = new UCEP(GATEWAY, EXECUTOR_MODULE, address(engine));
+
+        vm.label(address(engine), "SmartSession");
+        vm.label(address(validator), "PushSessionValidator");
+        vm.label(address(ucep), "UCEP");
     }
 
     // ───────────────────────────── key helpers ─────────────────────────────
@@ -117,24 +122,34 @@ abstract contract BaseTest is Test {
     // ────────────────────────── canonical session ──────────────────────────
 
     /**
-     * @notice The ONLY session shape v3 permits (deployment spec §4).
-     * @dev    `salt` is zero here; the wallet overwrites it with its monotonic grantNonce in
-     *         Phase 3. `ucep` is a parameter because UCEP does not exist in this phase.
+     * @notice The ONLY session shape v3 permits (deployment spec §4) — the deployed UCEP as the
+     *         single action policy. POSITIVE tests use this.
+     * @dev    `salt` is zero here; the wallet overwrites it with its monotonic grantNonce in Phase 3.
      */
-    function canonicalSession(bytes memory validatorInitData, address ucep, bytes memory ucepInitData)
+    function canonicalSession(bytes memory validatorInitData, bytes memory ucepInitData)
+        internal
+        view
+        returns (Session memory)
+    {
+        return sessionWithPolicy(address(ucep), validatorInitData, ucepInitData);
+    }
+
+    /**
+     * @notice The same shape with an arbitrary action policy. NEGATIVE wrong-policy tests use this;
+     *         positive tests must not, or they stop testing the shipped wiring.
+     */
+    function sessionWithPolicy(address policy, bytes memory validatorInitData, bytes memory policyInitData)
         internal
         view
         returns (Session memory)
     {
         PolicyData[] memory actionPolicies = new PolicyData[](1);
-        actionPolicies[0] = PolicyData({ policy: ucep, initData: ucepInitData });
+        actionPolicies[0] = PolicyData({ policy: policy, initData: policyInitData });
 
         ActionData[] memory actions = new ActionData[](1);
         // Selector BEFORE target — that is the declaration order at DataTypes.sol:82-86.
         actions[0] = ActionData({
-            actionTargetSelector: SEND_OUTBOUND_SELECTOR,
-            actionTarget: GATEWAY,
-            actionPolicies: actionPolicies
+            actionTargetSelector: SEND_OUTBOUND_SELECTOR, actionTarget: GATEWAY, actionPolicies: actionPolicies
         });
 
         return Session({
@@ -143,8 +158,7 @@ abstract contract BaseTest is Test {
             salt: bytes32(0),
             userOpPolicies: new PolicyData[](0),
             erc7739Policies: ERC7739Data({
-                allowedERC7739Content: new ERC7739Context[](0),
-                erc1271Policies: new PolicyData[](0)
+                allowedERC7739Content: new ERC7739Context[](0), erc1271Policies: new PolicyData[](0)
             }),
             actions: actions,
             permitERC4337Paymaster: false
