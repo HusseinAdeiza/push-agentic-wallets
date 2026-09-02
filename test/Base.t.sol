@@ -10,8 +10,7 @@ import {
     PolicyData,
     ERC7739Data,
     ERC7739Context,
-    PermissionId,
-    SmartSessionMode
+    PermissionId
 } from "smartsessions/DataTypes.sol";
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
 import { IdLib } from "smartsessions/lib/IdLib.sol";
@@ -196,10 +195,48 @@ abstract contract BaseTest is Test {
     ///      vm.expectRevert(Contract.Error.selector) directly, so the reader sees which
     ///      error is expected at the assertion site.
 
-    /// @dev Asserts no call is made to `target` for the remainder of the test.
-    ///      Used by W-28 in Phase 3.
-    function assertNoCallsTo(address target) internal {
-        vm.expectCall(target, "", 0);
+    // ─────────────────────────── the call recorder ───────────────────────────
+
+    // OBSERVER, NEVER ORACLE. The recorder counts calls and returns empty bytes; it supplies
+    // no behaviour to the code under test.
+    //
+    // WHY A RECORDER AND NOT `vm.expectCall(target, "", 0)`. That form depends on three
+    // behaviours at once: empty-calldata prefix matching, zero-count meaning "assert not
+    // called", and — the one that actually decides it — whether calls made inside a frame
+    // that later REVERTS still count against the expectation. W-28 asserts silence inside
+    // `vm.expectRevert`, so that third interaction is load-bearing and varies by version.
+    // Worse, a helper built on expectCall cannot be verified here: a cheatcode-level
+    // expectation failure is not catchable, so the negative branch can never be demonstrated
+    // — a test that cannot fail. The recorder's counter is ordinary storage, so both branches
+    // are provable (see test_callRecorder_semantics).
+    function etchCallRecorder(address target) internal {
+        vm.etch(target, type(CallRecorder).runtimeCode);
+    }
+
+    function callsRecorded(address target) internal view returns (uint256) {
+        return uint256(vm.load(target, bytes32(uint256(0))));
+    }
+
+    /// @dev Asserts `target` was never called. Requires etchCallRecorder(target) first.
+    function assertNoCallsTo(address target) internal view {
+        assertEq(callsRecorded(target), 0, "expected no calls to target");
+    }
+}
+
+/// @dev Deployed only via vm.etch, by etchCallRecorder. Observer, never oracle: it counts calls
+///      into slot 0 and returns empty bytes, supplying no behaviour to the code under test.
+///      Counts CALL only — a STATICCALL cannot write storage and will revert against this
+///      contract, which is itself informative: a caller that staticcalls a recorder is telling
+///      you the call happened.
+contract CallRecorder {
+    uint256 public count;
+
+    fallback() external payable {
+        count++;
+    }
+
+    receive() external payable {
+        count++;
     }
 }
 

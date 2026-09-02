@@ -63,6 +63,34 @@ contract BaseSmokeTest is BaseTest {
         assertEq(USV.code.length, 0, "USV stripped");
     }
 
+    /// Both branches of the recorder shown, which is the whole point of replacing
+    /// `vm.expectCall(target, "", 0)`: a cheatcode-level expectation failure is not catchable,
+    /// so that helper's negative branch could never be demonstrated.
+    ///
+    /// DEVIATION from the ruling's specified shape, verified by probe: a STATICCALL against a
+    /// storage-writing recorder REVERTS (it cannot SSTORE) and therefore cannot increment to 2.
+    /// Asserting the revert is the honest form — and it is still informative for W-28, because a
+    /// caller that staticcalls the recorder has demonstrably reached it.
+    function test_callRecorder_semantics() public {
+        address probe = makeAddr("recorderProbe");
+        etchCallRecorder(probe);
+
+        assertEq(callsRecorded(probe), 0, "starts at zero");
+        assertNoCallsTo(probe); // positive branch: passes when silent
+
+        (bool okCall,) = probe.call(hex"11223344");
+        assertTrue(okCall, "plain call succeeds");
+        assertEq(callsRecorded(probe), 1, "negative branch: counter moved");
+
+        (bool okStatic,) = probe.staticcall(hex"55667788");
+        assertFalse(okStatic, "staticcall reverts against a storage-writing recorder");
+        assertEq(callsRecorded(probe), 1, "and therefore does not increment");
+
+        (bool okValue,) = probe.call{ value: 0 }("");
+        assertTrue(okValue, "receive() path also counts");
+        assertEq(callsRecorded(probe), 2, "empty calldata routed to receive");
+    }
+
     function test_ecdsaConfigShape() public view {
         (uint8 scheme0, bytes memory key0) = abi.decode(ecdsaConfig(AGENT), (uint8, bytes));
         assertEq(scheme0, 0, "ecdsa scheme byte");

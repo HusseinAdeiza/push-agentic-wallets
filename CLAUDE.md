@@ -33,6 +33,16 @@
 
 - `solc 0.8.26` · `optimizer_runs = 833` · `evm_version = "cancun"` · `via_ir = true`
 - OpenZeppelin 5.7.0 · forge-std 1.16.2 · SmartSession fork `7dc20e4`
+- **forge: use STABLE, never nightly** (`foundryup -i stable`). Runtime bytecode is a function of
+  solc + optimizer + via_ir + evm_version + metadata — all pinned in `foundry.toml` — so the forge
+  binary does not change the sizes S-06 gates on. It does change how `--sizes` reports, how
+  remappings resolve, and how `forge script` broadcasts, which is where a nightly actually bites.
+  `foundry.toml` has no key for the driver version: **record the exact `forge --version` in every
+  gate report.** That is the reproducibility mechanism — do not invent a config key for it.
+  CI uses `foundry-toolchain` with an explicit `version:` matching the recorded line.
+
+  Version recorded at Gate 0: **PENDING** — awaiting `foundryup` to stable; Steps 1–2 re-run and
+  the SmartSession row re-confirmed at 22,581 B / +1,995 before this line is filled in.
 
 **`optimizer_runs` and `evm_version` are load-bearing.** The vendored engine exceeds EIP-170 above ~833 runs and becomes undeployable; `cancun` is required for `MCOPY` in UCEP's slice helper. A local `anvil` deploy will not catch the size problem — anvil does not enforce EIP-170.
 
