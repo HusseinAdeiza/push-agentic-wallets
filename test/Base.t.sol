@@ -56,6 +56,13 @@ abstract contract BaseTest is Test {
     // ───────────────────────────── constants ─────────────────────────────
 
     /// @dev Asserted against IUniversalGatewayPC.sendUniversalTxOutbound.selector in the smoke test.
+    ///
+    ///      DELIBERATELY HAND-TYPED, not imported from PushWalletTypes.sol. The production constant
+    ///      lives there and both the wallet and UCEP read it from that one place; this copy is the
+    ///      INDEPENDENT WITNESS that the shared constant is the value the gateway actually exposes.
+    ///      Importing it here would make the test agree with the source by construction and assert
+    ///      nothing — a mock supplying the behaviour under test. UCEP's smoke test pins the two
+    ///      against each other, so an edit to either side fails the build rather than passing quietly.
     bytes4 internal constant SEND_OUTBOUND_SELECTOR =
         bytes4(keccak256("sendUniversalTxOutbound((bytes,address,uint256,uint256,uint256,uint256,bytes,address))"));
 

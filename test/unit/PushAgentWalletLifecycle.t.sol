@@ -5,6 +5,7 @@ import { Vm } from "forge-std/Vm.sol";
 
 import { BaseTest } from "../Base.t.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
+import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
 import { ModeLib, ModeCode } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib, Execution } from "../../src/libraries/ExecutionLib.sol";
@@ -534,7 +535,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
 
         // revoke
         vm.expectEmit(true, true, true, true, address(wallet));
-        emit PushAgentWallet.MandateRevoked(pid);
+        emit IPushAgentWallet.MandateRevoked(pid);
         vm.prank(WALLET_OWNER);
         wallet.stopMandate(pid);
     }

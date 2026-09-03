@@ -13,8 +13,8 @@ import { ConfigId } from "smartsessions/DataTypes.sol";
  * @dev    INHERITANCE SHAPE, verified by compiled probe. `IActionPolicy is IPolicy is IERC165`,
  *         so IERC165 already arrives transitively and listing it again as
  *         `is IActionPolicy, IERC165` fails with `Error (5005): Linearization of inheritance
- *         graph impossible` — C3 requires the most-derived base first. Single inheritance is
- *         both correct and sufficient; do not "complete" it by adding IERC165.
+ *         graph impossible` — C3 linearization requires the most-derived base first. Single
+ *         inheritance is both correct and sufficient; do not "complete" it by adding IERC165.
  *
  * @dev    Revert data truncates to 32 bytes through the engine (`PolicyLib.sol:139-152`,
  *         `_maxCopy: 32`, surfacing as `PolicyCheckReverted(bytes32)`). The 4-byte selector
@@ -40,7 +40,9 @@ interface IUCEP is IActionPolicy {
 
     /// @param initialized      set once, at initialisation; re-initialisation is refused
     /// @param validUntil       non-zero always (enforced at init); "never" = type(uint48).max, explicit
-    /// @param destChainHash    stored, NOT enforced — SDK assertion + indexing only (see §10 item 1)
+    /// @param destChainHash    stored, NOT enforced. The destination chain is already pinned
+    ///                         transitively by the asset, so this field exists for SDK assertions
+    ///                         and indexing only — never as a gate.
     /// @param expectedCEA      the wallet's destination account, committed at grant
     /// @param asset            the one permitted PRC20
     /// @param maxAmountTotal   type(uint256).max = unlimited

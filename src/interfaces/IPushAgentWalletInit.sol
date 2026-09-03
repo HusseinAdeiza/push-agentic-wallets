@@ -4,7 +4,7 @@ pragma solidity 0.8.26;
 /**
  * @title  IPushAgentWalletInit — the ONE function the factory compiles against.
  * @notice The factory deliberately does NOT import `PushAgentWallet`. Its obligation ends at
- *         "call this once, bubble its revert" (§7.3); everything inside is the wallet's PRD.
+ *         "call this once, bubble its revert"; everything inside is the wallet's own concern.
  *         Importing the wallet would couple the factory's build to the wallet's whole dependency
  *         graph for a single zero-argument call.
  */

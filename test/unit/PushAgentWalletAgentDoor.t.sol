@@ -5,6 +5,7 @@ import { Vm } from "forge-std/Vm.sol";
 
 import { BaseTest } from "../Base.t.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
+import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
 import { ModeLib, ModeCode } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib, Execution } from "../../src/libraries/ExecutionLib.sol";
@@ -946,7 +947,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         good.nonceSeq = 1;
 
         vm.expectEmit(true, true, true, true, address(wallet));
-        emit PushAgentWallet.MandateActionAuthorized(good.pid, good.nonceKey, good.nonceSeq, _opHash(good));
+        emit IPushAgentWallet.MandateActionAuthorized(good.pid, good.nonceKey, good.nonceSeq, _opHash(good));
         _submit(good, _signed(good));
 
         assertEq(wallet.getNonce(0), 2, "the retry advanced the lane exactly once");
@@ -963,7 +964,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         bytes32 expectedHash = _opHash(r);
 
         vm.expectEmit(true, true, true, true, address(wallet));
-        emit PushAgentWallet.MandateActionAuthorized(r.pid, r.nonceKey, r.nonceSeq, expectedHash);
+        emit IPushAgentWallet.MandateActionAuthorized(r.pid, r.nonceKey, r.nonceSeq, expectedHash);
 
         _submit(r, _signed(r));
     }

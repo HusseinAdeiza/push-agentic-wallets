@@ -7,7 +7,12 @@ import { IActionPolicy, IPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { IERC165 } from "forge-std/interfaces/IERC165.sol";
 
 import { IUCEP } from "../interfaces/IUCEP.sol";
-import { UniversalOutboundTxRequest, Multicall, MULTICALL_SELECTOR } from "../libraries/PushWalletTypes.sol";
+import {
+    UniversalOutboundTxRequest,
+    Multicall,
+    MULTICALL_SELECTOR,
+    SEND_OUTBOUND_SELECTOR as GATEWAY_SEND_OUTBOUND_SELECTOR
+} from "../libraries/PushWalletTypes.sol";
 
 /**
  * @title  UCEP — Universal CrossChain Execution Policy
@@ -29,26 +34,31 @@ import { UniversalOutboundTxRequest, Multicall, MULTICALL_SELECTOR } from "../li
 contract UCEP is IUCEP {
     // ─────────────────────────────── constants ───────────────────────────────
 
-    // IMPORTED, NOT REDECLARED — both already exist upstream and duplicating a constant across a
-    // trust boundary is exactly the drift this project has been eliminating.
-    //   VALIDATION_SUCCESS  ← erc7579/interfaces/IERC7579Module.sol (via smartsessions/interfaces/IPolicy.sol)
-    //   MULTICALL_SELECTOR  ← src/libraries/PushWalletTypes.sol:31  (value 0x2cc2842d, verified identical)
+    // IMPORTED, NOT REDECLARED — all three already exist elsewhere and duplicating a constant
+    // across a trust boundary is exactly the drift this project has been eliminating.
+    //   VALIDATION_SUCCESS      ← erc7579/interfaces/IERC7579Module.sol (via smartsessions/interfaces/IPolicy.sol)
+    //   MULTICALL_SELECTOR      ← src/libraries/PushWalletTypes.sol  (value 0x2cc2842d, verified identical)
+    //   SEND_OUTBOUND_SELECTOR  ← src/libraries/PushWalletTypes.sol, re-exposed below
 
-    /// @dev E1 — named, never inlined. Gate 13's ceiling; bounds the inner loop.
+    /// @dev The maximum number of actions one batched request may carry. Named, never inlined:
+    ///      it is the ceiling gate 13 enforces and the bound on the inner validation loop.
     uint256 internal constant MAX_ACTIONS_PER_REQUEST = 10;
 
-    /// @dev RULED 2026-08-31. Bounds the allow-list loop, which was the last unbounded loop here.
+    /// @dev Bounds the allow-list loop, which was the last unbounded loop in this contract.
     uint256 internal constant MAX_ALLOWED_CALLS = 32;
 
-    bytes4 public constant SEND_OUTBOUND_SELECTOR =
-        bytes4(keccak256("sendUniversalTxOutbound((bytes,address,uint256,uint256,uint256,uint256,bytes,address))"));
+    /// @notice The gateway selector every agent action must carry.
+    /// @dev    PART OF THIS CONTRACT'S ABI — monitoring and the SDK read it, so it stays a public
+    ///         constant. The VALUE is not defined here: it is the shared gateway constant, so the
+    ///         wallet's grant-shape check and this policy's request gate cannot disagree.
+    bytes4 public constant SEND_OUTBOUND_SELECTOR = GATEWAY_SEND_OUTBOUND_SELECTOR;
 
     // The smallest possible ABI encoding of a UniversalOutboundTxRequest argument list.
     // Derivation (PushWalletTypes.sol:9-18): 32 (outer offset word — the struct is dynamic, so
     // abi.encode prefixes a pointer) + 256 (eight head words) + 32 + 32 (length words for the two
     // empty dynamic `bytes` fields, `recipient` and `payload`) = 352.
-    // DO NOT hand-maintain this number: test U-21 pins it against abi.encode of an empty request,
-    // so a future field added to the struct fails the build instead of silently loosening gate 4c.
+    // DO NOT hand-maintain this number: a test pins it against abi.encode of an empty request, so
+    // a future field added to the struct fails the build instead of silently loosening gate 4c.
     uint256 internal constant MIN_OUTBOUND_BODY_LEN = 352;
 
     // ─────────────────────────────── immutables ───────────────────────────────
@@ -57,7 +67,8 @@ contract UCEP is IUCEP {
     address public immutable UNIVERSAL_GATEWAY_PC;
 
     /// @notice The sole caller permitted to credit a failed outbound.
-    /// @dev    Address UNCONFIRMED against a live deployment — confirm before mainnet (D2).
+    /// @dev    Address UNCONFIRMED against a live deployment — confirm before mainnet. It is a
+    ///         constructor argument, so nothing about building or testing depends on the real one.
     address public immutable UNIVERSAL_EXECUTOR_MODULE;
 
     /// @notice The multiplexer this contract trusts on every non-engine-driven path.
@@ -103,7 +114,7 @@ contract UCEP is IUCEP {
      * @notice Write one permission's configuration. Reached inside `enableSessions` during the
      *         wallet's `grantMandate`; `msg.sender` becomes the multiplexer key.
      * @dev    Anyone CAN call this with themselves as multiplexer — that writes into their own
-     *         keyed slice and touches nothing the real engine reads. Harmless by keying (U-17).
+     *         keyed slice and touches nothing the real engine reads. Harmless by keying.
      * @param  initData `abi.encode(Config)`.
      */
     function initializeWithMultiplexer(address account, ConfigId configId, bytes calldata initData) external {
@@ -111,7 +122,7 @@ contract UCEP is IUCEP {
 
         // RE-INITIALISATION IS REFUSED — a deliberate, ruled deviation from the upstream IPolicy
         // comment "MAY be called again without deinit; MUST overwrite" (IPolicy.sol:22-24).
-        // DO NOT restore overwrite semantics for interface fidelity (§10 item 6).
+        // DO NOT restore overwrite semantics for interface fidelity.
         //
         // WHY THIS CANNOT BREAK A LEGITIMATE REGRANT, which is the question it raises: the wallet
         // supplies a fresh salt from its monotonic grant counter on every grant, so a regranted
@@ -130,17 +141,19 @@ contract UCEP is IUCEP {
         if (listLength == 0 || listLength > MAX_ALLOWED_CALLS) revert AllowListOutOfRange(listLength);
 
         // An owner consent term has no meaningful silence — "never expires" is written explicitly
-        // as type(uint48).max (Q4-A).
+        // as type(uint48).max, never left as zero.
         if (incoming.validUntil == 0 || incoming.validUntil <= block.timestamp) {
             revert InvalidExpiry(incoming.validUntil);
         }
         if (incoming.asset == address(0) || incoming.expectedCEA == address(0)) revert InvalidConfigField();
 
         // NOT VALIDATED, DELIBERATELY: cap values (zero and max are both legal — a per-call cap of
-        // zero is a valid redeploy-only mandate, §10 item 9); `destChainHash` (informational); and
-        // `beneficiaryOffset`. Allow-list LENGTH is validated above; its CONTENTS are not — offsets
-        // are generated from each protocol's ABI by tooling (O1) and every newly supported protocol
-        // ships a rejection test (O2). A wrong offset fails closed, per-rule, at validation time.
+        // zero is a valid redeploy-only mandate); `destChainHash` (informational); and
+        // `beneficiaryOffset`. Allow-list LENGTH is validated above; its CONTENTS are not, and that
+        // is an obligation this contract cannot enforce: offsets must be GENERATED from each
+        // protocol's ABI by tooling and never hand-typed, and every newly supported protocol must
+        // ship a test rejecting a wrong beneficiary and an oversized amount. A wrong offset fails
+        // closed, per-rule, at validation time — it cannot widen a mandate, only break it.
         _store(cfg, incoming);
         cfg.initialized = true;
 
@@ -194,8 +207,9 @@ contract UCEP is IUCEP {
         //    `try this.decode(...)`, which would introduce an EXTERNAL CALL into checkAction —
         //    and the safety argument above rests on there being none. DO NOT WRAP IT.
         //
-        //    abi.decode also IGNORES TRAILING BYTES, so this is not a canonical-encoding check
-        //    (U-22 characterises that). There is no exploit, for two independent reasons: the whole
+        //    abi.decode also IGNORES TRAILING BYTES, so this is not a canonical-encoding check —
+        //    the suite characterises that explicitly. There is no exploit, for two independent
+        //    reasons: the whole
         //    executionCalldata is bound into the wallet's operation hash, and the signature is
         //    verified LAST, so anything a policy wrote on garbage-appended calldata is unwound.
         if (data.length < 4 + MIN_OUTBOUND_BODY_LEN) revert MalformedOutboundRequest(data.length);
@@ -206,7 +220,7 @@ contract UCEP is IUCEP {
 
         // ── gate 6 · per-action cap. An amount of 0 passes trivially: zero-amount is the
         //    REDEPLOYMENT path (acting on capital already at the destination). There is no
-        //    zero-amount gate in v3 and one must not be restored (§10 item 5).
+        //    zero-amount gate in this design and one must not be restored.
         if (req.amount > cfg.maxAmountPerCall) revert AmountExceedsCap(req.amount, cfg.maxAmountPerCall);
 
         // ── gate 7 · lifetime cap. 0.8.x overflow-safe; max-cap configs never trip. ──
@@ -225,7 +239,7 @@ contract UCEP is IUCEP {
 
         // ── gate 11 · funds may only travel with the instruction payload. Defence in depth: the
         //    far-side multicall branch discards this field today; the pin makes that safety local
-        //    instead of inherited. NOT dead code (§10 item 2).
+        //    instead of inherited. NOT dead code.
         if (req.recipient.length != 0) revert RecipientMustBeEmpty();
 
         _checkInnerCalls(cfg, account, req.payload);
@@ -234,7 +248,7 @@ contract UCEP is IUCEP {
         //
         // ACCUMULATION IS OPTIMISTIC BUT ATOMIC: `spent` is written during validation, before
         // execution, and survives only because validation and dispatch share one transaction.
-        // A future maintainer who splits them breaks the accounting silently (§10 item 4).
+        // A future maintainer who splits them breaks the accounting silently.
         if (req.amount > 0) {
             cfg.spent = newSpent;
             emit OutboundMetered(id, msg.sender, account, req.amount); // the Push-core correlation record
@@ -292,7 +306,7 @@ contract UCEP is IUCEP {
             //    an owner who allow-listed their own destination account cannot hand the agent
             //    direct control of everything it holds. The list "redundantly" includes addresses
             //    other layers also block; three independent defences are the design and none may
-            //    be removed as redundant (§10 item 3).
+            //    be removed as redundant.
             //    `account` is the WALLET: the engine passes its own msg.sender through as this
             //    parameter (PolicyLib.sol:220,236), so it is the wallet and never the engine.
             if (
@@ -313,8 +327,8 @@ contract UCEP is IUCEP {
             }
 
             // ── gate 16 · per-entry value cap, DESTINATION-chain native units. NEVER compared
-            //    against the Push-side `value` — two assets on two chains (§10 item 7 records the
-            //    old bug this comment came from).
+            //    against the Push-side `value` — two assets on two chains. Conflating the two is
+            //    a real bug this design once carried; the comment is here to stop its return.
             if (entry.value > rule.maxValue) revert InnerValueExceedsAllowance(i, entry.value, rule.maxValue);
 
             unchecked {
@@ -348,11 +362,11 @@ contract UCEP is IUCEP {
 
     /**
      * @notice Credit a confirmed far-side failure back to the spend counter.
-     * @dev    STATUS: DESIGNED AND SHIPPED, NOT YET FUNCTIONAL. The executor module does not yet
-     *         call anything on outbound failure (Push-core open item F1). Until it lands, a failed
-     *         far leg leaves `spent` inflated; the remedy is revoke-and-regrant.
+     * @dev    STATUS: DESIGNED AND SHIPPED, NOT YET FUNCTIONAL. The Universal Executor Module does
+     *         not yet call anything on outbound failure — that is open work in Push core. Until it
+     *         lands, a failed far leg leaves `spent` inflated; the remedy is revoke-and-regrant.
      * @dev    NO GAS COUNTER EXISTS AND NONE MAY EVER BE TOUCHED BY THIS PATH — gas consumed on a
-     *         failed outbound was genuinely consumed (§10 item 10).
+     *         failed outbound was genuinely consumed, and is never credited back.
      */
     function creditRevert(ConfigId id, address account, bytes32 outboundTxId, uint256 amount) external {
         // One trusted caller; nobody else can fabricate a failure.
@@ -397,7 +411,7 @@ contract UCEP is IUCEP {
                 || iid == type(IERC165).interfaceId;
     }
 
-    // ─────────────────────────── internals (§2.1) ───────────────────────────
+    // ─────────────────────────────── internals ───────────────────────────────
 
     /// @dev Reads the 32-byte word at `offset` and returns its low 20 bytes.
     ///      MUST bounds-check: reading past the end of a short calldata blob would
@@ -448,8 +462,8 @@ contract UCEP is IUCEP {
         }
     }
 
-    /// @dev Copy a decoded config into storage. `initialized` is NOT set here — the caller
-    ///      sets it in step 4 of §6.1, so this function has exactly one job.
+    /// @dev Copy a decoded config into storage. `initialized` is NOT set here — the caller sets it
+    ///      immediately after this returns, so this function has exactly one job.
     ///      `spent` is forced to zero; any value supplied by the caller is ignored.
     function _store(Config storage cfg, Config memory incoming) internal {
         cfg.validUntil = incoming.validUntil;
@@ -461,8 +475,8 @@ contract UCEP is IUCEP {
         cfg.maxPCPerCall = incoming.maxPCPerCall;
         cfg.spent = 0;
 
-        // Re-initialisation is refused (§6.1), so in production this array is always
-        // empty here. The delete is kept for the stranger-slice path and for tests.
+        // Re-initialisation is refused, so in production this array is always empty here. The
+        // delete is kept for the stranger-slice path and for tests.
         delete cfg.allowedCalls;
         uint256 len = incoming.allowedCalls.length;
         for (uint256 i; i < len;) {

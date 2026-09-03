@@ -3,6 +3,7 @@ pragma solidity 0.8.26;
 
 import { BaseTest } from "../Base.t.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
+import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
 import {
     ModeLib,
@@ -397,7 +398,7 @@ contract PushAgentWalletTest is BaseTest {
         wallet.installModule(1, address(rev), "");
 
         vm.expectEmit(true, true, true, true, address(wallet));
-        emit PushAgentWallet.UninstallCallbackFailed(address(rev));
+        emit IPushAgentWallet.UninstallCallbackFailed(address(rev));
         vm.prank(WALLET_OWNER);
         wallet.uninstallModule(1, address(rev), "");
         assertFalse(wallet.isModuleInstalled(1, address(rev), ""), "reverting callback still removed");
@@ -408,7 +409,7 @@ contract PushAgentWalletTest is BaseTest {
         wallet.installModule(1, address(burner), "");
 
         vm.expectEmit(true, true, true, true, address(wallet));
-        emit PushAgentWallet.UninstallCallbackFailed(address(burner));
+        emit IPushAgentWallet.UninstallCallbackFailed(address(burner));
         vm.prank(WALLET_OWNER);
         wallet.uninstallModule(1, address(burner), "");
         assertFalse(wallet.isModuleInstalled(1, address(burner), ""), "gas-burning callback still removed");
@@ -529,9 +530,9 @@ contract PushAgentWalletTest is BaseTest {
 
         // the factory succeeds, and both events fire
         vm.expectEmit(true, true, true, true, address(fresh));
-        emit PushAgentWallet.ModuleInstalled(1, address(engine));
+        emit IPushAgentWallet.ModuleInstalled(1, address(engine));
         vm.expectEmit(true, true, true, true, address(fresh));
-        emit PushAgentWallet.AccountInitialized(WALLET_OWNER, address(engine));
+        emit IPushAgentWallet.AccountInitialized(WALLET_OWNER, address(engine));
 
         vm.prank(FACTORY);
         fresh.initializeAccount();
@@ -594,7 +595,7 @@ contract PushAgentWalletTest is BaseTest {
         bytes memory ecd = _singleCalldata(sink, 1 ether, "");
 
         vm.expectEmit(true, true, true, true, address(wallet));
-        emit PushAgentWallet.OwnerExecuted(_singleMode(), keccak256(ecd));
+        emit IPushAgentWallet.OwnerExecuted(_singleMode(), keccak256(ecd));
 
         vm.prank(WALLET_OWNER);
         wallet.execute(_singleMode(), ecd);
@@ -812,7 +813,7 @@ contract PushAgentWalletTest is BaseTest {
     // ═══════════════════════════════ views & plumbing ═══════════════════════════════
 
     function test_AccountId() public view {
-        assertEq(wallet.accountId(), "push.agentwallet.3.0.0", "ERC-7579 vendorname.accountname.semver");
+        assertEq(wallet.accountId(), "push.agentwallet.1.0.0", "ERC-7579 vendorname.accountname.semver");
     }
 
     /// ERC-165 + the two receiver interfaces, and NOTHING else. It must NOT report

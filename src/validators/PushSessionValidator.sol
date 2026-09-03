@@ -10,7 +10,7 @@ import { IPushSessionValidator } from "../interfaces/IPushSessionValidator.sol";
  * @title  PushSessionValidator
  * @notice A stateless ISessionValidator (ERC-7579 module type 7) that answers
  *         exactly one question for SmartSession: did the session key sign this hash?
- *         Supports secp256k1 (ECDSA) and Ed25519 via the USV precompile (PRD §7).
+ *         Supports secp256k1 (ECDSA) and Ed25519 via the signature-verification precompile.
  *
  * @dev    This is the contract that makes a Solana-keyed agent a first-class
  *         operator on an EVM account.
@@ -94,16 +94,19 @@ contract PushSessionValidator is ISessionValidator, IPushSessionValidator {
      *
      *         THREE-VALUED, and the consistency law with `validateSignatureWithData` is therefore
      *         three cases, not one biconditional:
-     *           1. `validateConfig == true`  ⟺ the runtime does NOT revert          (P-01)
+     *           1. `validateConfig == true`  ⟺ the runtime does NOT revert
      *              — a non-reverting runtime call may still return false; that is a SIGNATURE
      *                failure, outside this law entirely.
      *           2. `validateConfig == false` ⇒ the runtime reverts with a NAMED error
-     *              (`UnsupportedScheme` or `MalformedConfig`)                        (P-02)
+     *              (`UnsupportedScheme` or `MalformedConfig`)
      *           3. `validateConfig` REVERTS  ⇒ the runtime also reverts, at the same `abi.decode`
-     *              step, not necessarily with a named error                          (P-05)
+     *              step, not necessarily with a named error
+     *
+     *         Each of the three cases has its own test; the suite is what holds the two functions
+     *         together, since nothing in the type system can.
      *
      *         Callers MUST treat a revert as "invalid config". The two functions must never drift.
-     * @param  data abi.encode(uint8 scheme, bytes key) — the frozen encoding (§10 item 5).
+     * @param  data abi.encode(uint8 scheme, bytes key) — the frozen encoding.
      */
     function validateConfig(bytes calldata data) external pure returns (bool) {
         (uint8 scheme, bytes memory key) = abi.decode(data, (uint8, bytes));

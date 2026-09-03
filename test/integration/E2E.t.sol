@@ -7,6 +7,7 @@ import { BaseTest } from "../Base.t.sol";
 import { MockUniversalGateway, MockPRC20 } from "../mocks/MockUniversalGateway.sol";
 
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
+import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { IUCEP } from "../../src/interfaces/IUCEP.sol";
 import { ModeLib, ModeCode } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib } from "../../src/libraries/ExecutionLib.sol";
@@ -215,7 +216,7 @@ contract E2ETest is BaseTest {
         emit IUCEP.OutboundMetered(_configId(permissionId), address(engine), address(bobAgw), HUNDRED_USDC);
 
         vm.expectEmit(true, true, true, true, address(bobAgw));
-        emit PushAgentWallet.MandateActionAuthorized(permissionId, 0, 0, opHash);
+        emit IPushAgentWallet.MandateActionAuthorized(permissionId, 0, 0, opHash);
 
         // ANYONE may relay — the caller is not the authority, the signature is.
         vm.prank(RELAYER);

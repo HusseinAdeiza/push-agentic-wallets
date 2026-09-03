@@ -4,9 +4,8 @@ pragma solidity 0.8.26;
 /**
  * @title  IPushSessionValidator — the v3 addition to the session-validator surface.
  * @notice Upstream `ISessionValidator` does not carry `validateConfig`. The wallet's
- *         `grantMandate` compiles against THIS interface (wallet PRD §2.2 / §6.3), and
- *         `PushSessionValidator` inheriting it is what makes the compiler check the two
- *         against each other.
+ *         `grantMandate` compiles against THIS interface, and `PushSessionValidator` inheriting
+ *         it is what makes the compiler check the two against each other.
  *
  * @dev    `pure` is PERMANENT, not provisional. It cannot need to become `view` for a future
  *         scheme, because the validator can never be upgraded: its address is an input to every

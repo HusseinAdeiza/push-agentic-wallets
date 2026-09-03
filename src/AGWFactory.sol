@@ -28,7 +28,7 @@ import { IPushAgentWalletInit } from "./interfaces/IPushAgentWalletInit.sol";
  * @dev    WHAT THIS CONTRACT NEVER DOES: hold funds (no receive, no fallback, no token logic);
  *         touch a wallet after deployment (no upgrade, no migration, no admin reach — ever);
  *         accept an implementation parameter at deploy time or any policy/agent/mandate data;
- *         change the wallet implementation after initialisation (§11 item 1 — NO SETTER EXISTS).
+ *         change the wallet implementation after initialisation (NO SETTER EXISTS).
  *
  * @dev    DEPLOYMENT SHAPE: ERC-1967 proxy -> this implementation (UUPS). The PROXY address is the
  *         permanent, user-facing factory address; it never changes across logic upgrades.
@@ -59,7 +59,8 @@ contract AGWFactory is
 
     // DECLARATION ORDER IS NORMATIVE. All four bases use ERC-7201 namespaced storage, so NO
     // inherited variable occupies the linear slot space and these three sit at slots 0, 1, 2.
-    // T-01(a) asserts exactly that, from `forge inspect` output rather than from this comment.
+    // The storage-layout test asserts exactly that, reading `forge inspect` output rather than
+    // trusting this comment.
 
     /// @dev owner => number of wallets deployed for them. DOUBLES AS THE NEXT INDEX — one value,
     ///      one slot, no way for a count and a "next index" to drift apart. `uint96` so it matches
@@ -71,7 +72,7 @@ contract AGWFactory is
     mapping(address => IAGWFactory.WalletRecord) internal _records;
 
     /// @notice The canonical PushAgentWallet logic contract all clones delegate to.
-    /// @dev    Written exactly once, in `initialize`. NO SETTER EXISTS — §6.8, §11 item 1. Any
+    /// @dev    Written exactly once, in `initialize`. NO SETTER EXISTS, deliberately. Any
     ///         function able to rewrite this address could silently move every not-yet-deployed
     ///         predicted address, stranding counterfactually funded wallets with NO REMEDY (v3 has
     ///         no migration of any kind). The absence of the function IS the security mechanism.
@@ -79,16 +80,17 @@ contract AGWFactory is
     /// @dev    DECLARED LAST, AND DELIBERATELY: it is the APPEND-ONLY ANCHOR. Every future variable
     ///         goes after it; nothing is ever inserted or reordered before it. If that rule is
     ///         violated this address moves and address derivation breaks with no remedy — which is
-    ///         why T-01 asserts the layout and is never deleted or weakened.
+    ///         why the storage-layout and address-stability tests assert this and are never
+    ///         deleted or weakened.
     ///
     /// @dev    `internal`, exposed only through `walletImplementation()`. A `public` variable would
     ///         auto-generate a second getter with a different selector.
     address internal _walletImplementation;
 
-    // THERE IS NO `__gap`, DELIBERATELY (§11 item 3). This is a leaf UUPS implementation that
-    // nothing inherits from, so a trailing gap protects against nothing: a future logic version
-    // appends after `_walletImplementation`, which is always safe. The real protection is the
-    // append-only rule plus T-01(a).
+    // THERE IS NO `__gap`, DELIBERATELY. This is a leaf UUPS implementation that nothing inherits
+    // from, so a trailing gap protects against nothing: a future logic version appends after
+    // `_walletImplementation`, which is always safe. The real protection is the append-only rule
+    // plus the storage-layout test.
 
     // ────────────────────────────── constructor ──────────────────────────────
 
@@ -123,16 +125,16 @@ contract AGWFactory is
     /**
      * @notice Deploys the caller's next agent wallet.
      *
-     * @dev    THE ORDER OF EFFECTS IS NORMATIVE, and it is also the reentrancy protection
-     *         (§11 item 7 — there is deliberately NO ReentrancyGuard). The counter is advanced and
+     * @dev    THE ORDER OF EFFECTS IS NORMATIVE, and it is also the reentrancy protection — there
+     *         is deliberately NO ReentrancyGuard. The counter is advanced and
      *         the registry written BEFORE the one external call, so a reentrant `deployWallet` can
      *         never be handed the same index twice. Adding a guard would be harmless-looking noise
      *         that hides the actual invariant.
      *
      * @dev    NOTHING MANDATE-RELATED ENTERS THE DERIVATION. The salt is the owner and a
      *         factory-assigned sequential index, nothing else. The owner appears TWICE — in the
-     *         salt and in the immutable args — redundantly and on purpose (§11 item 4): optimising
-     *         it out of either changes every future address.
+     *         salt and in the immutable args — redundantly and on purpose: optimising it out of
+     *         either changes every future address.
      */
     function deployWallet(string calldata label) external whenNotPaused returns (address wallet) {
         address implementation = _walletImplementation;
@@ -160,7 +162,7 @@ contract AGWFactory is
         // THE ONLY EXTERNAL CALL THIS CONTRACT EVER MAKES. Any revert bubbles, and the entire
         // deployment reverts atomically: no wallet, no record, no counter change survives. There is
         // no code path on which an un-initialised wallet exists on-chain, and no recovery path for
-        // a "deployed but unarmed" state is added (§11 item 9).
+        // a "deployed but unarmed" state is added, because no such state can occur.
         IPushAgentWalletInit(wallet).initializeAccount();
 
         emit WalletDeployed(owner, index, wallet, label);
@@ -191,7 +193,7 @@ contract AGWFactory is
 
         wallet = Clones.predictDeterministicAddressWithImmutableArgs(implementation, args, salt, address(this));
         // Valid because indices are strictly sequential. NOT `extcodesize`, which would misreport
-        // during construction and costs more (§11 item 6).
+        // during construction and costs more.
         deployed = index < next;
     }
 
@@ -256,8 +258,8 @@ contract AGWFactory is
      *      salt formula, (b) the immutable-args encoding, (c) `_walletImplementation`'s value, or
      *      (d) the storage layout — new variables are APPENDED after `_walletImplementation`, base
      *      contracts are never added, removed or reordered, and nothing may come to share that
-     *      slot. T-01 is the permanent guard; it runs across an upgrade in CI and is never deleted
-     *      or weakened.
+     *      slot. The address-stability test is the permanent guard; it runs across an upgrade in
+     *      CI and is never deleted or weakened.
      *
      *      Upgrades exist for factory-LOGIC bugs only. The derivation is frozen forever.
      *

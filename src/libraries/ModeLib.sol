@@ -4,7 +4,7 @@ pragma solidity 0.8.26;
 /**
  * @title ModeLib
  * @notice ERC-7579 execution mode encoding/decoding. Ported verbatim from
- *         erc7579/erc7579-implementation/src/lib/ModeLib.sol (PRD §9.1).
+ *         erc7579/erc7579-implementation/src/lib/ModeLib.sol.
  *
  * Layout:
  * | CALLTYPE | EXECTYPE |  UNUSED  | ModeSelector | ModePayload |

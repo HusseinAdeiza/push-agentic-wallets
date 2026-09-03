@@ -4,7 +4,8 @@ pragma solidity 0.8.26;
 /**
  * @title  IAGWFactory — the factory's complete external surface.
  * @notice Functions not declared here must not exist on `AGWFactory` (the inherited
- *         AccessControl / Pausable / UUPS surface excepted). T-09 asserts the exact selector set.
+ *         AccessControl / Pausable / UUPS surface excepted). The factory's test suite asserts the
+ *         exact selector set, so an accidental addition fails the build rather than shipping.
  */
 interface IAGWFactory {
     // ─────────────────────────────── types ───────────────────────────────
