@@ -7,8 +7,11 @@ import { SmartSession } from "smartsessions/SmartSession.sol";
 import { Session, ActionData, PolicyData, ERC7739Data, ERC7739Context } from "smartsessions/DataTypes.sol";
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
 
+import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
+
 import { PushSessionValidator } from "../src/validators/PushSessionValidator.sol";
 import { UCEP } from "../src/policies/UCEP.sol";
+import { PushAgentWallet } from "../src/PushAgentWallet.sol";
 import { UniversalOutboundTxRequest, Multicall, MULTICALL_SELECTOR } from "../src/libraries/PushWalletTypes.sol";
 
 /**
@@ -22,6 +25,16 @@ abstract contract BaseTest is Test {
     SmartSession internal engine;
     PushSessionValidator internal validator;
     UCEP internal ucep;
+
+    /// @dev The wallet IMPLEMENTATION. Clones delegatecall into it; it is never driven directly.
+    PushAgentWallet internal walletImpl;
+
+    /// @dev Stand-in for AGWFactory, which arrives in Phase 4. Clones are created here and
+    ///      `initializeAccount` is pranked from this address.
+    address internal FACTORY;
+
+    /// @dev Salt source for deterministic clones, so repeated newWallet() calls do not collide.
+    uint256 private _cloneSalt;
 
     // ─────────────────────────── named addresses ───────────────────────────
 
@@ -59,13 +72,112 @@ abstract contract BaseTest is Test {
         OWNER = makeAddr("owner");
         AGENT = makeAddr("agent");
 
+        FACTORY = makeAddr("factory");
+
         engine = new SmartSession();
         validator = new PushSessionValidator();
         ucep = new UCEP(GATEWAY, EXECUTOR_MODULE, address(engine));
+        walletImpl = new PushAgentWallet(address(engine), address(ucep), address(validator), GATEWAY);
 
         vm.label(address(engine), "SmartSession");
         vm.label(address(validator), "PushSessionValidator");
         vm.label(address(ucep), "UCEP");
+        vm.label(address(walletImpl), "PushAgentWallet(impl)");
+    }
+
+    // ─────────────────────────── wallet clone helper ───────────────────────────
+
+    /**
+     * @notice Deploy an initialised wallet clone owned by `walletOwner`.
+     * @dev    Mirrors what AGWFactory will do in Phase 4: a deterministic clone carrying 40 bytes
+     *         of immutable args — owner at 0-19, factory at 20-39 — followed by `initializeAccount`
+     *         called BY THE FACTORY. Until the real factory exists, FACTORY is a makeAddr
+     *         placeholder and the init call is pranked from it.
+     */
+    function newWallet(address walletOwner) internal returns (PushAgentWallet wallet) {
+        bytes memory args = abi.encodePacked(walletOwner, FACTORY);
+        bytes32 salt = bytes32(_cloneSalt++);
+
+        wallet = PushAgentWallet(payable(Clones.cloneDeterministicWithImmutableArgs(address(walletImpl), args, salt)));
+
+        vm.prank(FACTORY);
+        wallet.initializeAccount();
+    }
+
+    // ─────────────────── UCEP gates seen through the engine ───────────────────
+
+    /**
+     * @notice Expect a UCEP gate to fire, as it surfaces THROUGH the engine.
+     * @dev    SHARED HELPER — use this in every suite that drives UCEP through SmartSession, and in
+     *         Phase 5. Do not hand-encode this at call sites.
+     *
+     *         The engine truncates policy revert data to 32 bytes and rewraps it
+     *         (`PolicyLib.sol:139-152`, `_maxCopy: 32`), so a UCEP error does NOT arrive as itself:
+     *         it arrives as `PolicyCheckReverted(bytes32)` carrying the policy's first word — the
+     *         4-byte selector LEFT-ALIGNED, the remaining 28 bytes zero. Naming the gate this way
+     *         is what makes a negative test say WHICH gate fired instead of "something reverted".
+     *
+     *         WHAT "FIRST 32 BYTES" ACTUALLY MEANS, measured rather than assumed: for a NO-ARGUMENT
+     *         error the word is the 4-byte selector left-aligned and 28 zero bytes. For an error
+     *         WITH arguments it is the selector followed by the first 28 bytes of the first
+     *         argument — e.g. `PCValueExceedsCap(6 ether, 5 ether)` surfaces as
+     *         `9ca1b7e2…53444835`, those trailing bytes being the high half of 6 ether
+     *         (0x53444835ec580000). So the caller must pass the full ABI-encoded revert data, and
+     *         this helper truncates it exactly as the engine does.
+     */
+    function expectUcepGate(bytes memory ucepRevertData) internal {
+        bytes32 firstWord;
+        // Mirror `_maxCopy: 32`: take the first word of the policy's revert data verbatim.
+        assembly {
+            firstWord := mload(add(ucepRevertData, 0x20))
+        }
+        vm.expectRevert(abi.encodeWithSelector(bytes4(0xf4270752), firstWord));
+    }
+
+    /// @dev Convenience for the no-argument case, where the word is just the left-aligned selector.
+    function expectUcepGate(bytes4 gateSelector) internal {
+        vm.expectRevert(abi.encodeWithSelector(bytes4(0xf4270752), bytes32(gateSelector)));
+    }
+
+    // ─────────────────────── the exact-selector assertion ───────────────────────
+
+    /**
+     * @notice Assert a deployed contract's function selectors equal `expected` EXACTLY.
+     * @dev    SHARED HELPER — W-25 here, T-09 in Phase 4. Do not write a second one.
+     *
+     *         EXACT SET, not "contains no X". A negative assertion cannot fail against a MISNAMED
+     *         X — the same defect class that made a `vm.expectCall(..., 0)` on an undeclared
+     *         selector pass in Phase 2. An exact set also catches an accidentally-`public` internal
+     *         helper such as `_owner()`, which no denylist would ever name.
+     *
+     *         Selectors are read from the build artifact's `methodIdentifiers`, which is solc's own
+     *         view of the external ABI — not a hand-maintained list.
+     */
+    function assertSelectorSet(string memory contractName, bytes4[] memory expected) internal view {
+        string memory path = string.concat("out/", contractName, ".sol/", contractName, ".json");
+        string memory artifact = vm.readFile(path);
+
+        string[] memory signatures = vm.parseJsonKeys(artifact, ".methodIdentifiers");
+
+        bytes4[] memory actual = new bytes4[](signatures.length);
+        for (uint256 i; i < signatures.length; ++i) {
+            actual[i] = bytes4(keccak256(bytes(signatures[i])));
+        }
+
+        assertEq(actual.length, expected.length, "selector COUNT differs from the expected set");
+
+        // Every actual selector must appear in `expected`. With equal counts and no duplicates in
+        // the ABI, that is set equality.
+        for (uint256 i; i < actual.length; ++i) {
+            bool found;
+            for (uint256 j; j < expected.length; ++j) {
+                if (actual[i] == expected[j]) {
+                    found = true;
+                    break;
+                }
+            }
+            assertTrue(found, string.concat("unexpected selector in ABI: ", signatures[i]));
+        }
     }
 
     // ───────────────────────────── key helpers ─────────────────────────────
@@ -114,9 +226,68 @@ abstract contract BaseTest is Test {
         vm.expectCall(USV, expectedCalldata);
     }
 
+    /**
+     * @dev A USV observer that answers a fixed `false`.
+     *
+     *      PERMITTED ONLY IN TESTS NAMED FOR PROPAGATION, NEVER FOR VALIDITY. Pairing this with
+     *      `etchUSVObserver` lets V-05/V-06 prove that whatever the precompile answered is what the
+     *      validator returned — which is the only Ed25519 property observable without a live chain.
+     *      A test that used either observer to claim a signature is *correct* would be the oracle
+     *      mistake that let this repo's one shipped critical bug survive review.
+     *
+     *      Correctness and liveness of the Ed25519 branch are proven ONLY by P-03 against the real
+     *      precompile; P-04 proves it fails closed when USV has no code.
+     */
+    function etchUSVFalseObserver() internal {
+        vm.etch(USV, type(USVFalseObserver).runtimeCode);
+    }
+
     /// @dev Remove all code from USV, so fails-closed tests (P-04) exercise a codeless precompile.
     function stripUSV() internal {
         vm.etch(USV, "");
+    }
+
+    // ─────────────────────── the storage-layout assertion ───────────────────────
+
+    /**
+     * @notice Assert that `contractName` declares NO storage variables, from the build artifact.
+     * @dev    SHARED HELPER — used by the validator's `test_holdsNoStorage` (validator PRD §4) and
+     *         by the factory's T-01(a). Do not write a second one.
+     *
+     *         WHY AN ARTIFACT ASSERTION AND NOT `vm.load`. Solidity offers no runtime way to ask
+     *         "does this contract declare storage?". Reading chosen slots with `vm.load` and
+     *         asserting zero proves only that THOSE slots are zero — equally true of a contract
+     *         that declares variables and never writes them. That is a test that cannot fail, so
+     *         the assertion is made against solc's own `storageLayout` output instead.
+     *
+     *         MECHANISM, and it is fussier than it looks — three forms were probed before this one.
+     *         `vm.parseJson` ABI-encodes the JSON array it finds. An EMPTY array encodes to exactly
+     *         64 bytes: an offset word plus a zero length word. Any declared variable makes it
+     *         longer (UCEP's two produce 1,120). So the length of the raw encoding is itself the
+     *         discriminator, and no decode is needed.
+     *
+     *         The two forms that do NOT work, recorded so they are not retried:
+     *           · `abi.decode(..., (bytes[]))` — succeeds on the empty case but REVERTS on a
+     *             non-empty one, because each entry is an object, not a bytes value. It fails, but
+     *             with a bare EvmError instead of a legible assertion.
+     *           · `vm.parseJsonStringArray(..., ".storageLayout.storage[*].label")` — the wildcard
+     *             path errors on BOTH cases ("must return exactly one JSON value").
+     *
+     *         Requires `extra_output = ["storageLayout"]` and read access to `out/` — both are set
+     *         in foundry.toml, the latter specifically for this assertion.
+     */
+    function assertEmptyStorageLayout(string memory contractName) internal view {
+        string memory path = string.concat("out/", contractName, ".sol/", contractName, ".json");
+        string memory artifact = vm.readFile(path);
+
+        require(vm.keyExistsJson(artifact, ".storageLayout.storage"), "no storageLayout in artifact");
+
+        uint256 encodedLength = vm.parseJson(artifact, ".storageLayout.storage").length;
+        assertEq(
+            encodedLength,
+            64,
+            string.concat(contractName, " must declare no storage variables (empty layout encodes to 64 bytes)")
+        );
     }
 
     // ────────────────────────── canonical session ──────────────────────────
@@ -253,5 +424,14 @@ contract CallRecorder {
 contract USVObserver {
     fallback(bytes calldata) external returns (bytes memory) {
         return abi.encode(true);
+    }
+}
+
+/// @dev The `false` counterpart. See etchUSVFalseObserver: permitted only in tests named for
+///      PROPAGATION, never for validity. It supplies no correctness — it exists so that
+///      "the validator returns what the precompile said" is assertable in both directions.
+contract USVFalseObserver {
+    fallback(bytes calldata) external returns (bytes memory) {
+        return abi.encode(false);
     }
 }

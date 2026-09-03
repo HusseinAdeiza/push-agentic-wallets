@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
 import { IUSigVerifier } from "../interfaces/IUSigVerifier.sol";
+import { IPushSessionValidator } from "../interfaces/IPushSessionValidator.sol";
 
 /**
  * @title  PushSessionValidator
@@ -17,7 +18,7 @@ import { IUSigVerifier } from "../interfaces/IUSigVerifier.sol";
  *         MUST hold no storage — every parameter arrives as calldata. That is
  *         what makes one deployment serve every account.
  */
-contract PushSessionValidator is ISessionValidator {
+contract PushSessionValidator is ISessionValidator, IPushSessionValidator {
     /// @notice Push Chain USV precompile (fixed, chain-level).
     address public constant USV = 0xEC00000000000000000000000000000000000001;
 
@@ -82,6 +83,33 @@ contract PushSessionValidator is ISessionValidator {
         }
 
         revert UnsupportedScheme(scheme);
+    }
+
+    /**
+     * @notice Pure config sanity check for grant-time use by the SDK and grant screens.
+     * @dev    THE GAP THIS CLOSES: the engine's grant path checks only `isModuleType(7)`; it never
+     *         inspects the key config. An owner could grant a permission with a 19-byte key — the
+     *         grant succeeds, and every subsequent agent request reverts `MalformedConfig` forever:
+     *         a dead permission that looks alive.
+     *
+     *         THREE-VALUED, and the consistency law with `validateSignatureWithData` is therefore
+     *         three cases, not one biconditional:
+     *           1. `validateConfig == true`  ⟺ the runtime does NOT revert          (P-01)
+     *              — a non-reverting runtime call may still return false; that is a SIGNATURE
+     *                failure, outside this law entirely.
+     *           2. `validateConfig == false` ⇒ the runtime reverts with a NAMED error
+     *              (`UnsupportedScheme` or `MalformedConfig`)                        (P-02)
+     *           3. `validateConfig` REVERTS  ⇒ the runtime also reverts, at the same `abi.decode`
+     *              step, not necessarily with a named error                          (P-05)
+     *
+     *         Callers MUST treat a revert as "invalid config". The two functions must never drift.
+     * @param  data abi.encode(uint8 scheme, bytes key) — the frozen encoding (§10 item 5).
+     */
+    function validateConfig(bytes calldata data) external pure returns (bool) {
+        (uint8 scheme, bytes memory key) = abi.decode(data, (uint8, bytes));
+        if (scheme == SCHEME_ECDSA) return key.length == 20;
+        if (scheme == SCHEME_ED25519) return key.length == 32;
+        return false;
     }
 
     // ── IERC7579Module ────────────────────────────────────────────────

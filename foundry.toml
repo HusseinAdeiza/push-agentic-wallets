@@ -23,7 +23,15 @@ via_ir = true
 # Coverage scope: src/ excluding interfaces and libraries of pure types.
 no_match_coverage = "(src/interfaces/|test/|script/|lib/)"
 
-fs_permissions = [{ access = "read-write", path = "deployments/" }]
+# `out/` is READ-ONLY and is required, not a convenience: the statelessness invariant
+# (validator PRD §4, factory PRD T-01(a)) is asserted against the build artifact's
+# storageLayout, because Solidity offers no runtime way to prove "declares no storage" —
+# a vm.load slot read is equally satisfied by a contract that declares variables and never
+# writes them, i.e. a test that cannot fail.
+fs_permissions = [
+    { access = "read-write", path = "deployments/" },
+    { access = "read", path = "out/" },
+]
 
 [fmt]
 line_length = 120
