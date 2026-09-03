@@ -30,7 +30,8 @@ interface IERC7579Validator is IERC7579Module {
         returns (bytes4);
 }
 
-/// @notice ERC-7579 hook module (type 4). Declared per D-08; none installed in v1.
+/// @notice ERC-7579 hook module (type 4). Declared for interface completeness; the wallet refuses
+///         this module type, so none is ever installed.
 interface IERC7579Hook is IERC7579Module {
     /// @notice Called before execution. Return value is passed to postCheck.
     function preCheck(address msgSender, uint256 msgValue, bytes calldata msgData)
