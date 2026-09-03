@@ -223,6 +223,81 @@ contract PushAgentWalletTest is BaseTest {
 
     // ═══════════════════════════ execution-mode gates ═══════════════════════════
 
+    /**
+     * ExecutionLib.decodeBatch's THREE MALFORMED-CALLDATA GUARDS, each through the owner door.
+     *
+     * WHY THESE EXIST AT ALL — this is the D-4 divergence from the reference implementation, and it
+     * was added because upstream's version is a bug: given SINGLE-encoded calldata in BATCH mode it
+     * reads a length of zero and returns an EMPTY batch, so `execute` SUCCEEDS having performed no
+     * call — a silent no-op that still consumes a nonce and emits an event. The guards turn that
+     * into a revert.
+     *
+     * WHY THE OWNER DOOR — the agent door refuses batch mode at step 9 before decoding, so these
+     * lines are unreachable from there. `execute` is the only path that decodes a batch.
+     *
+     * A guard whose absence WAS a bug, with no test, is a guard a future refactor deletes silently.
+     * Each case names `MalformedBatchCalldata` rather than accepting any revert.
+     */
+    function test_DecodeBatch_MalformedCalldata_AllThreeGuards() public {
+        bytes32 batchMode = _batchMode();
+
+        // (1) ExecutionLib.sol:51 — shorter than the single offset word.
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        wallet.execute(batchMode, new bytes(31));
+
+        // (2) ExecutionLib.sol:60 — the offset word points past the end of the blob.
+        bytes memory offsetPastEnd = abi.encodePacked(uint256(1_000_000), uint256(0));
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        wallet.execute(batchMode, offsetPastEnd);
+
+        // (2b) the same guard's SECOND arm: the offset lands inside the blob, but leaves fewer than
+        //      32 bytes after it — so there is no room for the length word that must follow.
+        //      The blob is 96 bytes, so the offset must exceed 64 for fewer than 32 to remain.
+        //      Measured: offset 64 leaves EXACTLY 32 and legitimately decodes to an empty batch,
+        //      and offset 48 leaves 48 — both are VALID. 80 is the first that is not.
+        bytes memory noRoomForLength = abi.encodePacked(uint256(80), uint256(0), uint256(0));
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        wallet.execute(batchMode, noRoomForLength);
+
+        // (3) ExecutionLib.sol:70 — a length larger than the remaining bytes could hold.
+        //     offset 32, length 1000, but only one word follows: 1000 head slots cannot fit.
+        bytes memory impossibleLength = abi.encodePacked(uint256(32), uint256(1000), uint256(0));
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        wallet.execute(batchMode, impossibleLength);
+    }
+
+    /**
+     * THE EXACT INPUT THE DIVERGENCE WAS WRITTEN FOR: SINGLE-encoded calldata submitted in BATCH
+     * mode. Upstream decodes it as an empty batch and `execute` SUCCEEDS having called nothing.
+     *
+     * It must REVERT, and the recorder proves the silent-no-op reading is not what happens: the
+     * target is never called, and the transaction does not succeed.
+     */
+    function test_DecodeBatch_SingleEncodedInBatchMode_RevertsNotSilentNoop() public {
+        address sink = makeAddr("batchModeSink");
+        etchCallRecorder(sink);
+        vm.store(sink, bytes32(uint256(0)), bytes32(0));
+
+        // Perfectly valid SINGLE calldata — target, value, empty payload.
+        bytes memory singleEncoded = _singleCalldata(sink, 1 ether, "");
+
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        wallet.execute(_batchMode(), singleEncoded);
+
+        assertEq(callsRecorded(sink), 0, "nothing was called");
+        assertEq(sink.balance, 0, "and no value moved - it reverted rather than silently no-opping");
+
+        // CONTROL: the same bytes in SINGLE mode do exactly what they say.
+        vm.prank(WALLET_OWNER);
+        wallet.execute(_singleMode(), singleEncoded);
+        assertEq(sink.balance, 1 ether, "the same calldata is valid in SINGLE mode");
+    }
+
     function test_OwnerDoor_RejectsNonDefaultExecAndExoticCallTypes() public {
         bytes memory ecd = _singleCalldata(AGENT, 0, "");
 

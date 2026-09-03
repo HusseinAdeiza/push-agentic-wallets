@@ -532,6 +532,24 @@ contract PushSessionValidatorTest is BaseTest {
             vm.skip(true, "P-03 requires PUSH_TESTNET_RPC - not set");
         }
 
+        // ⚠️ KNOWN LIMITATION, MEASURED 2026-09-03 — REPORTED, AWAITING A RULING.
+        //
+        // `vm.createSelectFork` runs the call in forge's LOCAL EVM against forked STATE. Push's
+        // Ed25519 precompile is chain-level code that forge does not implement, so on a fork the
+        // staticcall SUCCEEDS AND RETURNS 0 BYTES, the validator's `ret.length < 32` guard fails
+        // closed, and this test reports `false` for a vector that is genuinely valid.
+        //
+        // THE WIRING IS CORRECT AND IS NOW PROVEN AGAINST THE LIVE NODE. Run directly with `cast`
+        // against https://evm.donut.rpc.push.org/ , the configured address and method return true:
+        //   cast call 0xEC00000000000000000000000000000000000001 0x1dc0f01d<vector> --rpc-url ...
+        //   -> 0x0000...0001
+        // That also closes the Gate 2 escalation: `0xEC00…0001` +
+        // `verifyEd25519RawMessage(bytes,bytes,bytes)` is the right pair, and the address is
+        // codeless (`cast code` -> 0x) exactly as the raw-staticcall design assumes.
+        //
+        // So this test cannot be satisfied through a fork by construction. Closing it needs either
+        // an on-chain assertion (a deployed prober contract) or an FFI-based `cast call` check —
+        // both are design decisions, not builder choices.
         vm.createSelectFork(rpc);
 
         // DEPLOY AFTER THE FORK. `validator` comes from setUp(), and createSelectFork switches to a

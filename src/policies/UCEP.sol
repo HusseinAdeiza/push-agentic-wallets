@@ -432,6 +432,12 @@ contract UCEP is IUCEP {
     }
 
     /// @dev Memory slice helper.
+    ///
+    ///      THE BOUNDS BRANCH IS UNREACHABLE FROM THE THREE CALL SITES AND IS EXPECTED TO SHOW AS
+    ///      UNCOVERED: gate 12 checks `payload.length < 4` before both payload slices, and gate 14
+    ///      checks `entry.data.length < 4` before the inner one, so `start + len > data.length`
+    ///      never holds. The guard stays because this is a `pure` helper whose safety must not
+    ///      depend on every future caller remembering to check first.
     function _slice(bytes memory data, uint256 start, uint256 len) internal pure returns (bytes memory out) {
         if (start + len > data.length) revert MalformedInnerCalldata();
         out = new bytes(len);
