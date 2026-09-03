@@ -8,10 +8,12 @@ import { Session, ActionData, PolicyData, ERC7739Data, ERC7739Context } from "sm
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
 
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
+import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 
 import { PushSessionValidator } from "../src/validators/PushSessionValidator.sol";
 import { UCEP } from "../src/policies/UCEP.sol";
 import { PushAgentWallet } from "../src/PushAgentWallet.sol";
+import { AGWFactory } from "../src/AGWFactory.sol";
 import { UniversalOutboundTxRequest, Multicall, MULTICALL_SELECTOR } from "../src/libraries/PushWalletTypes.sol";
 
 /**
@@ -29,12 +31,16 @@ abstract contract BaseTest is Test {
     /// @dev The wallet IMPLEMENTATION. Clones delegatecall into it; it is never driven directly.
     PushAgentWallet internal walletImpl;
 
-    /// @dev Stand-in for AGWFactory, which arrives in Phase 4. Clones are created here and
-    ///      `initializeAccount` is pranked from this address.
+    /// @dev THE REAL FACTORY — an ERC-1967 proxy in front of `factoryLogic`. Every wallet in every
+    ///      suite is now deployed through it, so the wallet's `_factory()` immutable arg is the
+    ///      proxy address, exactly as in production. (Phase 3 used a makeAddr placeholder.)
+    AGWFactory internal factory;
+    AGWFactory internal factoryLogic;
+
+    /// @dev The proxy address, for tests that want it as a plain address.
     address internal FACTORY;
 
-    /// @dev Salt source for deterministic clones, so repeated newWallet() calls do not collide.
-    uint256 private _cloneSalt;
+    address internal FACTORY_ADMIN;
 
     // ─────────────────────────── named addresses ───────────────────────────
 
@@ -72,36 +78,45 @@ abstract contract BaseTest is Test {
         OWNER = makeAddr("owner");
         AGENT = makeAddr("agent");
 
-        FACTORY = makeAddr("factory");
+        FACTORY_ADMIN = makeAddr("factoryAdmin");
 
         engine = new SmartSession();
         validator = new PushSessionValidator();
         ucep = new UCEP(GATEWAY, EXECUTOR_MODULE, address(engine));
         walletImpl = new PushAgentWallet(address(engine), address(ucep), address(validator), GATEWAY);
 
+        // ERC-1967 proxy -> factory logic, initialised in the SAME transaction, so no
+        // initialisation front-run window exists (factory PRD §8 step 3).
+        factoryLogic = new AGWFactory();
+        factory = AGWFactory(
+            address(
+                new ERC1967Proxy(
+                    address(factoryLogic), abi.encodeCall(AGWFactory.initialize, (FACTORY_ADMIN, address(walletImpl)))
+                )
+            )
+        );
+        FACTORY = address(factory);
+
         vm.label(address(engine), "SmartSession");
         vm.label(address(validator), "PushSessionValidator");
         vm.label(address(ucep), "UCEP");
         vm.label(address(walletImpl), "PushAgentWallet(impl)");
+        vm.label(address(factory), "AGWFactory(proxy)");
+        vm.label(address(factoryLogic), "AGWFactory(logic)");
     }
 
     // ─────────────────────────── wallet clone helper ───────────────────────────
 
     /**
      * @notice Deploy an initialised wallet clone owned by `walletOwner`.
-     * @dev    Mirrors what AGWFactory will do in Phase 4: a deterministic clone carrying 40 bytes
-     *         of immutable args — owner at 0-19, factory at 20-39 — followed by `initializeAccount`
-     *         called BY THE FACTORY. Until the real factory exists, FACTORY is a makeAddr
-     *         placeholder and the init call is pranked from it.
+     * @dev    THE REAL PATH, as of Phase 4: `deployWallet` called BY THE OWNER. The factory assigns
+     *         the index, derives the salt, writes the 40-byte immutable args (owner 0-19, factory
+     *         20-39) and calls `initializeAccount` itself. Nothing here simulates the factory any
+     *         more, so every earlier suite now exercises the production deployment path.
      */
     function newWallet(address walletOwner) internal returns (PushAgentWallet wallet) {
-        bytes memory args = abi.encodePacked(walletOwner, FACTORY);
-        bytes32 salt = bytes32(_cloneSalt++);
-
-        wallet = PushAgentWallet(payable(Clones.cloneDeterministicWithImmutableArgs(address(walletImpl), args, salt)));
-
-        vm.prank(FACTORY);
-        wallet.initializeAccount();
+        vm.prank(walletOwner);
+        return PushAgentWallet(payable(factory.deployWallet("")));
     }
 
     // ─────────────────── UCEP gates seen through the engine ───────────────────
