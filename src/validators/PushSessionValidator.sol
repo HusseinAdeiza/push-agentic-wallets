@@ -12,31 +12,48 @@ import { IPushSessionValidator } from "../interfaces/IPushSessionValidator.sol";
  *         exactly one question for SmartSession: did the session key sign this hash?
  *         Supports secp256k1 (ECDSA) and Ed25519 via the signature-verification precompile.
  *
- * @dev    This is the contract that makes a Solana-keyed agent a first-class
- *         operator on an EVM account.
- *
- *         MUST hold no storage — every parameter arrives as calldata. That is
- *         what makes one deployment serve every account.
+ * @dev    - Makes a Solana-keyed agent a first-class operator on an EVM account.
+ *         - Holds no storage, so one deployment serves every account.
+ *         - Every parameter arrives as calldata.
  */
 contract PushSessionValidator is ISessionValidator, IPushSessionValidator {
-    /// @notice Push Chain USV precompile (fixed, chain-level).
+    /// @notice Push Chain signature-verification precompile (fixed, chain-level).
     address public constant USV = 0xEC00000000000000000000000000000000000001;
 
+    /// @notice Scheme byte selecting secp256k1 signatures.
     uint8 public constant SCHEME_ECDSA = 0;
+
+    /// @notice Scheme byte selecting Ed25519 signatures.
     uint8 public constant SCHEME_ED25519 = 1;
 
+    /// @dev ERC-7579 stateless-validator module type.
     uint256 internal constant MODULE_TYPE_STATELESS_VALIDATOR = 7;
 
+    /// @dev Thrown when the scheme byte is neither of the two supported values.
     error UnsupportedScheme(uint8 scheme);
+
+    /// @dev Thrown when the key length does not match the scheme it is paired with.
     error MalformedConfig();
 
     /**
      * @notice Validate a session signature.
+     *
+     * @dev    - ECDSA: reverts `MalformedConfig` on a key that is not 20 bytes; returns false on a
+     *           signature that is not 65 bytes or that fails to recover.
+     *         - Ed25519: reverts `MalformedConfig` on a key that is not 32 bytes; returns false on a
+     *           signature that is not 64 bytes or on a failed precompile call.
+     *         - Reverts `UnsupportedScheme` on anything else.
+     *         - Recovery uses `tryRecover` rather than `recover`, so a malformed signature returns
+     *           false instead of reverting: a revert inside validation is indistinguishable from a
+     *           policy failure and degrades error reporting. The Ed25519 branch fails closed for the
+     *           same reason.
+     *
      * @param hash The opHash produced by PushAgentWallet._computeOpHash
      * @param sig  ECDSA: 65 bytes (r,s,v).  Ed25519: 64 bytes.
      * @param data abi.encode(uint8 scheme, bytes key)
      *             scheme 0 → key is abi.encodePacked(address signer)   — 20 bytes
      *             scheme 1 → key is the raw Ed25519 public key         — 32 bytes
+     * @return validSig Whether the signature is valid for the configured key.
      */
     function validateSignatureWithData(bytes32 hash, bytes calldata sig, bytes calldata data)
         external
@@ -49,12 +66,8 @@ contract PushSessionValidator is ISessionValidator, IPushSessionValidator {
         if (scheme == SCHEME_ECDSA) {
             if (key.length != 20) revert MalformedConfig();
             if (sig.length != 65) return false;
-            // tryRecover (not recover) so a malformed signature returns false rather
-            // than reverting — a revert inside validation is indistinguishable from a
-            // policy failure and degrades error reporting.
             (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, sig);
             if (err != ECDSA.RecoverError.NoError) return false;
-            // key.length is checked to be exactly 20 above, so this is exact, not truncating.
             // forge-lint: disable-next-line(unsafe-typecast)
             return recovered == address(bytes20(key));
         }
@@ -62,22 +75,16 @@ contract PushSessionValidator is ISessionValidator, IPushSessionValidator {
         if (scheme == SCHEME_ED25519) {
             if (key.length != 32) revert MalformedConfig();
             if (sig.length != 64) return false;
-            // D-18: raw-message variant. message = the 32 bytes of `hash`.
-            // MUST NOT use verifyEd25519 — that verifies over the ASCII of a hex
-            // string, which a headless agent signing with a standard library will
-            // not produce.
+            // Raw-message variant: the message is the 32 bytes of hash. Not verifyEd25519, which
+            // verifies over the ASCII of a hex string that a standard signing library will not
+            // produce.
             //
-            // SECURITY: this MUST be a raw staticcall, not a high-level call through
-            // IUSigVerifier. Solidity inserts an `extcodesize(target) > 0` check before
-            // any high-level call that ABI-decodes return data, and reverts when the
-            // target has no code. Precompiles have no code, so the interface call
-            // reverts on-chain. The audited UEA_SVM uses a raw staticcall for exactly
-            // this reason. IUSigVerifier is retained for documentation only.
+            // Must be a raw staticcall. Solidity inserts an extcodesize check before any high-level
+            // call that ABI-decodes return data, and precompiles have no code, so an interface call
+            // would revert on-chain. IUSigVerifier is documentation only.
             (bool ok, bytes memory ret) = USV.staticcall(
                 abi.encodeWithSignature("verifyEd25519RawMessage(bytes,bytes,bytes)", key, abi.encodePacked(hash), sig)
             );
-            // Fail closed. Consistent with the ECDSA branch: a revert inside validation
-            // is indistinguishable from a policy failure and degrades error reporting.
             if (!ok || ret.length < 32) return false;
             return abi.decode(ret, (bool));
         }
@@ -86,27 +93,21 @@ contract PushSessionValidator is ISessionValidator, IPushSessionValidator {
     }
 
     /**
-     * @notice Pure config sanity check for grant-time use by the SDK and grant screens.
-     * @dev    THE GAP THIS CLOSES: the engine's grant path checks only `isModuleType(7)`; it never
-     *         inspects the key config. An owner could grant a permission with a 19-byte key — the
-     *         grant succeeds, and every subsequent agent request reverts `MalformedConfig` forever:
-     *         a dead permission that looks alive.
+     * @notice Pure config sanity check, for grant screens and the SDK.
      *
-     *         THREE-VALUED, and the consistency law with `validateSignatureWithData` is therefore
-     *         three cases, not one biconditional:
-     *           1. `validateConfig == true`  ⟺ the runtime does NOT revert
-     *              — a non-reverting runtime call may still return false; that is a SIGNATURE
-     *                failure, outside this law entirely.
-     *           2. `validateConfig == false` ⇒ the runtime reverts with a NAMED error
-     *              (`UnsupportedScheme` or `MalformedConfig`)
-     *           3. `validateConfig` REVERTS  ⇒ the runtime also reverts, at the same `abi.decode`
-     *              step, not necessarily with a named error
+     * @dev    - Closes a gap in the engine's grant path, which checks only the module type and never
+     *           inspects the key config. Without this, an owner can grant a permission with a
+     *           19-byte key: the grant succeeds and every later agent request reverts forever.
+     *         - Returns true only for scheme 0 with a 20-byte key, or scheme 1 with a 32-byte key.
+     *         - Three-valued, and must stay consistent with `validateSignatureWithData`: true means
+     *           the runtime call will not revert, though it may still return false, which is a
+     *           signature failure and a different thing; false means the runtime call reverts with a
+     *           named error; a revert here means the runtime call also reverts, at the same decode
+     *           step, not necessarily with a named error.
+     *         - Callers must treat a revert as an invalid config.
      *
-     *         Each of the three cases has its own test; the suite is what holds the two functions
-     *         together, since nothing in the type system can.
-     *
-     *         Callers MUST treat a revert as "invalid config". The two functions must never drift.
      * @param  data abi.encode(uint8 scheme, bytes key) — the frozen encoding.
+     * @return Whether the config is a supported scheme and key-length pair.
      */
     function validateConfig(bytes calldata data) external pure returns (bool) {
         (uint8 scheme, bytes memory key) = abi.decode(data, (uint8, bytes));
@@ -115,17 +116,29 @@ contract PushSessionValidator is ISessionValidator, IPushSessionValidator {
         return false;
     }
 
-    // ── IERC7579Module ────────────────────────────────────────────────
+    // --- IERC7579Module ---
 
-    function onInstall(bytes calldata) external pure { } // stateless
+    /// @dev No-op: the validator holds no per-account state.
+    function onInstall(bytes calldata) external pure { }
 
-    function onUninstall(bytes calldata) external pure { } // stateless
+    /// @dev No-op: the validator holds no per-account state.
+    function onUninstall(bytes calldata) external pure { }
 
+    /**
+     * @notice Whether this module implements an ERC-7579 module type.
+     * @param  moduleTypeId  Module type to query.
+     * @return True only for the stateless-validator type.
+     */
     function isModuleType(uint256 moduleTypeId) external pure returns (bool) {
         return moduleTypeId == MODULE_TYPE_STATELESS_VALIDATOR;
     }
 
+    /**
+     * @notice Whether this module is initialised for an account.
+     * @dev    Always true: the validator is stateless, so there is nothing to initialise.
+     * @return Always true.
+     */
     function isInitialized(address) external pure returns (bool) {
-        return true; // stateless — always "initialized"
+        return true;
     }
 }
