@@ -1,0 +1,73 @@
+{
+  "network": "push-donut-testnet",
+  "chainId": 42101,
+  "explorer": "https://donut.push.network",
+  "deployedAt": "2026-09-04T00:00:00Z",
+  "deployedAtBlock": 22631775,
+  "commit": "c6845057b45d41be5dd531cc96e8b4d224ece866",
+  "engineForkCommit": "7dc20e4",
+  "deployer": "0xa89523351BE1e2De64937AA9AF61Ae06eAd199C7",
+  "toolchain": {
+    "solc": "0.8.26",
+    "optimizerRuns": 833,
+    "evmVersion": "cancun",
+    "viaIR": true,
+    "forge": "1.5.1-stable"
+  },
+  "contracts": {
+    "factoryProxy": {
+      "address": "0xF1A131571f89fD06890576e6cD0154114ACBBc8b",
+      "contract": "ERC1967Proxy -> AGWFactory",
+      "txHash": "0x36da03367d53cf648e2646f864426017f79d459a4c5c81c5b327d2c803dbea43",
+      "verified": true,
+      "note": "PERMANENT, user-facing. This is the address the SDK and every integration uses. It does not change across factory-logic upgrades."
+    },
+    "factoryLogic": {
+      "address": "0x4b1dC2bcF9de73d60e7c38E864730866439A368F",
+      "contract": "AGWFactory",
+      "txHash": "0x969681a9c5ce00c36764d47db39ff18877b037955a571e6437aca39a156d9ab2",
+      "runtimeSize": 8300,
+      "verified": true,
+      "note": "UUPS implementation behind factoryProxy. Never addressed directly."
+    },
+    "walletImplementation": {
+      "address": "0x959ED7f6943bdd56B3a359BAE0115fef4aa07e17",
+      "contract": "PushAgentWallet",
+      "txHash": "0x6c9237d0da0ae0d73c01a06bf8426d4905652232d42f8e840ebc90ace5d60541",
+      "runtimeSize": 10515,
+      "accountId": "push.agentwallet.1.0.0",
+      "verified": true,
+      "note": "Clone template. Every wallet is a minimal clone of this with 40 bytes of immutable args (owner 0-19, factory 20-39)."
+    },
+    "ucep": {
+      "address": "0x79F07D379BdC26468E48025a61bC955909522c1D",
+      "contract": "UCEP",
+      "txHash": "0x27948df316e91f8c78eb1a79d7d632c0de7a74f59cb81b44cf799fd1c0ffce00",
+      "runtimeSize": 6833,
+      "verified": true,
+      "note": "The security boundary. Sole action policy on every mandate; stripping it fails closed."
+    },
+    "sessionValidator": {
+      "address": "0x5A59a5Ac94d5190553821307F98e4673BF3c4a1D",
+      "contract": "PushSessionValidator",
+      "txHash": "0xbc9bc542b077c343240bad63e664ccb98f37714e5cf3ff93f69f2ccb508979fb",
+      "runtimeSize": 1720,
+      "verified": true,
+      "note": "Stateless. Its address is an input to every permission id, so this deployment is pinned for the life of the environment - replacing it invalidates every existing mandate."
+    },
+    "sessionEngine": {
+      "address": "0x7540f9a59693d51CFB4A3727141eAE4836F96749",
+      "contract": "SmartSession",
+      "txHash": "0x6ddc23146f000905f64dd2e37bb39a89f088380a207664283fbb7b1209ac13b4",
+      "runtimeSize": 22581,
+      "verified": true,
+      "note": "Vendored fork 7dc20e4, adopted unmodified. Installed as each wallet's only validator module."
+    }
+  },
+  "adminState": {
+    "factoryDefaultAdmin": "0xa89523351BE1e2De64937AA9AF61Ae06eAd199C7",
+    "defaultAdminDelaySeconds": 172800,
+    "paused": false,
+    "note": "Admin is the deployer EOA for testnet. The admin's one real power is authorising a UUPS upgrade of the factory logic, which is the only action that can strand counterfactually funded addresses. A production deployment should hold this in a multisig."
+  }
+}

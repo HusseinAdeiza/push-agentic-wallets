@@ -1,0 +1,44 @@
+{
+  "network": "push-donut-testnet",
+  "chainId": 42101,
+  "explorer": "https://donut.push.network",
+  "note": "Dependencies this repo does NOT deploy. Each carries a verification status measured against the live chain, so an unconfirmed address is never silently trusted. Verified as of 2026-09-04, block 22631775.",
+  "dependencies": {
+    "universalGateway": {
+      "address": "0x00000000000000000000000000000000000000C1",
+      "implementation": "0x1e412939780f2b834dc42c7ac58d9f99888da659",
+      "consumedBy": ["UCEP", "PushAgentWallet"],
+      "verified": true,
+      "evidence": [
+        "cast code -> 1551 bytes; ERC-1967 proxy",
+        "implementation bytecode contains selector 0x77b86bec = sendUniversalTxOutbound((bytes,address,uint256,uint256,uint256,uint256,bytes,address))",
+        "explorer reports implementation verified as UniversalGatewayPC, solc v0.8.26+commit.8a97fa7a"
+      ],
+      "note": "The only Push-side target an agent action may reach. Our PushWalletTypes struct mirror was checked field-for-field against this selector."
+    },
+    "universalExecutorModule": {
+      "address": "0x14191Ea54B4c176fCf86f51b0FAc7CB1E71Df7d7",
+      "consumedBy": ["UCEP"],
+      "verified": false,
+      "evidence": [
+        "cast code -> 0x (no code); balance 0; nonce 0 as of block 22631775",
+        "address confirmed correct by the owner, 2026-09-04",
+        "matches push-chain-core-contracts/test/helpers/PushChainAddresses.sol"
+      ],
+      "impact": "Baked into UCEP as an immutable, and UCEP is not upgradeable, so correcting it would require redeploying UCEP and regranting every mandate. It gates creditRevert only, which Push core does not yet call, so an absent contract costs nothing operationally today.",
+      "note": "This is the single reason S-05's live run reports one failing assertion. Re-check once Push core deploys the module."
+    },
+    "ed25519Precompile": {
+      "address": "0xEC00000000000000000000000000000000000001",
+      "method": "verifyEd25519RawMessage(bytes,bytes,bytes)",
+      "consumedBy": ["PushSessionValidator"],
+      "verified": true,
+      "evidence": [
+        "cast code -> 0x, codeless exactly as the raw-staticcall design assumes",
+        "known-good vector returns 0x..01 (true)",
+        "same vector with its first byte flipped returns 0x..00 (false), so the precompile genuinely discriminates"
+      ],
+      "note": "Called through a raw staticcall, never a typed interface: solc inserts an extcodesize check before any high-level call that ABI-decodes returndata, and a precompile has no code, so a typed call would revert on-chain. The forge fork test (P-03) cannot exercise this - forge's local EVM does not implement the precompile and returns 0 bytes - so the live cast probe above is the liveness proof."
+    }
+  }
+}
