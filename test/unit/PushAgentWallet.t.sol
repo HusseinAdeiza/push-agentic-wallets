@@ -1,20 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import { Test } from "forge-std/Test.sol";
-import { IERC721Receiver } from "@openzeppelin/contracts/token/ERC721/IERC721Receiver.sol";
-import { IERC1155Receiver } from "@openzeppelin/contracts/token/ERC1155/IERC1155Receiver.sol";
-import { IERC165 } from "@openzeppelin/contracts/utils/introspection/IERC165.sol";
-
+import { BaseTest } from "../Base.t.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
-import { AgentWalletFactory } from "../../src/AgentWalletFactory.sol";
+import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
 import {
     ModeLib,
     ModeCode,
-    CallType,
-    ExecType,
-    ModeSelector,
     ModePayload,
     CALLTYPE_SINGLE,
     CALLTYPE_BATCH,
@@ -25,559 +18,990 @@ import {
     MODE_DEFAULT
 } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib, Execution } from "../../src/libraries/ExecutionLib.sol";
-import {
-    MockValidator,
-    StubbornValidator,
-    ReenteringValidator,
-    MockTarget,
-    MockHook,
-    RejectsPC
-} from "../mocks/Mocks.sol";
+import { IUCEP } from "../../src/interfaces/IUCEP.sol";
+import { IERC7579Account } from "erc7579/interfaces/IERC7579Account.sol";
+import { Session, PermissionId } from "smartsessions/DataTypes.sol";
+import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 
-/// @notice PRD §11.1 — unit tests U-01 … U-23.
-contract PushAgentWalletTest is Test {
-    PushAgentWallet internal impl;
-    AgentWalletFactory internal factory;
+/**
+ * @notice PushAgentWallet — Phase 3a: skeleton, owner door, initialisation, views.
+ *
+ * @dev    grantMandate / stopMandate / stopAll / executeWithSession are placeholders in this
+ *         sub-phase; their tests arrive in 3b and 3c. Where a test here needs mandate STATE it
+ *         builds it directly through the engine (`vm.prank(wallet) -> engine.enableSessions`),
+ *         which is exactly what grantMandate will do minus the salt and shape check.
+ */
+contract PushAgentWalletTest is BaseTest {
     PushAgentWallet internal wallet;
+    address internal WALLET_OWNER;
 
-    address internal ownerUEA = address(0xB0B);
-    address internal stranger = address(0xBAD);
-    bytes32 internal mandateId = keccak256("mandate-1");
-
-    MockValidator internal validator;
-    MockTarget internal target;
-
-    event ModuleInstalled(uint256 moduleTypeId, address module);
-    event ModuleUninstalled(uint256 moduleTypeId, address module);
-    event WalletInitialized(address indexed owner);
-    event PCSwept(address indexed to, uint256 amount);
-    event EmergencyRevokeAll(address indexed caller);
-
-    function setUp() public {
-        impl = new PushAgentWallet();
-        factory = new AgentWalletFactory(address(impl));
-        vm.prank(ownerUEA);
-        wallet = PushAgentWallet(payable(factory.deployAgentWallet(mandateId)));
-
-        validator = new MockValidator();
-        target = new MockTarget();
+    function setUp() public override {
+        super.setUp();
+        WALLET_OWNER = makeAddr("walletOwner");
+        wallet = newWallet(WALLET_OWNER);
+        vm.deal(address(wallet), 100 ether);
     }
 
-    // ── U-01 / U-02 — initialization ──────────────────────────────────
+    // ─────────────────────────────── helpers ───────────────────────────────
 
-    function test_U01_initializeSetsOwner_secondCallReverts() public {
-        assertEq(wallet.owner(), ownerUEA);
-        vm.expectRevert(PushWalletErrors.AlreadyInitialized.selector);
-        wallet.initialize(address(0xdead));
+    function _singleMode() internal pure returns (bytes32) {
+        return ModeCode.unwrap(ModeLib.encodeSimpleSingle());
     }
 
-    function test_U02_initializeZeroAddressReverts() public {
-        PushAgentWallet fresh = new PushAgentWallet();
-        vm.expectRevert(PushWalletErrors.ZeroAddress.selector);
-        fresh.initialize(address(0));
+    function _batchMode() internal pure returns (bytes32) {
+        return ModeCode.unwrap(ModeLib.encodeSimpleBatch());
     }
 
-    function test_U01b_initializeEmitsEvent() public {
-        PushAgentWallet fresh = new PushAgentWallet();
-        vm.expectEmit(true, false, false, true);
-        emit WalletInitialized(ownerUEA);
-        fresh.initialize(ownerUEA);
-        assertEq(fresh.owner(), ownerUEA);
+    /// @dev Build an arbitrary (callType, execType) mode. Packed by hand rather than through
+    ///      ModeLib.encode so the test can express types ModeLib has no constant for — which is
+    ///      what the rejection cases need.
+    ///      Layout: | CALLTYPE 1B | EXECTYPE 1B | UNUSED 4B | ModeSelector 4B | ModePayload 22B |
+    function _mode(bytes1 callType, bytes1 execType) internal pure returns (bytes32) {
+        return bytes32(abi.encodePacked(callType, execType, bytes4(0), bytes4(0), bytes22(0)));
     }
 
-    // ── U-03 / U-04 / U-05 — account config ───────────────────────────
-
-    function test_U03_accountId() public view {
-        assertEq(wallet.accountId(), "push.agentwallet.1.0.0");
+    function _singleCalldata(address target, uint256 value, bytes memory data) internal pure returns (bytes memory) {
+        return ExecutionLib.encodeSingle(target, value, data);
     }
 
-    function test_U04_supportsModule() public view {
-        assertTrue(wallet.supportsModule(1), "validator");
-        assertTrue(wallet.supportsModule(4), "hook");
-        assertFalse(wallet.supportsModule(2), "executor must be unsupported");
-        assertFalse(wallet.supportsModule(3), "fallback must be unsupported");
-        assertFalse(wallet.supportsModule(7));
-        assertFalse(wallet.supportsModule(0));
-        assertFalse(wallet.supportsModule(type(uint256).max));
+    /// @dev A gateway-shaped call — the owner composing an outbound request freely (no UCEP pin).
+    function _gatewayShapedCalldata() internal view returns (bytes memory) {
+        return _singleCalldata(GATEWAY, 0, abi.encodeWithSelector(SEND_OUTBOUND_SELECTOR, ""));
     }
 
-    function test_U05_supportsExecutionMode() public view {
-        assertTrue(wallet.supportsExecutionMode(ModeLib.encodeSimpleSingle()));
-        assertTrue(wallet.supportsExecutionMode(ModeLib.encodeSimpleBatch()));
+    /// @dev Grant a mandate THROUGH THE WALLET — the real path. (In 3a this went directly to the
+    ///      engine because grantMandate was a placeholder; 3b switched it, per the instruction.)
+    function _grant(PushAgentWallet w, address agentKey) internal returns (bytes32 pid) {
+        vm.prank(WALLET_OWNER);
+        return w.grantMandate(canonicalSession(ecdsaConfig(agentKey), _ucepInitData()));
+    }
 
-        assertFalse(
-            wallet.supportsExecutionMode(
-                ModeLib.encode(CALLTYPE_DELEGATECALL, EXECTYPE_DEFAULT, MODE_DEFAULT, ModePayload.wrap(0))
-            )
-        );
-        assertFalse(
-            wallet.supportsExecutionMode(
-                ModeLib.encode(CALLTYPE_STATIC, EXECTYPE_DEFAULT, MODE_DEFAULT, ModePayload.wrap(0))
-            )
-        );
-        assertFalse(
-            wallet.supportsExecutionMode(
-                ModeLib.encode(CALLTYPE_SINGLE, EXECTYPE_TRY, MODE_DEFAULT, ModePayload.wrap(0))
-            )
-        );
-        assertFalse(
-            wallet.supportsExecutionMode(
-                ModeLib.encode(CALLTYPE_BATCH, EXECTYPE_TRY, MODE_DEFAULT, ModePayload.wrap(0))
-            )
+    function _grant(PushAgentWallet w) internal returns (bytes32) {
+        return _grant(w, AGENT);
+    }
+
+    /// @dev A minimal valid UCEP config, so enableSessions' policy init succeeds.
+    function _ucepInitData() internal view returns (bytes memory) {
+        IUCEP.AllowedCall[] memory rules = new IUCEP.AllowedCall[](1);
+        rules[0] = IUCEP.AllowedCall({
+            target: _addr("farProtocol"),
+            selector: bytes4(keccak256("swap(uint256,address)")),
+            beneficiaryOffset: 36,
+            hasBeneficiary: true,
+            maxValue: 1 ether
+        });
+        return abi.encode(
+            IUCEP.Config({
+                initialized: false,
+                validUntil: uint48(block.timestamp + 365 days),
+                destChainHash: keccak256("eip155:11155111"),
+                expectedCEA: _addr("cea"),
+                asset: _addr("prc20"),
+                maxAmountPerCall: 100 ether,
+                maxAmountTotal: 1000 ether,
+                maxPCPerCall: 5 ether,
+                spent: 0,
+                allowedCalls: rules
+            })
         );
     }
 
-    // ── U-06 … U-11 — module config ───────────────────────────────────
-
-    function test_U06_installModuleByOwner() public {
-        vm.expectEmit(false, false, false, true);
-        emit ModuleInstalled(1, address(validator));
-        vm.prank(ownerUEA);
-        wallet.installModule(1, address(validator), hex"c0ffee");
-
-        assertTrue(wallet.isModuleInstalled(1, address(validator), ""));
-        assertTrue(validator.installed());
-        assertEq(validator.lastInitData(), hex"c0ffee");
-        assertEq(validator.installCount(), 1);
+    /// @dev A deterministic address without touching cheatcode state, so `view` helpers stay view.
+    function _addr(string memory label) internal pure returns (address) {
+        return address(uint160(uint256(keccak256(abi.encodePacked(label)))));
     }
 
-    /// A-11 — reentrancy through onInstall is blocked by nonReentrant.
-    function test_U06_A11_reentrancyThroughOnInstallBlocked() public {
-        ReenteringValidator rv = new ReenteringValidator();
-        rv.setWallet(address(wallet));
+    // ═══════════════════════════════════ W-01 ═══════════════════════════════════
 
-        vm.prank(ownerUEA);
-        wallet.installModule(1, address(rv), "");
+    /**
+     * W-01 ⚠️ NEVER-WEAKEN — THE MOST IMPORTANT TEST IN THIS CONTRACT.
+     *
+     * `execute` reads EXACTLY TWO THINGS: the immutable-args owner, and calldata. No module, no
+     * policy, no engine state, no flag may ever be consulted on that path. This matrix is what
+     * guards that: the owner door must succeed in EVERY degraded wallet state.
+     *
+     * If someone later adds a "helpful" safety check — a module-health probe, an engine liveness
+     * read, a pause flag — at least one cell here goes red. That is the entire point. Do not
+     * weaken a cell to make a change pass; the change is the bug.
+     *
+     * MATRIX: {zero mandates, ghost-mandate state, engine uninstalled, hostile validator installed,
+     * engine returning garbage} x {transfer, gateway-shaped call} x {single, batch}.
+     */
+    function test_OwnerPath_SurvivesDegradedMatrix() public {
+        // ── cell group 1: zero mandates (the freshly initialised wallet) ──
+        _assertOwnerDoorFullyLive("zero mandates");
 
-        assertTrue(rv.attempted(), "onInstall must have run");
-        assertFalse(rv.reentrySucceeded(), "reentrant installModule must fail");
+        // ── cell group 2: ghost-mandate state — a live permission exists on the engine ──
+        // Granted through the REAL path (wallet.grantMandate), switched from the direct
+        // engine.enableSessions used while grantMandate was a 3a placeholder.
+        _grant(wallet);
+        _assertOwnerDoorFullyLive("ghost-mandate state");
+
+        // ── cell group 3: engine UNINSTALLED (after clearing permissions so the wedge guard passes) ──
+        PushAgentWallet w3 = newWallet(WALLET_OWNER);
+        vm.deal(address(w3), 100 ether);
+        vm.prank(WALLET_OWNER);
+        w3.uninstallModule(1, address(engine), "");
+        assertFalse(w3.isModuleInstalled(1, address(engine), ""), "engine really is uninstalled");
+        _assertOwnerDoorFullyLiveOn(w3, "engine uninstalled");
+
+        // ── cell group 4: a HOSTILE validator installed ──
+        PushAgentWallet w4 = newWallet(WALLET_OWNER);
+        vm.deal(address(w4), 100 ether);
+        HostileValidator hostile = new HostileValidator();
+        vm.prank(WALLET_OWNER);
+        w4.installModule(1, address(hostile), "");
+        assertTrue(w4.isModuleInstalled(1, address(hostile), ""), "hostile validator really is installed");
+        _assertOwnerDoorFullyLiveOn(w4, "hostile validator installed");
+
+        // ── cell group 5: the engine returns GARBAGE from every call ──
+        PushAgentWallet w5 = newWallet(WALLET_OWNER);
+        vm.deal(address(w5), 100 ether);
+        vm.etch(address(engine), type(GarbageEngine).runtimeCode);
+        _assertOwnerDoorFullyLiveOn(w5, "engine returning garbage");
     }
 
-    function test_U07_installModuleByNonOwnerReverts() public {
-        vm.expectRevert(PushWalletErrors.Unauthorized.selector);
-        vm.prank(stranger);
-        wallet.installModule(1, address(validator), "");
+    function _assertOwnerDoorFullyLive(string memory cell) internal {
+        _assertOwnerDoorFullyLiveOn(wallet, cell);
     }
 
-    function test_U08_installUnsupportedTypeReverts() public {
-        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.UnsupportedModuleType.selector, uint256(2)));
-        vm.prank(ownerUEA);
-        wallet.installModule(2, address(validator), "");
+    /// @dev Both payload shapes x both call types = four cells per degraded state.
+    function _assertOwnerDoorFullyLiveOn(PushAgentWallet w, string memory cell) internal {
+        address sink = makeAddr(string.concat("sink:", cell));
+        uint256 before = sink.balance;
 
-        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.UnsupportedModuleType.selector, uint256(3)));
-        vm.prank(ownerUEA);
-        wallet.installModule(3, address(validator), "");
+        // (a) SINGLE — a plain transfer (this is what "withdrawal" is; there is no withdraw()).
+        vm.prank(WALLET_OWNER);
+        w.execute(_singleMode(), _singleCalldata(sink, 1 ether, ""));
+        assertEq(sink.balance, before + 1 ether, string.concat(cell, ": single transfer"));
+
+        // (b) SINGLE — a gateway-shaped call. The owner composes outbound requests freely; no UCEP
+        //     pin applies on this door.
+        etchCallRecorder(GATEWAY);
+        vm.store(GATEWAY, bytes32(uint256(0)), bytes32(0));
+        vm.prank(WALLET_OWNER);
+        w.execute(_singleMode(), _gatewayShapedCalldata());
+        assertEq(callsRecorded(GATEWAY), 1, string.concat(cell, ": single gateway-shaped call"));
+        vm.etch(GATEWAY, "");
+
+        // (c) BATCH — transfer + gateway-shaped call in one owner signature. This is the shape the
+        //     canonical permission-change flow needs (W-10).
+        //     NOTE: vm.etch replaces code but NOT storage, so the recorder's slot-0 counter
+        //     survives the re-etch above. Zero it explicitly, or this leg reads leg (b)'s count.
+        etchCallRecorder(GATEWAY);
+        vm.store(GATEWAY, bytes32(uint256(0)), bytes32(0));
+        Execution[] memory execs = new Execution[](2);
+        execs[0] = Execution({ target: sink, value: 1 ether, callData: "" });
+        execs[1] =
+            Execution({ target: GATEWAY, value: 0, callData: abi.encodeWithSelector(SEND_OUTBOUND_SELECTOR, "") });
+
+        vm.prank(WALLET_OWNER);
+        w.execute(_batchMode(), ExecutionLib.encodeBatch(execs));
+
+        assertEq(sink.balance, before + 2 ether, string.concat(cell, ": batch transfer leg"));
+        assertEq(callsRecorded(GATEWAY), 1, string.concat(cell, ": batch gateway leg"));
+        vm.etch(GATEWAY, "");
     }
 
-    function test_U08b_installZeroAddressReverts() public {
-        vm.expectRevert(PushWalletErrors.ZeroAddress.selector);
-        vm.prank(ownerUEA);
+    /// A non-owner is refused in every one of those states — the door is open to exactly one address.
+    function test_OwnerPath_RejectsNonOwner() public {
+        vm.prank(AGENT);
+        vm.expectRevert(PushWalletErrors.NotOwner.selector);
+        wallet.execute(_singleMode(), _singleCalldata(AGENT, 1 ether, ""));
+
+        vm.prank(FACTORY);
+        vm.expectRevert(PushWalletErrors.NotOwner.selector);
+        wallet.execute(_singleMode(), _singleCalldata(AGENT, 1 ether, ""));
+    }
+
+    /// The owner door bubbles an inner revert verbatim rather than swallowing it.
+    function test_OwnerPath_BubblesInnerRevert() public {
+        Reverter r = new Reverter();
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(Reverter.Nope.selector);
+        wallet.execute(_singleMode(), _singleCalldata(address(r), 0, abi.encodeCall(Reverter.boom, ())));
+    }
+
+    // ═══════════════════════════ execution-mode gates ═══════════════════════════
+
+    /**
+     * ExecutionLib.decodeBatch's THREE MALFORMED-CALLDATA GUARDS, each through the owner door.
+     *
+     * WHY THESE EXIST AT ALL — this is the D-4 divergence from the reference implementation, and it
+     * was added because upstream's version is a bug: given SINGLE-encoded calldata in BATCH mode it
+     * reads a length of zero and returns an EMPTY batch, so `execute` SUCCEEDS having performed no
+     * call — a silent no-op that still consumes a nonce and emits an event. The guards turn that
+     * into a revert.
+     *
+     * WHY THE OWNER DOOR — the agent door refuses batch mode at step 9 before decoding, so these
+     * lines are unreachable from there. `execute` is the only path that decodes a batch.
+     *
+     * A guard whose absence WAS a bug, with no test, is a guard a future refactor deletes silently.
+     * Each case names `MalformedBatchCalldata` rather than accepting any revert.
+     */
+    function test_DecodeBatch_MalformedCalldata_AllThreeGuards() public {
+        bytes32 batchMode = _batchMode();
+
+        // (1) ExecutionLib.sol:51 — shorter than the single offset word.
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        wallet.execute(batchMode, new bytes(31));
+
+        // (2) ExecutionLib.sol:60 — the offset word points past the end of the blob.
+        bytes memory offsetPastEnd = abi.encodePacked(uint256(1_000_000), uint256(0));
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        wallet.execute(batchMode, offsetPastEnd);
+
+        // (2b) the same guard's SECOND arm: the offset lands inside the blob, but leaves fewer than
+        //      32 bytes after it — so there is no room for the length word that must follow.
+        //      The blob is 96 bytes, so the offset must exceed 64 for fewer than 32 to remain.
+        //      Measured: offset 64 leaves EXACTLY 32 and legitimately decodes to an empty batch,
+        //      and offset 48 leaves 48 — both are VALID. 80 is the first that is not.
+        bytes memory noRoomForLength = abi.encodePacked(uint256(80), uint256(0), uint256(0));
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        wallet.execute(batchMode, noRoomForLength);
+
+        // (3) ExecutionLib.sol:70 — a length larger than the remaining bytes could hold.
+        //     offset 32, length 1000, but only one word follows: 1000 head slots cannot fit.
+        bytes memory impossibleLength = abi.encodePacked(uint256(32), uint256(1000), uint256(0));
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        wallet.execute(batchMode, impossibleLength);
+    }
+
+    /**
+     * THE EXACT INPUT THE DIVERGENCE WAS WRITTEN FOR: SINGLE-encoded calldata submitted in BATCH
+     * mode. Upstream decodes it as an empty batch and `execute` SUCCEEDS having called nothing.
+     *
+     * It must REVERT, and the recorder proves the silent-no-op reading is not what happens: the
+     * target is never called, and the transaction does not succeed.
+     */
+    function test_DecodeBatch_SingleEncodedInBatchMode_RevertsNotSilentNoop() public {
+        address sink = makeAddr("batchModeSink");
+        etchCallRecorder(sink);
+        vm.store(sink, bytes32(uint256(0)), bytes32(0));
+
+        // Perfectly valid SINGLE calldata — target, value, empty payload.
+        bytes memory singleEncoded = _singleCalldata(sink, 1 ether, "");
+
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.MalformedBatchCalldata.selector);
+        wallet.execute(_batchMode(), singleEncoded);
+
+        assertEq(callsRecorded(sink), 0, "nothing was called");
+        assertEq(sink.balance, 0, "and no value moved - it reverted rather than silently no-opping");
+
+        // CONTROL: the same bytes in SINGLE mode do exactly what they say.
+        vm.prank(WALLET_OWNER);
+        wallet.execute(_singleMode(), singleEncoded);
+        assertEq(sink.balance, 1 ether, "the same calldata is valid in SINGLE mode");
+    }
+
+    function test_OwnerDoor_RejectsNonDefaultExecAndExoticCallTypes() public {
+        bytes memory ecd = _singleCalldata(AGENT, 0, "");
+
+        // try-exec type
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.UnsupportedExecutionMode.selector);
+        wallet.execute(_mode(0x00, 0x01), ecd);
+
+        // delegatecall — the wallet half of the non-upgradeable ruling (W-25)
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.UnsupportedExecutionMode.selector);
+        wallet.execute(_mode(0xFF, 0x00), ecd);
+
+        // static
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.UnsupportedExecutionMode.selector);
+        wallet.execute(_mode(0xFE, 0x00), ecd);
+
+        // an unassigned call type
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.UnsupportedExecutionMode.selector);
+        wallet.execute(_mode(0x42, 0x00), ecd);
+    }
+
+    function test_supportsExecutionMode() public view {
+        assertTrue(wallet.supportsExecutionMode(_singleMode()), "single/default");
+        assertTrue(wallet.supportsExecutionMode(_batchMode()), "batch/default");
+        assertFalse(wallet.supportsExecutionMode(_mode(0x00, 0x01)), "try exec type");
+        assertFalse(wallet.supportsExecutionMode(_mode(0xFF, 0x00)), "delegatecall");
+        assertFalse(wallet.supportsExecutionMode(_mode(0xFE, 0x00)), "static");
+    }
+
+    // ═══════════════════════════════════ W-11 ═══════════════════════════════════
+
+    /// Unqualified: types 2/3/4 are refused BY THE WALLET. A hook would run on the owner path and
+    /// could block it — which is why no hook type exists in v3 at all.
+    function test_W11_ModuleTypes_2_3_4_Rejected() public {
+        DummyModule m = new DummyModule();
+
+        for (uint256 t = 2; t <= 4; ++t) {
+            assertFalse(wallet.supportsModule(t), "supportsModule must be false");
+
+            vm.prank(WALLET_OWNER);
+            vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.UnsupportedModuleType.selector, t));
+            wallet.installModule(t, address(m), "");
+
+            vm.prank(WALLET_OWNER);
+            vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.UnsupportedModuleType.selector, t));
+            wallet.uninstallModule(t, address(m), "");
+        }
+
+        assertTrue(wallet.supportsModule(1), "only type 1 is supported");
+        assertFalse(wallet.supportsModule(0), "type 0");
+        assertFalse(wallet.supportsModule(5), "type 5");
+    }
+
+    function test_InstallModule_Guards() public {
+        DummyModule m = new DummyModule();
+
+        // zero address
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.InvalidModuleAddress.selector);
         wallet.installModule(1, address(0), "");
+
+        // codeless target
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.InvalidModuleAddress.selector);
+        wallet.installModule(1, makeAddr("noCode"), "");
+
+        // double install reverts loudly
+        vm.prank(WALLET_OWNER);
+        wallet.installModule(1, address(m), "");
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.ModuleAlreadyInstalled.selector, address(m)));
+        wallet.installModule(1, address(m), "");
+
+        // non-owner
+        vm.prank(AGENT);
+        vm.expectRevert(PushWalletErrors.NotOwner.selector);
+        wallet.installModule(1, address(m), "");
     }
 
-    function test_U09_doubleInstallReverts() public {
-        vm.startPrank(ownerUEA);
-        wallet.installModule(1, address(validator), "");
-        vm.expectRevert(
-            abi.encodeWithSelector(PushWalletErrors.ModuleAlreadyInstalled.selector, uint256(1), address(validator))
+    function test_UninstallModule_RequiresInstalled() public {
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.ValidatorNotInstalled.selector, AGENT));
+        wallet.uninstallModule(1, AGENT, "");
+    }
+
+    // ═══════════════════════════════════ W-12 ═══════════════════════════════════
+
+    /// A reverting callback AND a gas-burning callback are both still removed. The account unmarks
+    /// FIRST, so a hostile module cannot block its own removal.
+    function test_W12_Uninstall_StipendSemantics() public {
+        // (a) a callback that reverts
+        RevertingUninstall rev = new RevertingUninstall();
+        vm.prank(WALLET_OWNER);
+        wallet.installModule(1, address(rev), "");
+
+        vm.expectEmit(true, true, true, true, address(wallet));
+        emit IPushAgentWallet.UninstallCallbackFailed(address(rev));
+        vm.prank(WALLET_OWNER);
+        wallet.uninstallModule(1, address(rev), "");
+        assertFalse(wallet.isModuleInstalled(1, address(rev), ""), "reverting callback still removed");
+
+        // (b) a callback that burns everything it is given
+        GasBurnerUninstall burner = new GasBurnerUninstall();
+        vm.prank(WALLET_OWNER);
+        wallet.installModule(1, address(burner), "");
+
+        vm.expectEmit(true, true, true, true, address(wallet));
+        emit IPushAgentWallet.UninstallCallbackFailed(address(burner));
+        vm.prank(WALLET_OWNER);
+        wallet.uninstallModule(1, address(burner), "");
+        assertFalse(wallet.isModuleInstalled(1, address(burner), ""), "gas-burning callback still removed");
+    }
+
+    /// The stipend is a named constant and it really is capped: the burner consumes the stipend,
+    /// not the whole transaction. Asserted with a number so the test can fail.
+    function test_W12_StipendIsCapped() public {
+        GasBurnerUninstall burner = new GasBurnerUninstall();
+        vm.prank(WALLET_OWNER);
+        wallet.installModule(1, address(burner), "");
+
+        vm.prank(WALLET_OWNER);
+        uint256 before = gasleft();
+        wallet.uninstallModule(1, address(burner), "");
+        uint256 used = before - gasleft();
+
+        emit log_named_uint("uninstall gas with a burning callback", used);
+        // The 100k stipend plus the wallet's own work. Well under a full-transaction burn.
+        assertLt(used, 200_000, "the callback is capped by UNINSTALL_CALLBACK_GAS_STIPEND");
+    }
+
+    // ═══════════════════════════════════ W-13 ═══════════════════════════════════
+
+    /// The wedge guard: the engine cannot be uninstalled while it holds live permissions, because
+    /// its unbounded cleanup loop would die midway under the stipend and leave dangling rows the
+    /// engine then refuses to reinstall over. AND a third-party validator with live "state" is NOT
+    /// protected — it removes unconditionally.
+    function test_W13_EngineUninstall_WedgeGuard() public {
+        // with a live permission, the engine is protected
+        _grant(wallet);
+        assertTrue(engine.isInitialized(address(wallet)), "engine reports live state");
+
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.EngineStillHoldsPermissions.selector);
+        wallet.uninstallModule(1, address(engine), "");
+        assertTrue(wallet.isModuleInstalled(1, address(engine), ""), "still installed");
+
+        // after removing the permission, it uninstalls cleanly
+        PermissionId[] memory ids = engine.getPermissionIDs(address(wallet));
+        for (uint256 i; i < ids.length; ++i) {
+            vm.prank(address(wallet));
+            engine.removeSession(ids[i]);
+        }
+        assertFalse(engine.isInitialized(address(wallet)), "engine reports no state");
+
+        vm.prank(WALLET_OWNER);
+        wallet.uninstallModule(1, address(engine), "");
+        assertFalse(wallet.isModuleInstalled(1, address(engine), ""), "clean uninstall after stopAll-equivalent");
+    }
+
+    /// THE OTHER HALF, and it is the security-relevant one: a hostile validator that claims live
+    /// state removes anyway. The guard is scoped EXACTLY to DEFAULT_SESSION_ENGINE (§11 item 9) —
+    /// generalising it would hand every hostile module a removal blocker.
+    function test_W13_ThirdPartyValidator_NotProtected() public {
+        AlwaysInitializedValidator hostile = new AlwaysInitializedValidator();
+        vm.prank(WALLET_OWNER);
+        wallet.installModule(1, address(hostile), "");
+
+        assertTrue(hostile.isInitialized(address(wallet)), "it claims live state");
+
+        vm.prank(WALLET_OWNER);
+        wallet.uninstallModule(1, address(hostile), "");
+        assertFalse(wallet.isModuleInstalled(1, address(hostile), ""), "removed unconditionally");
+    }
+
+    // ═══════════════════════════════════ W-14 ═══════════════════════════════════
+
+    /// The probe FAILS OPEN. An engine whose isInitialized reverts, burns gas, or returns garbage
+    /// must still be removable — the guard exists to prevent an ordering mistake, never to make a
+    /// broken engine irremovable.
+    function test_W14_EngineGuard_FailsOpen() public {
+        // (a) probe reverts
+        _assertEngineRemovableWithProbe(type(RevertingProbeEngine).runtimeCode, "probe reverts");
+
+        // (b) probe burns all the gas it is given
+        _assertEngineRemovableWithProbe(type(GasBurnerProbeEngine).runtimeCode, "probe burns gas");
+
+        // (c) probe returns garbage too short to decode
+        _assertEngineRemovableWithProbe(type(ShortReturnProbeEngine).runtimeCode, "probe returns short data");
+
+        // (d) probe returns no data at all
+        _assertEngineRemovableWithProbe(type(EmptyReturnProbeEngine).runtimeCode, "probe returns nothing");
+    }
+
+    /// @dev Snapshot the real engine's code, etch the broken probe, assert removal proceeds, then
+    ///      restore — so each case runs against a genuinely installed engine.
+    function _assertEngineRemovableWithProbe(bytes memory probeCode, string memory label) internal {
+        PushAgentWallet w = newWallet(WALLET_OWNER);
+        bytes memory realEngineCode = address(engine).code;
+
+        vm.etch(address(engine), probeCode);
+
+        vm.prank(WALLET_OWNER);
+        w.uninstallModule(1, address(engine), "");
+        assertFalse(w.isModuleInstalled(1, address(engine), ""), label);
+
+        vm.etch(address(engine), realEngineCode);
+    }
+
+    // ═══════════════════════════════════ W-20 ═══════════════════════════════════
+
+    function test_W20_InitializeAccount_FactoryOnlyOnce() public {
+        // a fresh, UNINITIALISED clone
+        bytes memory args = abi.encodePacked(WALLET_OWNER, FACTORY);
+        PushAgentWallet fresh = PushAgentWallet(
+            payable(Clones.cloneDeterministicWithImmutableArgs(address(walletImpl), args, bytes32(uint256(999))))
         );
-        wallet.installModule(1, address(validator), "");
-        vm.stopPrank();
+
+        // non-factory callers are refused
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.NotFactory.selector);
+        fresh.initializeAccount();
+
+        vm.prank(AGENT);
+        vm.expectRevert(PushWalletErrors.NotFactory.selector);
+        fresh.initializeAccount();
+
+        // the factory succeeds, and both events fire
+        vm.expectEmit(true, true, true, true, address(fresh));
+        emit IPushAgentWallet.ModuleInstalled(1, address(engine));
+        vm.expectEmit(true, true, true, true, address(fresh));
+        emit IPushAgentWallet.AccountInitialized(WALLET_OWNER, address(engine));
+
+        vm.prank(FACTORY);
+        fresh.initializeAccount();
+
+        assertTrue(fresh.isModuleInstalled(1, address(engine), ""), "engine installed as sole validator");
+
+        // second call reverts
+        vm.prank(FACTORY);
+        vm.expectRevert(PushWalletErrors.AlreadyInitialized.selector);
+        fresh.initializeAccount();
     }
 
-    function test_U10_uninstallModule() public {
-        vm.startPrank(ownerUEA);
-        wallet.installModule(1, address(validator), "");
+    // ═══════════════════════════════════ W-21 ═══════════════════════════════════
 
-        vm.expectEmit(false, false, false, true);
-        emit ModuleUninstalled(1, address(validator));
-        wallet.uninstallModule(1, address(validator), hex"dead");
-        vm.stopPrank();
-
-        assertFalse(wallet.isModuleInstalled(1, address(validator), ""));
-        assertFalse(validator.installed());
-        assertEq(validator.uninstallCount(), 1);
-    }
-
-    function test_U11_uninstallNotInstalledReverts() public {
-        vm.expectRevert(
-            abi.encodeWithSelector(PushWalletErrors.ModuleNotInstalled.selector, uint256(1), address(validator))
-        );
-        vm.prank(ownerUEA);
-        wallet.uninstallModule(1, address(validator), "");
-    }
-
-    function test_hookInstallAndUninstallManagesHookSlot() public {
-        MockHook hook = new MockHook();
-        vm.startPrank(ownerUEA);
-        wallet.installModule(4, address(hook), "");
-        assertTrue(wallet.isModuleInstalled(4, address(hook), ""));
-
-        // hook fires on execute
-        wallet.execute(
-            ModeLib.encodeSimpleSingle(),
-            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (7)))
-        );
-        assertEq(hook.preCount(), 1);
-        assertEq(hook.postCount(), 1);
-        assertEq(hook.lastMsgSender(), ownerUEA);
-
-        wallet.uninstallModule(4, address(hook), "");
-        vm.stopPrank();
-        assertFalse(wallet.isModuleInstalled(4, address(hook), ""));
-
-        // no longer fires
-        vm.prank(ownerUEA);
-        wallet.execute(
-            ModeLib.encodeSimpleSingle(),
-            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (8)))
-        );
-        assertEq(hook.preCount(), 1, "hook must not fire after uninstall");
-    }
-
-    // ── U-12 … U-17 — execution ───────────────────────────────────────
-
-    function test_U12_executeSingleByOwner() public {
-        vm.prank(ownerUEA);
-        wallet.execute(
-            ModeLib.encodeSimpleSingle(),
-            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (42)))
-        );
-        assertEq(target.value(), 42);
-        assertEq(target.callCount(), 1);
-    }
-
-    function test_U12b_executeSingleForwardsValue() public {
-        vm.deal(address(wallet), 5 ether);
-        vm.prank(ownerUEA);
-        wallet.execute(
-            ModeLib.encodeSimpleSingle(),
-            ExecutionLib.encodeSingle(address(target), 1 ether, abi.encodeCall(MockTarget.setValue, (1)))
-        );
-        assertEq(target.receivedValue(), 1 ether);
-        assertEq(address(target).balance, 1 ether);
-    }
-
-    function test_U13_executeBatchInOrder() public {
-        Execution[] memory execs = new Execution[](3);
-        execs[0] = Execution(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)));
-        execs[1] = Execution(address(target), 0, abi.encodeCall(MockTarget.setValue, (2)));
-        execs[2] = Execution(address(target), 0, abi.encodeCall(MockTarget.setValue, (3)));
-
-        vm.prank(ownerUEA);
-        wallet.execute(ModeLib.encodeSimpleBatch(), ExecutionLib.encodeBatch(execs));
-
-        assertEq(target.callCount(), 3);
-        assertEq(target.orderLength(), 3);
-        assertEq(target.order(0), 1);
-        assertEq(target.order(1), 2);
-        assertEq(target.order(2), 3);
-        assertEq(target.value(), 3);
-    }
-
-    function test_U14_executeByStrangerReverts() public {
-        vm.expectRevert(PushWalletErrors.Unauthorized.selector);
-        vm.prank(stranger);
-        wallet.execute(
-            ModeLib.encodeSimpleSingle(),
-            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)))
-        );
-    }
-
-    /// U-15 / A-15 — delegatecall mode is rejected explicitly.
-    function test_U15_A15_delegatecallModeReverts() public {
-        ModeCode mode = ModeLib.encode(CALLTYPE_DELEGATECALL, EXECTYPE_DEFAULT, MODE_DEFAULT, ModePayload.wrap(0));
-        vm.expectRevert(PushWalletErrors.DelegatecallNotSupported.selector);
-        vm.prank(ownerUEA);
-        wallet.execute(mode, ExecutionLib.encodeSingle(address(target), 0, ""));
-    }
-
-    function test_U16_execTypeTryReverts() public {
-        ModeCode mode = ModeLib.encode(CALLTYPE_SINGLE, EXECTYPE_TRY, MODE_DEFAULT, ModePayload.wrap(0));
-        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.UnsupportedExecType.selector, EXECTYPE_TRY));
-        vm.prank(ownerUEA);
-        wallet.execute(mode, ExecutionLib.encodeSingle(address(target), 0, ""));
-    }
-
-    function test_U16b_unsupportedCallTypeReverts() public {
-        ModeCode mode = ModeLib.encode(CALLTYPE_STATIC, EXECTYPE_DEFAULT, MODE_DEFAULT, ModePayload.wrap(0));
-        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.UnsupportedCallType.selector, CALLTYPE_STATIC));
-        vm.prank(ownerUEA);
-        wallet.execute(mode, ExecutionLib.encodeSingle(address(target), 0, ""));
-    }
-
-    function test_U17_innerRevertBubblesOriginalData() public {
-        vm.expectRevert(abi.encodeWithSelector(MockTarget.TargetReverted.selector, "boom"));
-        vm.prank(ownerUEA);
-        wallet.execute(
-            ModeLib.encodeSimpleSingle(),
-            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.boom, ()))
-        );
-    }
-
-    // ── U-18 — sweepPC ────────────────────────────────────────────────
-
-    function test_U18_sweepPCByOwner() public {
-        vm.deal(address(wallet), 3 ether);
-        address payable dest = payable(address(0xD35));
-
-        vm.expectEmit(true, false, false, true);
-        emit PCSwept(dest, 2 ether);
-        vm.prank(ownerUEA);
-        wallet.sweepPC(dest, 2 ether);
-
-        assertEq(dest.balance, 2 ether);
-        assertEq(address(wallet).balance, 1 ether);
-    }
-
-    function test_U18b_sweepPCByNonOwnerReverts() public {
-        vm.deal(address(wallet), 1 ether);
-        vm.expectRevert(PushWalletErrors.Unauthorized.selector);
-        vm.prank(stranger);
-        wallet.sweepPC(payable(stranger), 1 ether);
-    }
-
-    function test_U18c_sweepPCZeroAddressReverts() public {
-        vm.deal(address(wallet), 1 ether);
-        vm.expectRevert(PushWalletErrors.ZeroAddress.selector);
-        vm.prank(ownerUEA);
-        wallet.sweepPC(payable(address(0)), 1 ether);
-    }
-
-    function test_U18d_sweepPCFailedTransferReverts() public {
-        vm.deal(address(wallet), 1 ether);
-        RejectsPC r = new RejectsPC();
-        vm.expectRevert(PushWalletErrors.NativeTransferFailed.selector);
-        vm.prank(ownerUEA);
-        wallet.sweepPC(payable(address(r)), 1 ether);
-    }
-
-    // ── U-19 / A-10 — emergencyRevokeAll ──────────────────────────────
-
-    function test_U19_A10_emergencyRevokeAllBypassesRevertingOnUninstall() public {
-        StubbornValidator sv = new StubbornValidator();
-        vm.prank(ownerUEA);
-        wallet.installModule(1, address(sv), "");
-        assertTrue(wallet.isModuleInstalled(1, address(sv), ""));
-
-        // Normal uninstall is blocked by the module itself.
-        vm.expectRevert(bytes("cannot uninstall"));
-        vm.prank(ownerUEA);
-        wallet.uninstallModule(1, address(sv), "");
-        assertTrue(wallet.isModuleInstalled(1, address(sv), ""), "still installed");
-
-        // The escape hatch works.
-        address[] memory vs = new address[](1);
-        vs[0] = address(sv);
-        vm.expectEmit(true, false, false, true);
-        emit EmergencyRevokeAll(ownerUEA);
-        vm.prank(ownerUEA);
-        wallet.emergencyRevokeAll(vs);
-
-        assertFalse(wallet.isModuleInstalled(1, address(sv), ""), "revoked");
-    }
-
-    function test_U19b_emergencyRevokeAllClearsHook() public {
-        MockHook hook = new MockHook();
-        vm.startPrank(ownerUEA);
-        wallet.installModule(4, address(hook), "");
-        address[] memory vs = new address[](0);
-        wallet.emergencyRevokeAll(vs);
-
-        // hook no longer fires
-        wallet.execute(
-            ModeLib.encodeSimpleSingle(),
-            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)))
-        );
-        vm.stopPrank();
-        assertEq(hook.preCount(), 0, "hook slot must be cleared");
-    }
-
-    function test_U19c_emergencyRevokeAllByNonOwnerReverts() public {
-        address[] memory vs = new address[](1);
-        vs[0] = address(validator);
-        vm.expectRevert(PushWalletErrors.Unauthorized.selector);
-        vm.prank(stranger);
-        wallet.emergencyRevokeAll(vs);
-    }
-
-    // ── U-24 … U-26 — Q8: single-active-hook discipline ───────────────
-
-    /// U-24 — emergencyRevokeAll clears the hook MAPPING, not just the slot, so the
-    /// hook can be reinstalled afterwards.
-    function test_U24_Q8_emergencyRevokeAllClearsHookMapping() public {
-        MockHook hook = new MockHook();
-        vm.startPrank(ownerUEA);
-        wallet.installModule(4, address(hook), "");
-        assertTrue(wallet.isModuleInstalled(4, address(hook), ""));
-
-        address[] memory none = new address[](0);
-        wallet.emergencyRevokeAll(none);
-
-        assertFalse(wallet.isModuleInstalled(4, address(hook), ""), "mapping must be cleared, not just _hook");
-
-        // The previously-orphaning bug made this revert forever.
-        wallet.installModule(4, address(hook), "");
-        vm.stopPrank();
-        assertTrue(wallet.isModuleInstalled(4, address(hook), ""), "hook must be reinstallable");
-    }
-
-    /// U-25 — installing a second hook while one is active is rejected. Silently
-    /// overwriting _hook would orphan the first hook's mapping entry forever.
-    function test_U25_Q8_secondHookRejected() public {
-        MockHook a = new MockHook();
-        MockHook b = new MockHook();
-
-        vm.startPrank(ownerUEA);
-        wallet.installModule(4, address(a), "");
-
-        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.HookAlreadyInstalled.selector, address(a)));
-        wallet.installModule(4, address(b), "");
-        vm.stopPrank();
-
-        assertTrue(wallet.isModuleInstalled(4, address(a), ""));
-        assertFalse(wallet.isModuleInstalled(4, address(b), ""));
-    }
-
-    /// U-26 — explicit uninstall then install leaves no orphan.
-    function test_U26_Q8_uninstallThenInstallSecondHook() public {
-        MockHook a = new MockHook();
-        MockHook b = new MockHook();
-
-        vm.startPrank(ownerUEA);
-        wallet.installModule(4, address(a), "");
-        wallet.uninstallModule(4, address(a), "");
-        wallet.installModule(4, address(b), "");
-        vm.stopPrank();
-
-        assertFalse(wallet.isModuleInstalled(4, address(a), ""), "A must not be orphaned");
-        assertTrue(wallet.isModuleInstalled(4, address(b), ""));
-
-        // B is the active hook.
-        vm.prank(ownerUEA);
-        wallet.execute(
-            ModeLib.encodeSimpleSingle(),
-            ExecutionLib.encodeSingle(address(target), 0, abi.encodeCall(MockTarget.setValue, (1)))
-        );
-        assertEq(b.preCount(), 1, "B is active");
-        assertEq(a.preCount(), 0, "A is not");
-    }
-
-    // ── U-20 / A-14 — callValidator ───────────────────────────────────
-
-    function test_U20_A14_callValidatorUninstalledReverts() public {
-        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.ValidatorNotInstalled.selector, address(target)));
-        vm.prank(ownerUEA);
-        wallet.callValidator(address(target), abi.encodeCall(MockTarget.setValue, (1)));
-    }
-
-    function test_U20b_callValidatorByNonOwnerReverts() public {
-        vm.prank(ownerUEA);
-        wallet.installModule(1, address(validator), "");
-        vm.expectRevert(PushWalletErrors.Unauthorized.selector);
-        vm.prank(stranger);
-        wallet.callValidator(address(validator), abi.encodeCall(MockValidator.setValidationData, (0)));
-    }
-
-    function test_U20c_callValidatorForwardsAndReturns() public {
-        vm.startPrank(ownerUEA);
-        wallet.installModule(1, address(validator), "");
-        wallet.callValidator(address(validator), abi.encodeCall(MockValidator.setValidationData, (123)));
-        vm.stopPrank();
-        assertEq(validator.validationData(), 123);
-    }
-
-    function test_U20d_callValidatorBubblesRevert() public {
-        StubbornValidator sv = new StubbornValidator();
-        vm.startPrank(ownerUEA);
-        wallet.installModule(1, address(sv), "");
-        vm.expectRevert(bytes("cannot uninstall"));
-        wallet.callValidator(address(sv), abi.encodeWithSignature("onUninstall(bytes)", ""));
-        vm.stopPrank();
-    }
-
-    // ── U-21 … U-23 — misc surface ────────────────────────────────────
-
-    function test_U21_isValidSignatureAlwaysFails() public view {
-        assertEq(wallet.isValidSignature(bytes32(0), ""), bytes4(0xFFFFFFFF));
-        assertEq(wallet.isValidSignature(keccak256("x"), hex"1234"), bytes4(0xFFFFFFFF));
-    }
-
-    function test_U22_tokenReceiverSelectors() public view {
-        assertEq(wallet.onERC721Received(address(0), address(0), 0, ""), IERC721Receiver.onERC721Received.selector);
+    /// Always 0xffffffff. The wallet never signs as an ERC-1271 party in v3, and this is also what
+    /// makes the engine's ENABLE-mode flow dead on v3 wallets (S-01).
+    function test_W21_ERC1271_AlwaysInvalid() public view {
+        assertEq(wallet.isValidSignature(bytes32(0), ""), bytes4(0xffffffff), "empty");
+        assertEq(wallet.isValidSignature(keccak256("x"), hex"deadbeef"), bytes4(0xffffffff), "arbitrary");
         assertEq(
-            wallet.onERC1155Received(address(0), address(0), 0, 0, ""), IERC1155Receiver.onERC1155Received.selector
-        );
-        uint256[] memory ids = new uint256[](0);
-        assertEq(
-            wallet.onERC1155BatchReceived(address(0), address(0), ids, ids, ""),
-            IERC1155Receiver.onERC1155BatchReceived.selector
+            wallet.isValidSignature(keccak256("y"), abi.encodePacked(uint256(1), uint256(2), uint8(27))),
+            bytes4(0xffffffff),
+            "well-formed-looking ECDSA signature"
         );
     }
 
-    function test_U22b_supportsInterface() public view {
-        assertTrue(wallet.supportsInterface(type(IERC165).interfaceId));
-        assertTrue(wallet.supportsInterface(type(IERC721Receiver).interfaceId));
-        assertTrue(wallet.supportsInterface(type(IERC1155Receiver).interfaceId));
-        assertFalse(wallet.supportsInterface(bytes4(0xdeadbeef)));
+    function testFuzz_W21_ERC1271_AlwaysInvalid(bytes32 hash, bytes memory sig) public view {
+        assertEq(wallet.isValidSignature(hash, sig), bytes4(0xffffffff), "no input ever validates");
     }
 
-    function test_U23_receiveAcceptsNativePC() public {
-        vm.deal(stranger, 5 ether);
-        vm.prank(stranger);
-        (bool ok,) = address(wallet).call{ value: 2 ether }("");
-        assertTrue(ok);
-        assertEq(address(wallet).balance, 2 ether);
+    // ═══════════════════════════════════ W-22 ═══════════════════════════════════
+
+    /// A freshly deployed wallet is a VALID wallet: the owner door is fully live, and the agent
+    /// door refuses. (In 3c this asserts the failure happens before any policy runs; here the
+    /// agent door is still a placeholder, so it asserts the door is closed.)
+    function test_W22_EmptyWallet_RejectsAgents() public {
+        PushAgentWallet fresh = newWallet(WALLET_OWNER);
+        vm.deal(address(fresh), 10 ether);
+
+        assertEq(engine.getPermissionIDs(address(fresh)).length, 0, "no mandates");
+
+        // the agent door is closed — refused at its FIRST guard, the step-4 USE-mode/length check,
+        // which also confirms no engine call precedes it
+        vm.prank(AGENT);
+        vm.expectRevert(PushWalletErrors.InvalidSessionSignature.selector);
+        fresh.executeWithSession(address(engine), _singleMode(), "", "", 0, 0, 0);
+
+        // the owner door is fully live
+        address sink = makeAddr("freshSink");
+        vm.prank(WALLET_OWNER);
+        fresh.execute(_singleMode(), _singleCalldata(sink, 1 ether, ""));
+        assertEq(sink.balance, 1 ether, "owner door works on an empty wallet");
+    }
+
+    // ═══════════════════════════════════ W-23 ═══════════════════════════════════
+
+    /// The owner-door half. (The MandateActionAuthorized half arrives in 3c.)
+    function test_W23_Events_Attribution_OwnerDoor() public {
+        address sink = makeAddr("eventSink");
+        bytes memory ecd = _singleCalldata(sink, 1 ether, "");
+
+        vm.expectEmit(true, true, true, true, address(wallet));
+        emit IPushAgentWallet.OwnerExecuted(_singleMode(), keccak256(ecd));
+
+        vm.prank(WALLET_OWNER);
+        wallet.execute(_singleMode(), ecd);
+    }
+
+    /// The event is emitted AFTER successful dispatch — a failed call emits nothing.
+    function test_W23_NoEventOnFailedDispatch() public {
+        Reverter r = new Reverter();
+        vm.recordLogs();
+        vm.prank(WALLET_OWNER);
+        try wallet.execute(_singleMode(), _singleCalldata(address(r), 0, abi.encodeCall(Reverter.boom, ()))) {
+            fail();
+        } catch { }
+        assertEq(vm.getRecordedLogs().length, 0, "no OwnerExecuted on a failed dispatch");
+    }
+
+    // ═══════════════════════════════════ W-25 ═══════════════════════════════════
+
+    /**
+     * W-25 — THE EXACT SELECTOR SET, not "contains no X".
+     *
+     * A denylist ("assert there is no upgradeTo") cannot fail against a MISNAMED entry — the same
+     * defect class that made a `vm.expectCall(..., 0)` on an undeclared selector pass in Phase 2.
+     * An exact set also catches an accidentally-`public` internal helper such as `_owner()`, which
+     * no denylist would ever name.
+     *
+     * The expected list below is hard-coded on purpose. If a function is added or removed, this
+     * test fails and a human decides whether the ABI change was intended.
+     */
+    function test_W25_Clone_NoUpgradeSurface_ExactSelectorSet() public view {
+        bytes4[] memory expected = new bytes4[](25);
+        uint256 i;
+
+        // one-shot initialisation
+        expected[i++] = PushAgentWallet.initializeAccount.selector;
+        // owner door + lifecycle
+        expected[i++] = PushAgentWallet.execute.selector;
+        expected[i++] = PushAgentWallet.grantMandate.selector;
+        expected[i++] = PushAgentWallet.stopMandate.selector;
+        expected[i++] = PushAgentWallet.stopAll.selector;
+        // agent door
+        expected[i++] = PushAgentWallet.executeWithSession.selector;
+        // module manager
+        expected[i++] = PushAgentWallet.installModule.selector;
+        expected[i++] = PushAgentWallet.uninstallModule.selector;
+        expected[i++] = PushAgentWallet.isModuleInstalled.selector;
+        expected[i++] = PushAgentWallet.supportsModule.selector;
+        expected[i++] = PushAgentWallet.supportsExecutionMode.selector;
+        // views
+        expected[i++] = PushAgentWallet.owner.selector;
+        expected[i++] = PushAgentWallet.factory.selector;
+        expected[i++] = PushAgentWallet.getNonce.selector;
+        expected[i++] = PushAgentWallet.grantNonce.selector;
+        expected[i++] = PushAgentWallet.accountId.selector;
+        expected[i++] = PushAgentWallet.sessionEngine.selector;
+        expected[i++] = PushAgentWallet.ucep.selector;
+        expected[i++] = PushAgentWallet.sessionValidator.selector;
+        expected[i++] = PushAgentWallet.universalGateway.selector;
+        // reception plumbing
+        expected[i++] = PushAgentWallet.onERC721Received.selector;
+        expected[i++] = PushAgentWallet.onERC1155Received.selector;
+        expected[i++] = PushAgentWallet.onERC1155BatchReceived.selector;
+        expected[i++] = PushAgentWallet.supportsInterface.selector;
+        expected[i++] = PushAgentWallet.isValidSignature.selector;
+
+        assertEq(i, 25, "the hard-coded list must be complete");
+        assertSelectorSet("PushAgentWallet", expected);
     }
 
     /**
-     * D-3 — self-calls are rejected by AUTHORIZATION, not by the reentrancy guard.
+     * The other half of W-25: `initializeAccount` on the IMPLEMENTATION reverts `NotFactory()` from
+     * EVERY caller — including the real factory placeholder.
      *
-     * The `msg.sender == address(this)` branch was removed: a UEA multicall calls
-     * each target directly, so Stage B config arrives with `msg.sender == UEA` and
-     * never needs the wallet to call itself.
+     * WHY `NotFactory()` AND NOT `AlreadyInitialized()`, which looks like the "truer" reason: the
+     * factory check runs first, and `_factory()` on the implementation reads a slice of its own
+     * runtime bytecode rather than reverting (`Clones.fetchCloneArgs` is undefined on a non-clone,
+     * OZ `Clones.sol:255-258`). Probe-confirmed value here:
+     * `0x8063112d3a7D1461019A578063150B7A02146101` — nobody holds a key for it. §6.1 says to leave
+     * the guard order and expect `NotFactory()`.
      *
-     * ACPActionPolicy R7 is retained regardless. A-04 has three independent
-     * defences — SmartSession's InvalidSelfCall, our R7, and this modifier — and
-     * this test pins the third.
+     * HONEST SCOPE: this test does NOT prove the constructor's `_initialized = true` line matters.
+     * Verified by mutation — deleting that line leaves every test green, because the factory check
+     * fires first and the latch behind it is unreachable on the implementation. The line stays
+     * because §4 specifies it as an INDEPENDENT second block, and §4's own argument is that none of
+     * the four inertness reasons is load-bearing alone. A test asserting otherwise would be
+     * asserting something the code's structure makes unobservable.
      */
-    function test_D3_selfCallRejectedByAuthorization() public {
-        Execution[] memory execs = new Execution[](1);
-        execs[0] =
-            Execution(address(wallet), 0, abi.encodeCall(PushAgentWallet.installModule, (1, address(validator), "")));
-
-        // The inner self-call bubbles Unauthorized, not ReentrancyGuardReentrantCall.
-        vm.expectRevert(PushWalletErrors.Unauthorized.selector);
-        vm.prank(ownerUEA);
-        wallet.execute(ModeLib.encodeSimpleBatch(), ExecutionLib.encodeBatch(execs));
-
-        assertFalse(wallet.isModuleInstalled(1, address(validator), ""));
+    function test_W25_ImplementationCannotBeInitialized() public {
+        address[4] memory callers = [FACTORY, WALLET_OWNER, AGENT, address(this)];
+        for (uint256 i; i < callers.length; ++i) {
+            vm.prank(callers[i]);
+            vm.expectRevert(PushWalletErrors.NotFactory.selector);
+            walletImpl.initializeAccount();
+        }
     }
 
-    /// D-3 — the wallet calling itself directly is also rejected.
-    function test_D3_directSelfCallRejected() public {
-        vm.expectRevert(PushWalletErrors.Unauthorized.selector);
-        vm.prank(address(wallet));
-        wallet.installModule(1, address(validator), "");
+    /// The other three inertness reasons from §4, each asserted independently.
+    function test_W25_ImplementationIsInertOnEveryDoor() public {
+        // (1) the owner door: the only address passing onlyOwner is a bytecode slice.
+        address implOwner = walletImpl.owner();
+        assertTrue(implOwner != WALLET_OWNER && implOwner != FACTORY, "impl owner is a bytecode slice, not a key");
+
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.NotOwner.selector);
+        walletImpl.execute(_singleMode(), _singleCalldata(AGENT, 0, ""));
+
+        // (3) the agent door needs a session enabled for account = implementation, which only the
+        //     unreachable owner door could grant.
+        assertEq(engine.getPermissionIDs(address(walletImpl)).length, 0, "no sessions on the implementation");
+
+        // (4) it holds no funds.
+        assertEq(address(walletImpl).balance, 0, "the implementation holds nothing");
     }
+
+    // ═══════════════════════════════════ W-27 ═══════════════════════════════════
+
+    function test_W27_Immutables_SetAndReadableByClones() public {
+        // (a) every zero constructor argument reverts
+        vm.expectRevert(PushWalletErrors.InvalidModuleAddress.selector);
+        new PushAgentWallet(address(0), address(ucep), address(validator), GATEWAY);
+        vm.expectRevert(PushWalletErrors.InvalidModuleAddress.selector);
+        new PushAgentWallet(address(engine), address(0), address(validator), GATEWAY);
+        vm.expectRevert(PushWalletErrors.InvalidModuleAddress.selector);
+        new PushAgentWallet(address(engine), address(ucep), address(0), GATEWAY);
+        vm.expectRevert(PushWalletErrors.InvalidModuleAddress.selector);
+        new PushAgentWallet(address(engine), address(ucep), address(validator), address(0));
+
+        // (b) a deployed CLONE returns all four through its views — proving immutables resolve
+        //     through delegatecall from the implementation's own bytecode
+        assertEq(wallet.sessionEngine(), address(engine), "engine");
+        assertEq(wallet.ucep(), address(ucep), "ucep");
+        assertEq(wallet.sessionValidator(), address(validator), "validator");
+        assertEq(wallet.universalGateway(), GATEWAY, "gateway");
+
+        // (c) two implementations wired DIFFERENTLY produce clones that behave differently —
+        //     the values are not shared state
+        address altEngine = makeAddr("altEngine");
+        address altUcep = makeAddr("altUcep");
+        address altValidator = makeAddr("altValidator");
+        address altGateway = makeAddr("altGateway");
+        PushAgentWallet altImpl = new PushAgentWallet(altEngine, altUcep, altValidator, altGateway);
+
+        PushAgentWallet altClone = PushAgentWallet(
+            payable(Clones.cloneDeterministicWithImmutableArgs(
+                    address(altImpl), abi.encodePacked(WALLET_OWNER, FACTORY), bytes32(uint256(1234))
+                ))
+        );
+
+        assertEq(altClone.sessionEngine(), altEngine, "alt engine");
+        assertEq(altClone.ucep(), altUcep, "alt ucep");
+        assertEq(altClone.sessionValidator(), altValidator, "alt validator");
+        assertEq(altClone.universalGateway(), altGateway, "alt gateway");
+
+        // and the original clone is unaffected
+        assertEq(wallet.sessionEngine(), address(engine), "original clone unchanged");
+    }
+
+    /// Clone args round-trip: owner at 0-19, factory at 20-39.
+    function test_CloneArgs_OwnerAndFactory() public view {
+        assertEq(wallet.owner(), WALLET_OWNER, "owner from immutable args");
+        assertEq(wallet.factory(), FACTORY, "factory from immutable args");
+    }
+
+    function testFuzz_CloneArgs_OwnerAndFactory(address o, address f) public {
+        vm.assume(o != address(0) && f != address(0));
+        PushAgentWallet w = PushAgentWallet(
+            payable(Clones.cloneDeterministicWithImmutableArgs(
+                    address(walletImpl), abi.encodePacked(o, f), keccak256(abi.encode(o, f))
+                ))
+        );
+        assertEq(w.owner(), o, "any owner round-trips");
+        assertEq(w.factory(), f, "any factory round-trips");
+    }
+
+    // ═════════════════════════════ storage layout ═════════════════════════════
 
     /**
-     * D-3 — Stage B works as a UEA multicall: each entry arrives with
-     * msg.sender == UEA, so config needs no self-call at all.
+     * THE WALLET'S WHOLE STATE IS FOUR DECLARATIONS, in this order (§4). Asserted against solc's
+     * own storageLayout, not a slot read.
+     *
+     * `_initialized` (bool) and `_grantNonce` (uint64) MUST share slot 0 — the PRD specifies the
+     * packing, and a reordering that unpacked them would be a silent gas regression on every grant.
      */
-    function test_D3_stageBConfigViaOwnerCallsSucceeds() public {
-        vm.startPrank(ownerUEA);
-        wallet.installModule(1, address(validator), "");
-        wallet.callValidator(address(validator), abi.encodeCall(MockValidator.setValidationData, (0)));
-        vm.stopPrank();
+    function test_StorageLayout_ExactlyFourDeclarations() public view {
+        string memory artifact = vm.readFile("out/PushAgentWallet.sol/PushAgentWallet.json");
 
-        assertTrue(wallet.isModuleInstalled(1, address(validator), ""));
+        string[] memory labels = new string[](4);
+        labels[0] = "_initialized";
+        labels[1] = "_grantNonce";
+        labels[2] = "_installedValidators";
+        labels[3] = "_nonces";
+
+        for (uint256 i; i < labels.length; ++i) {
+            string memory base = string.concat(".storageLayout.storage[", vm.toString(i), "]");
+            assertEq(
+                vm.parseJsonString(artifact, string.concat(base, ".label")),
+                labels[i],
+                string.concat("declaration ", vm.toString(i))
+            );
+        }
+
+        // exactly four: index 4 must not exist
+        assertFalse(
+            vm.keyExistsJson(artifact, ".storageLayout.storage[4]"),
+            "a fifth storage declaration appeared - the wallet's whole state is four"
+        );
+
+        // the packing: both in slot 0
+        assertEq(vm.parseJsonString(artifact, ".storageLayout.storage[0].slot"), "0", "_initialized slot");
+        assertEq(vm.parseJsonString(artifact, ".storageLayout.storage[1].slot"), "0", "_grantNonce packs into slot 0");
+        assertEq(vm.parseJsonString(artifact, ".storageLayout.storage[2].slot"), "1", "_installedValidators slot");
+        assertEq(vm.parseJsonString(artifact, ".storageLayout.storage[3].slot"), "2", "_nonces slot");
     }
 
-    /// Owner may still configure directly (the path Stage B must use today).
-    function test_ownerDirectConfigWorks() public {
-        vm.prank(ownerUEA);
-        wallet.installModule(1, address(validator), "");
-        assertTrue(wallet.isModuleInstalled(1, address(validator), ""));
+    // ═══════════════════════════════ views & plumbing ═══════════════════════════════
+
+    function test_AccountId() public view {
+        assertEq(wallet.accountId(), "push.agentwallet.1.0.0", "ERC-7579 vendorname.accountname.semver");
+    }
+
+    /// ERC-165 + the two receiver interfaces, and NOTHING else. It must NOT report
+    /// IERC7579Account — the wallet implements that interface only partially, so advertising it
+    /// would be a false claim to exactly the tooling that probes for it (§11 item 15).
+    function test_SupportsInterface_DoesNotClaimERC7579Account() public view {
+        assertTrue(wallet.supportsInterface(0x01ffc9a7), "ERC-165");
+        assertTrue(wallet.supportsInterface(0x150b7a02), "ERC721Receiver");
+        assertTrue(wallet.supportsInterface(0x4e2312e0), "ERC1155Receiver");
+
+        assertFalse(wallet.supportsInterface(0xffffffff), "the ERC-165 invalid id");
+
+        // THE REAL interface id, computed from the upstream type — not a hash of the string
+        // "IERC7579Account", which is a meaningless value the wallet would never return anyway
+        // and which therefore cannot fail. (Value: 0xb429f8f5.)
+        assertFalse(
+            wallet.supportsInterface(type(IERC7579Account).interfaceId),
+            "must NOT advertise IERC7579Account - the wallet implements it only partially"
+        );
+
+        // Nothing else is claimed either. Four spot values that a careless addition might return.
+        assertFalse(wallet.supportsInterface(0xd03c7914), "supportsExecutionMode selector is not an interface id");
+        assertFalse(wallet.supportsInterface(0x00000000), "zero");
+        assertFalse(wallet.supportsInterface(0xdeadbeef), "arbitrary");
+    }
+
+    /// Only the three declared ids may ever return true. A fuzz so an added claim cannot hide.
+    function testFuzz_SupportsInterface_ExactlyThree(bytes4 id) public view {
+        bool expected = id == bytes4(0x01ffc9a7) || id == bytes4(0x150b7a02) || id == bytes4(0x4e2312e0);
+        assertEq(wallet.supportsInterface(id), expected, "exactly three interface ids are claimed");
+    }
+
+    function test_TokenReceiverHooks() public view {
+        assertEq(wallet.onERC721Received(address(0), address(0), 0, ""), bytes4(0x150b7a02), "721");
+        assertEq(wallet.onERC1155Received(address(0), address(0), 0, 0, ""), bytes4(0xf23a6e61), "1155 single");
+        assertEq(
+            wallet.onERC1155BatchReceived(address(0), address(0), new uint256[](0), new uint256[](0), ""),
+            bytes4(0xbc197c81),
+            "1155 batch"
+        );
+    }
+
+    function test_Receive_AcceptsPC() public {
+        uint256 before = address(wallet).balance;
+        vm.deal(AGENT, 5 ether);
+        vm.prank(AGENT);
+        (bool ok,) = address(wallet).call{ value: 5 ether }("");
+        assertTrue(ok, "receive accepts PC from anyone - refunds land here");
+        assertEq(address(wallet).balance, before + 5 ether, "balance moved");
+    }
+
+    function test_NonceViews_StartAtZero() public view {
+        assertEq(wallet.getNonce(0), 0, "lane 0");
+        assertEq(wallet.getNonce(type(uint192).max), 0, "an arbitrary lane");
+        assertEq(wallet.grantNonce(), 0, "grant nonce starts at zero");
+    }
+
+    /// The agent door is live as of 3c. A malformed request is refused at its FIRST guard — here,
+    /// the USE-mode/length check at step 4 — which also confirms no engine call precedes it.
+    function test_AgentDoor_IsLive_AndRefusesMalformedRequests() public {
+        vm.prank(AGENT);
+        vm.expectRevert(PushWalletErrors.InvalidSessionSignature.selector);
+        wallet.executeWithSession(address(engine), _singleMode(), "", "", 0, 0, 0);
+    }
+}
+
+// ─────────────────────────────── test doubles ───────────────────────────────
+// All OBSERVERS or inert stand-ins. None supplies behaviour the wallet's logic depends on.
+
+/**
+ * @dev A validator that is hostile in every way it CAN be while still being installable.
+ *
+ *      `onInstall` must succeed — the wallet bubbles install reverts by design (§6.7 step 5), so a
+ *      module that reverts there simply never gets installed and the "hostile validator installed"
+ *      cell would test nothing. Everything reachable AFTER installation reverts, which is the
+ *      state W-01 actually cares about: a hostile module sitting in the registry must not affect
+ *      the owner door, because the owner door never consults the registry.
+ */
+contract HostileValidator {
+    function onInstall(bytes calldata) external { }
+
+    function onUninstall(bytes calldata) external pure {
+        revert("hostile: refuses removal");
+    }
+
+    function isModuleType(uint256) external pure returns (bool) {
+        revert("hostile");
+    }
+
+    function isInitialized(address) external pure returns (bool) {
+        revert("hostile");
+    }
+
+    function validateUserOp(bytes calldata, bytes32) external pure returns (uint256) {
+        revert("hostile");
+    }
+
+    fallback() external payable {
+        revert("hostile");
+    }
+
+    receive() external payable {
+        revert("hostile");
+    }
+}
+
+/// @dev Returns garbage from every call, including the engine's own methods.
+contract GarbageEngine {
+    fallback(bytes calldata) external returns (bytes memory) {
+        return hex"deadbeef";
+    }
+}
+
+contract DummyModule {
+    function onInstall(bytes calldata) external { }
+    function onUninstall(bytes calldata) external { }
+
+    function isModuleType(uint256) external pure returns (bool) {
+        return true;
+    }
+}
+
+contract RevertingUninstall {
+    function onInstall(bytes calldata) external { }
+
+    function onUninstall(bytes calldata) external pure {
+        revert("no");
+    }
+}
+
+contract GasBurnerUninstall {
+    uint256 private sink;
+
+    function onInstall(bytes calldata) external { }
+
+    function onUninstall(bytes calldata) external {
+        // Burn everything given. The stipend must cap this.
+        while (true) {
+            sink++;
+        }
+    }
+}
+
+/// @dev A third-party validator that claims live state — it must still be removable.
+contract AlwaysInitializedValidator {
+    function onInstall(bytes calldata) external { }
+    function onUninstall(bytes calldata) external { }
+
+    function isInitialized(address) external pure returns (bool) {
+        return true;
+    }
+}
+
+contract RevertingProbeEngine {
+    function isInitialized(address) external pure returns (bool) {
+        revert("probe down");
+    }
+
+    fallback() external { }
+}
+
+contract GasBurnerProbeEngine {
+    uint256 private sink;
+
+    function isInitialized(address) external returns (bool) {
+        while (true) {
+            sink++;
+        }
+        return true;
+    }
+
+    fallback() external { }
+}
+
+contract ShortReturnProbeEngine {
+    fallback(bytes calldata) external returns (bytes memory) {
+        return hex"01";
+    }
+}
+
+contract EmptyReturnProbeEngine {
+    fallback() external { }
+}
+
+contract Reverter {
+    error Nope();
+
+    function boom() external pure {
+        revert Nope();
     }
 }

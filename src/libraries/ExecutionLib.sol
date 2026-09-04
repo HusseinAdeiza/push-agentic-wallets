@@ -12,7 +12,7 @@ struct Execution {
 
 /**
  * @title ExecutionLib
- * @notice Encode/decode ERC-7579 execution calldata (PRD §9.2).
+ * @notice Encode/decode ERC-7579 execution calldata.
  *
  * @dev ⚠ REVIEW REQUIRED — the encodings differ per call type and mixing them
  *      produces plausible-looking garbage:
