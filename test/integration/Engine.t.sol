@@ -273,7 +273,9 @@ contract EngineTest is BaseTest {
         s3.actions[0].actionPolicies = new PolicyData[](0);
         _expectShape(s3);
 
-        URP other = new URP(GATEWAY, EXECUTOR_MODULE, address(engine));
+        // Only its ADDRESS matters — the shape check rejects a non-canonical policy without
+        // calling it, so this needs no proxy and no initialisation.
+        URP other = new URP();
         _expectShape(sessionWithPolicy(address(other), ecdsaConfig(agentAddr), _urpConfig()));
 
         // RULE 5 — the paymaster flag is always false

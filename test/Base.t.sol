@@ -9,6 +9,7 @@ import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.so
 
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import { TransparentUpgradeableProxy } from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 
 import { PushSessionValidator } from "../src/validators/PushSessionValidator.sol";
 import { URP } from "../src/policies/URP.sol";
@@ -26,7 +27,16 @@ abstract contract BaseTest is Test {
 
     SmartSession internal engine;
     PushSessionValidator internal validator;
+
+    /// @dev THE REAL URP — a TransparentUpgradeableProxy in front of `urpImplementation`. Every
+    ///      suite drives this, so every test runs against the deployed shape.
     URP internal urp;
+
+    /// @dev The URP IMPLEMENTATION. Holds no config of its own; its initialiser is disabled.
+    URP internal urpImplementation;
+
+    /// @dev The proxy itself, typed. Needed to reach the admin, which TUP creates internally.
+    TransparentUpgradeableProxy internal urpProxy;
 
     /// @dev The wallet IMPLEMENTATION. Clones delegatecall into it; it is never driven directly.
     PushAgentWallet internal walletImpl;
@@ -41,6 +51,9 @@ abstract contract BaseTest is Test {
     address internal FACTORY;
 
     address internal FACTORY_ADMIN;
+
+    /// @dev Owner of URP's ProxyAdmin — the only account that can upgrade the policy.
+    address internal URP_ADMIN_OWNER;
 
     // ─────────────────────────── named addresses ───────────────────────────
 
@@ -89,7 +102,20 @@ abstract contract BaseTest is Test {
 
         engine = new SmartSession();
         validator = new PushSessionValidator();
-        urp = new URP(GATEWAY, EXECUTOR_MODULE, address(engine));
+
+        // URP BEHIND ITS REAL PROXY, not a bare instance. Every suite therefore exercises the
+        // deployed shape: storage in the proxy, logic reached by delegatecall. A harness that
+        // deployed URP directly would test a contract that does not exist in production, and
+        // would silently miss anything that only breaks through a delegatecall.
+        URP_ADMIN_OWNER = makeAddr("urpAdminOwner");
+        urpImplementation = new URP();
+        urpProxy = new TransparentUpgradeableProxy(
+            address(urpImplementation),
+            URP_ADMIN_OWNER,
+            abi.encodeCall(URP.initialize, (GATEWAY, EXECUTOR_MODULE, address(engine)))
+        );
+        urp = URP(address(urpProxy));
+
         walletImpl = new PushAgentWallet(address(engine), address(urp), address(validator), GATEWAY);
 
         // ERC-1967 proxy -> factory logic, initialised in the SAME transaction, so no
@@ -309,6 +335,53 @@ abstract contract BaseTest is Test {
             encodedLength,
             64,
             string.concat(contractName, " must declare no storage variables (empty layout encodes to 64 bytes)")
+        );
+    }
+
+    /**
+     * @notice Assert a contract's storage layout is EXACTLY these labels, in this slot order.
+     *
+     * @dev    THE GUARD THAT MAKES "APPEND ONLY" ENFORCEABLE. Behind a proxy, storage belongs to
+     *         the proxy and outlives every implementation, so reordering or retyping a variable
+     *         does not fail the build — it silently reinterprets live state. For URP that means
+     *         live mandates: a shifted slot could move `spent`, and an agent's budget would read as
+     *         unspent. Nothing in Solidity catches that, so it is asserted against solc's own
+     *         `storageLayout` output here, exactly as `assertEmptyStorageLayout` does.
+     *
+     *         A future version may APPEND labels (and decrement `__gap`); this assertion should be
+     *         extended, never loosened. If it fails, do not "fix" it by editing the expected list
+     *         until you are certain the change is an append and not a reorder.
+     *
+     * @param contractName   Artifact name, e.g. "URP".
+     * @param expectedLabels Variable names in declaration order.
+     */
+    function assertStorageLayout(string memory contractName, string[] memory expectedLabels) internal view {
+        string memory path = string.concat("out/", contractName, ".sol/", contractName, ".json");
+        string memory artifact = vm.readFile(path);
+
+        require(vm.keyExistsJson(artifact, ".storageLayout.storage"), "no storageLayout in artifact");
+
+        for (uint256 i; i < expectedLabels.length; ++i) {
+            string memory base = string.concat(".storageLayout.storage[", vm.toString(i), "]");
+            assertEq(
+                vm.parseJsonString(artifact, string.concat(base, ".label")),
+                expectedLabels[i],
+                string.concat(contractName, " slot ", vm.toString(i), " label moved")
+            );
+            assertEq(
+                vm.parseJsonString(artifact, string.concat(base, ".slot")),
+                vm.toString(i),
+                string.concat(contractName, " ", expectedLabels[i], " is not at slot ", vm.toString(i))
+            );
+        }
+
+        // And nothing beyond the expected list — an unexpected trailing variable is a layout change
+        // too, and would otherwise pass silently.
+        assertFalse(
+            vm.keyExistsJson(
+                artifact, string.concat(".storageLayout.storage[", vm.toString(expectedLabels.length), "]")
+            ),
+            string.concat(contractName, " declares more storage than expected")
         );
     }
 

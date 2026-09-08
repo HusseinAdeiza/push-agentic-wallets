@@ -5,6 +5,7 @@ import { VALIDATION_SUCCESS } from "erc7579/interfaces/IERC7579Module.sol";
 import { ConfigId } from "smartsessions/DataTypes.sol";
 import { IActionPolicy, IPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { IERC165 } from "forge-std/interfaces/IERC165.sol";
+import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 
 import { IURP } from "../interfaces/IURP.sol";
 import {
@@ -26,11 +27,30 @@ import {
  *         - It is the fail-closed anchor: the engine requires at least one action policy per action
  *           (`PolicyLib.check`), so removing this one does not weaken a mandate, it kills every
  *           request under it.
- *         - No admin, no owner, no setters, no pause, not upgradeable. Three immutables are its only
- *           trust anchors.
+ *         - No owner, no setters, no pause. Its three trust anchors are written once, at
+ *           initialisation, and there is no function that can change them afterwards.
  *         - It never makes an external call, and writes only after every gate has passed.
+ *
+ *         UPGRADEABLE, BEHIND A TRANSPARENT PROXY, AND THAT IS A DELIBERATE TRADE. This contract
+ *         used to hold its trust anchors in immutables and describe itself as needing no trust at
+ *         all. Immutables live in the implementation's bytecode, which a `delegatecall` never
+ *         executes the constructor of, so upgradeability and immutables are mutually exclusive —
+ *         they had to become storage. The consequence is worth stating plainly rather than
+ *         discovering later: **URP's guarantees now hold subject to the proxy admin not being
+ *         malicious.** An admin able to install new logic can rewrite every gate in this file.
+ *
+ *         What that means in practice, and what it does NOT mean:
+ *         - No function here can move `SESSION_ENGINE`, the gateway or the executor module. The
+ *           only route to changing them is a full implementation swap by the admin.
+ *         - The admin cannot reach `$configs` or `$credited` directly; it can only replace the code
+ *           that reads them. Existing mandates keep their caps until an upgrade says otherwise.
+ *         - Storage layout is therefore load-bearing FOREVER. See the layout note on `__gap`.
+ *
+ *         THE IMPLEMENTATION MUST NEVER BE INITIALISED DIRECTLY. Its constructor disables the
+ *         initialiser for exactly that reason; an initialised implementation is a contract with a
+ *         live config that the proxy does not know about.
  */
-contract URP is IURP {
+contract URP is IURP, Initializable {
     /// @dev Maximum inner calls in one request. Bounds the gate-13 loop.
     uint256 internal constant MAX_ACTIONS_PER_REQUEST = 10;
 
@@ -49,17 +69,36 @@ contract URP is IURP {
     ///      request, so a new struct field fails the build rather than loosening gate 4c.
     uint256 internal constant MIN_OUTBOUND_BODY_LEN = 352;
 
+    // ───────────────────────────────── storage ─────────────────────────────────
+    //
+    // THE LAYOUT BELOW IS FROZEN. Behind a proxy, storage belongs to the proxy and outlives every
+    // implementation, so a new version may only APPEND — never reorder, never remove, never change
+    // a type. Doing so does not fail the build: it silently reinterprets live mandates, which is
+    // the worst failure mode this system has.
+    //
+    // slot 0  UNIVERSAL_GATEWAY_PC
+    // slot 1  UNIVERSAL_EXECUTOR_MODULE
+    // slot 2  SESSION_ENGINE
+    // slot 3  $configs
+    // slot 4  $credited
+    // slots 5..49  __gap
+    //
+    // `Initializable` adds nothing here: OZ 5.x keeps its initialisation flags in an ERC-7201
+    // namespaced slot, not slot 0. A test pins this exact layout against solc's own output.
+
     /// @notice The one Push-side target any agent action may reach.
-    address public immutable UNIVERSAL_GATEWAY_PC;
+    /// @dev    Written once by `initialize`. No setter exists, here or anywhere.
+    address public UNIVERSAL_GATEWAY_PC;
 
     /// @notice The sole caller permitted to credit a failed outbound.
-    /// @dev    Address unconfirmed against a live deployment; confirm before mainnet. It is a
-    ///         constructor argument, so nothing about building or testing depends on the real one.
-    address public immutable UNIVERSAL_EXECUTOR_MODULE;
+    /// @dev    Address unconfirmed against a live deployment; confirm before mainnet. It is an
+    ///         initialiser argument, so nothing about building or testing depends on the real one.
+    address public UNIVERSAL_EXECUTOR_MODULE;
 
     /// @notice The multiplexer this contract trusts on every non-engine-driven path.
-    /// @dev    Never accepted as an argument: a wrong value would silently address an empty slice.
-    address public immutable SESSION_ENGINE;
+    /// @dev    Never accepted as a call argument: a wrong value would silently address an empty
+    ///         slice. It is set once at initialisation and read from storage thereafter.
+    address public SESSION_ENGINE;
 
     /// @dev configId => multiplexer (the engine) => account (the wallet) => config.
     /// @dev The configId already binds the account and the permission, so the middle level isolates
@@ -72,14 +111,44 @@ contract URP is IURP {
     mapping(bytes32 => bool) internal $credited;
 
     /**
+     * @dev Reserved so a later version can add state without shifting `$configs` or `$credited`.
+     *
+     *      Adding a variable means DECREMENTING this by exactly the number of slots consumed, in
+     *      the same commit. A mapping or dynamic array costs one slot; a struct costs its packed
+     *      size. `Config` itself lives inside a mapping, so APPENDING a field to that struct is
+     *      safe and costs nothing here — reordering or removing one is not.
+     */
+    uint256[45] private __gap;
+
+    /**
+     * @notice Locks the implementation so it can never be initialised in its own context.
+     *
+     * @dev    An implementation left initialisable is a live contract holding a config the proxy
+     *         has no knowledge of. This is the standard guard and it is not optional.
+     */
+    constructor() {
+        _disableInitializers();
+    }
+
+    /**
      * @notice Pins the three addresses this policy trusts for its whole lifetime.
-     * @dev    Reverts with `ZeroAddress` if any argument is zero.
+     *
+     * @dev    Runs once, in the PROXY's context, immediately after deployment. Reverts with
+     *         `ZeroAddress` if any argument is zero, and with `InvalidInitialization` on any
+     *         second call.
+     *
+     *         Deploy and initialise atomically — pass this call as the TransparentUpgradeableProxy
+     *         constructor's `_data`. A proxy deployed uninitialised is front-runnable: whoever
+     *         calls `initialize` first chooses the engine this policy trusts.
      *
      * @param  universalGatewayPC        The one Push-side target agent actions may reach.
      * @param  universalExecutorModule   The only caller permitted to credit a failed outbound.
      * @param  sessionEngine             The multiplexer trusted on non-engine-driven paths.
      */
-    constructor(address universalGatewayPC, address universalExecutorModule, address sessionEngine) {
+    function initialize(address universalGatewayPC, address universalExecutorModule, address sessionEngine)
+        external
+        initializer
+    {
         if (universalGatewayPC == address(0)) revert ZeroAddress();
         if (universalExecutorModule == address(0)) revert ZeroAddress();
         if (sessionEngine == address(0)) revert ZeroAddress();
@@ -376,6 +445,22 @@ contract URP is IURP {
      */
     function isCredited(bytes32 outboundTxId) external view returns (bool) {
         return $credited[outboundTxId];
+    }
+
+    /**
+     * @notice The implementation's version, readable THROUGH the proxy.
+     *
+     * @dev    The proxy has no version of its own — it delegates, so this answers with whichever
+     *         implementation is currently installed. That makes it the cheapest possible check that
+     *         an upgrade actually took effect: read it before, upgrade, read it again.
+     *
+     *         A `constant` in bytecode, deliberately not storage: it must change with the CODE, and
+     *         a storage value could drift from the logic it claims to describe.
+     *
+     *         BUMP THIS IN THE SAME COMMIT AS ANY LOGIC CHANGE.
+     */
+    function version() external pure returns (string memory) {
+        return "1.0.0";
     }
 
     /**

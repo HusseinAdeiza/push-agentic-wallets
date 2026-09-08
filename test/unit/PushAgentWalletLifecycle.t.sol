@@ -172,7 +172,9 @@ contract PushAgentWalletLifecycleTest is BaseTest {
     /// A policy that is not URP — built with sessionWithPolicy, the harness helper that exists
     /// precisely so a negative test cannot accidentally use the canonical wiring.
     function test_W24_Deviation_WrongPolicyAddress() public {
-        URP otherUrp = new URP(GATEWAY, EXECUTOR_MODULE, address(engine));
+        // Only its ADDRESS matters — the wallet rejects any policy that is not the canonical one
+        // before it ever calls it, so this needs no proxy and no initialisation.
+        URP otherUrp = new URP();
         Session memory s = sessionWithPolicy(address(otherUrp), ecdsaConfig(AGENT), _urpInitData());
         _expectMalformed(s);
     }

@@ -8,6 +8,13 @@ import { ConfigId } from "smartsessions/DataTypes.sol";
 import { IActionPolicy, IPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { IERC165 } from "forge-std/interfaces/IERC165.sol";
 import { Multicall, MULTICALL_SELECTOR, UniversalOutboundTxRequest } from "../../src/libraries/PushWalletTypes.sol";
+import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import { ProxyAdmin } from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+import {
+    ITransparentUpgradeableProxy,
+    TransparentUpgradeableProxy
+} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
+import { ERC1967Utils } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
 
 /**
  * @notice URP acceptance suite — U-01 … U-22 (U-19 deferred to Phase 3b: it needs removeSession
@@ -152,21 +159,120 @@ contract URPTest is BaseTest {
 
     // ═══════════════════════════ construction & init ═══════════════════════════
 
+    /// @dev The zero-address guard moved from the constructor to `initialize` when URP went behind
+    ///      a proxy. The NAME is kept: it is the same guard, on the same three arguments, and the
+    ///      test ids in the PRD refer to it. Driven through a fresh proxy each time, because that
+    ///      is the only context in which `initialize` is reachable.
     function test_constructor_rejectsZeroAddresses() public {
-        vm.expectRevert(IURP.ZeroAddress.selector);
-        new URP(address(0), EXECUTOR_MODULE, address(engine));
+        URP impl = new URP();
 
         vm.expectRevert(IURP.ZeroAddress.selector);
-        new URP(GATEWAY, address(0), address(engine));
+        new TransparentUpgradeableProxy(
+            address(impl),
+            URP_ADMIN_OWNER,
+            abi.encodeCall(URP.initialize, (address(0), EXECUTOR_MODULE, address(engine)))
+        );
 
         vm.expectRevert(IURP.ZeroAddress.selector);
-        new URP(GATEWAY, EXECUTOR_MODULE, address(0));
+        new TransparentUpgradeableProxy(
+            address(impl), URP_ADMIN_OWNER, abi.encodeCall(URP.initialize, (GATEWAY, address(0), address(engine)))
+        );
+
+        vm.expectRevert(IURP.ZeroAddress.selector);
+        new TransparentUpgradeableProxy(
+            address(impl), URP_ADMIN_OWNER, abi.encodeCall(URP.initialize, (GATEWAY, EXECUTOR_MODULE, address(0)))
+        );
     }
 
+    /// @dev Formerly "setsImmutables". The three anchors are storage now, but the property under
+    ///      test is unchanged: they are readable, correct, and there is no setter for any of them.
     function test_constructor_setsImmutables() public view {
-        assertEq(urp.UNIVERSAL_GATEWAY_PC(), GATEWAY, "gateway immutable");
-        assertEq(urp.UNIVERSAL_EXECUTOR_MODULE(), EXECUTOR_MODULE, "executor module immutable");
-        assertEq(urp.SESSION_ENGINE(), address(engine), "session engine immutable");
+        assertEq(urp.UNIVERSAL_GATEWAY_PC(), GATEWAY, "gateway anchor");
+        assertEq(urp.UNIVERSAL_EXECUTOR_MODULE(), EXECUTOR_MODULE, "executor module anchor");
+        assertEq(urp.SESSION_ENGINE(), address(engine), "session engine anchor");
+    }
+
+    // ═══════════════════════════ upgradeability ═══════════════════════════
+
+    /// @dev An implementation left initialisable is a live contract holding a config the proxy
+    ///      knows nothing about. Its constructor must lock it.
+    function test_upgradeable_implementationCannotBeInitialised() public {
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        urpImplementation.initialize(GATEWAY, EXECUTOR_MODULE, address(engine));
+    }
+
+    /// @dev The proxy is initialised exactly once, in its constructor. A second call must fail, or
+    ///      anyone could re-point the engine this policy trusts.
+    function test_upgradeable_proxyCannotBeReinitialised() public {
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        urp.initialize(GATEWAY, EXECUTOR_MODULE, address(engine));
+    }
+
+    /// @dev The anchors live in the PROXY's storage, not the implementation's. The implementation
+    ///      read directly must therefore answer zero — proof the values were never in bytecode.
+    function test_upgradeable_anchorsLiveInProxyStorage() public view {
+        assertEq(urpImplementation.UNIVERSAL_GATEWAY_PC(), address(0), "implementation holds no gateway");
+        assertEq(urpImplementation.SESSION_ENGINE(), address(0), "implementation holds no engine");
+        assertEq(urp.UNIVERSAL_GATEWAY_PC(), GATEWAY, "the proxy holds it");
+    }
+
+    /// @dev Only the ProxyAdmin's owner may upgrade. This is the whole security model now, so it
+    ///      gets a test that fails loudly if the admin is ever widened.
+    function test_upgradeable_onlyAdminOwnerCanUpgrade() public {
+        URP next = new URP();
+        ProxyAdmin admin = ProxyAdmin(_urpAdmin());
+
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", makeAddr("stranger")));
+        admin.upgradeAndCall(ITransparentUpgradeableProxy(address(urp)), address(next), "");
+    }
+
+    /**
+     * @dev THE ONE THAT MATTERS. A mandate's spend counter is live money: it is what stops an agent
+     *      re-spending a budget. If an upgrade silently reinterpreted storage, `spent` would move
+     *      or reset and every existing mandate would be wrong in the attacker's favour.
+     *
+     *      Meters a real amount, upgrades, then asserts the counter and every anchor survived.
+     */
+    function test_upgradeable_storageSurvivesUpgrade() public {
+        _initDefault();
+        vm.prank(address(engine));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
+
+        uint256 spentBefore = _spent();
+        assertGt(spentBefore, 0, "the counter must have moved, or this test proves nothing");
+
+        URP next = new URP();
+        vm.prank(URP_ADMIN_OWNER);
+        ProxyAdmin(_urpAdmin()).upgradeAndCall(ITransparentUpgradeableProxy(address(urp)), address(next), "");
+
+        assertEq(_spent(), spentBefore, "spend counter survived the upgrade");
+        assertEq(urp.UNIVERSAL_GATEWAY_PC(), GATEWAY, "gateway anchor survived");
+        assertEq(urp.UNIVERSAL_EXECUTOR_MODULE(), EXECUTOR_MODULE, "executor anchor survived");
+        assertEq(urp.SESSION_ENGINE(), address(engine), "engine anchor survived");
+    }
+
+    /**
+     * @dev ⚠️ NEVER-DELETE. The storage layout is frozen for the life of the proxy; a reorder does
+     *      not fail the build, it reinterprets live mandates. If this test fails, the change is
+     *      almost certainly wrong — extend the list only for a genuine append.
+     */
+    function test_upgradeable_storageLayoutIsFrozen() public view {
+        string[] memory expected = new string[](6);
+        expected[0] = "UNIVERSAL_GATEWAY_PC";
+        expected[1] = "UNIVERSAL_EXECUTOR_MODULE";
+        expected[2] = "SESSION_ENGINE";
+        expected[3] = "$configs";
+        expected[4] = "$credited";
+        expected[5] = "__gap";
+
+        assertStorageLayout("URP", expected);
+    }
+
+    /// @dev TUP stores its admin in the ERC-1967 admin slot; it is created by the proxy's own
+    ///      constructor and is not returned anywhere, so it must be read from that slot.
+    function _urpAdmin() internal view returns (address) {
+        return address(uint160(uint256(vm.load(address(urp), ERC1967Utils.ADMIN_SLOT))));
     }
 
     /// The hand-hashed constant must equal the interface's own selector.
