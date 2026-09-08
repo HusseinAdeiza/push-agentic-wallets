@@ -1,0 +1,20 @@
+{
+  "network": "push-donut-testnet",
+  "chainId": 42101,
+  "explorer": "https://donut.push.network",
+  "note": "Push core infrastructure on Donut, and the PRC20 token registry. NOT deployed by this repo. Kept separate from push_agw_contracts.json and external_agw_libraries.json, which are the source of truth for our own deployment and are not reshaped. Flat name -> address map, matching sepolia.json.",
+  "UniversalGatewayPC": "0x00000000000000000000000000000000000000C1",
+  "UniversalCore": "0x00000000000000000000000000000000000000C0",
+  "UEAFactory": "0x00000000000000000000000000000000000000eA",
+  "PRC20_USDC": "0x7A58048036206bB898008b5bBDA85697DB1e5d66",
+  "evidence": {
+    "UniversalCore": "Returned by UniversalGatewayPC.universalCore(). Answers getOutboundTxGasAndFees.",
+    "UEAFactory": "The only probed address answering computeUEA((string,string,bytes)); its EIP-1967 implementation slot is distinct from the gateway's and UniversalCore's.",
+    "PRC20_USDC": "symbol() == 'USDC.eth' (NOT the deprecated 'USDC.eth.old' at 0x387b9C8D...), 6 decimals, quote resolves to eip155:11155111. Its quote's gasToken is the pETH PRC20 0x2971824D..., which cross-checks the token table."
+  },
+  "deprecated": {
+    "note": "Recorded so a stale address found in an older document is recognisable as stale rather than mistaken for live. Both still quote and still resolve to Sepolia, so choosing one fails SILENTLY. Never use these.",
+    "PRC20_USDC_old": "0x387b9C8Db60E74999aAAC5A2b7825b400F12d68E",
+    "PRC20_USDT_old": "0xCA0C5E6F002A389E1580F0DB7cd06e4549B5F9d3"
+  }
+}
