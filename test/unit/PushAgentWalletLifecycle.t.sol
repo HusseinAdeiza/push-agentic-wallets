@@ -9,8 +9,8 @@ import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
 import { ModeLib, ModeCode } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib, Execution } from "../../src/libraries/ExecutionLib.sol";
-import { IUCEP } from "../../src/interfaces/IUCEP.sol";
-import { UCEP } from "../../src/policies/UCEP.sol";
+import { IURP } from "../../src/interfaces/IURP.sol";
+import { URP } from "../../src/policies/URP.sol";
 import { Session, PermissionId, ConfigId, ActionData, PolicyData, ERC7739Context } from "smartsessions/DataTypes.sol";
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
 import { IdLib } from "smartsessions/lib/IdLib.sol";
@@ -20,7 +20,7 @@ import { IdLib } from "smartsessions/lib/IdLib.sol";
  *         grantMandate (§6.3) · stopMandate (§6.4) · stopAll (§6.5).
  *
  * @dev    grantMandate does EXACTLY TWO JOBS: the canonical-shape check, and the salt. Everything
- *         about UCEP's config CONTENTS is UCEP's own business and is deliberately untested here —
+ *         about URP's config CONTENTS is URP's own business and is deliberately untested here —
  *         Phase 1 covers it.
  */
 contract PushAgentWalletLifecycleTest is BaseTest {
@@ -40,9 +40,9 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         return address(uint160(uint256(keccak256(abi.encodePacked(label)))));
     }
 
-    function _ucepInitData() internal view returns (bytes memory) {
-        IUCEP.AllowedCall[] memory rules = new IUCEP.AllowedCall[](1);
-        rules[0] = IUCEP.AllowedCall({
+    function _urpInitData() internal view returns (bytes memory) {
+        IURP.AllowedCall[] memory rules = new IURP.AllowedCall[](1);
+        rules[0] = IURP.AllowedCall({
             target: _addr("farProtocol"),
             selector: bytes4(keccak256("swap(uint256,address)")),
             beneficiaryOffset: 36,
@@ -50,7 +50,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
             maxValue: 1 ether
         });
         return abi.encode(
-            IUCEP.Config({
+            IURP.Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 365 days),
                 destChainHash: keccak256("eip155:11155111"),
@@ -67,7 +67,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
 
     /// @dev THE canonical session — the only shape v3 permits.
     function _canonical() internal view returns (Session memory) {
-        return canonicalSession(ecdsaConfig(AGENT), _ucepInitData());
+        return canonicalSession(ecdsaConfig(AGENT), _urpInitData());
     }
 
     function _grant(Session memory s) internal returns (bytes32) {
@@ -100,7 +100,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
     function test_W24_Deviation_ExtraUserOpPolicy() public {
         Session memory s = _canonical();
         s.userOpPolicies = new PolicyData[](1);
-        s.userOpPolicies[0] = PolicyData({ policy: address(ucep), initData: "" });
+        s.userOpPolicies[0] = PolicyData({ policy: address(urp), initData: "" });
         _expectMalformed(s);
     }
 
@@ -113,7 +113,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
     function test_W24_Deviation_NonEmpty7739Policies() public {
         Session memory s = _canonical();
         s.erc7739Policies.erc1271Policies = new PolicyData[](1);
-        s.erc7739Policies.erc1271Policies[0] = PolicyData({ policy: address(ucep), initData: "" });
+        s.erc7739Policies.erc1271Policies[0] = PolicyData({ policy: address(urp), initData: "" });
         _expectMalformed(s);
     }
 
@@ -169,11 +169,11 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         _expectMalformed(s);
     }
 
-    /// A policy that is not UCEP — built with sessionWithPolicy, the harness helper that exists
+    /// A policy that is not URP — built with sessionWithPolicy, the harness helper that exists
     /// precisely so a negative test cannot accidentally use the canonical wiring.
     function test_W24_Deviation_WrongPolicyAddress() public {
-        UCEP otherUcep = new UCEP(GATEWAY, EXECUTOR_MODULE, address(engine));
-        Session memory s = sessionWithPolicy(address(otherUcep), ecdsaConfig(AGENT), _ucepInitData());
+        URP otherUrp = new URP(GATEWAY, EXECUTOR_MODULE, address(engine));
+        Session memory s = sessionWithPolicy(address(otherUrp), ecdsaConfig(AGENT), _urpInitData());
         _expectMalformed(s);
     }
 
@@ -220,20 +220,20 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         wallet.grantMandate(s);
     }
 
-    /// grantMandate does NOT validate UCEP's config CONTENTS — that is UCEP's own job, and it fails
-    /// closed at init. Here UCEP's init reverts on its own terms (zero asset), and the error that
-    /// surfaces is UCEP's, NOT MalformedSessionShape: proof the shape check did not overreach.
-    function test_W24_ShapeCheckDoesNotValidateUcepContents() public {
-        IUCEP.AllowedCall[] memory rules = new IUCEP.AllowedCall[](1);
-        rules[0] = IUCEP.AllowedCall({
+    /// grantMandate does NOT validate URP's config CONTENTS — that is URP's own job, and it fails
+    /// closed at init. Here URP's init reverts on its own terms (zero asset), and the error that
+    /// surfaces is URP's, NOT MalformedSessionShape: proof the shape check did not overreach.
+    function test_W24_ShapeCheckDoesNotValidateUrpContents() public {
+        IURP.AllowedCall[] memory rules = new IURP.AllowedCall[](1);
+        rules[0] = IURP.AllowedCall({
             target: _addr("p"), selector: bytes4(0x11223344), beneficiaryOffset: 0, hasBeneficiary: false, maxValue: 0
         });
-        IUCEP.Config memory bad = IUCEP.Config({
+        IURP.Config memory bad = IURP.Config({
             initialized: false,
             validUntil: uint48(block.timestamp + 1 days),
             destChainHash: bytes32(0),
             expectedCEA: _addr("cea"),
-            asset: address(0), // UCEP's own guard rejects this
+            asset: address(0), // URP's own guard rejects this
             maxAmountPerCall: 1,
             maxAmountTotal: 1,
             maxPCPerCall: 1,
@@ -242,13 +242,13 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         });
 
         Session memory s = canonicalSession(ecdsaConfig(AGENT), abi.encode(bad));
-        // UCEP's OWN error, surfacing through the engine — NOT MalformedSessionShape. Naming it is
+        // URP's OWN error, surfacing through the engine — NOT MalformedSessionShape. Naming it is
         // the whole point of this test: it proves the shape check did not overreach into term
-        // validation. UCEP reverts during initializeWithMultiplexer, which the engine does not
+        // validation. URP reverts during initializeWithMultiplexer, which the engine does not
         // rewrap (the 32-byte PolicyCheckReverted rewrap is on the checkAction path), so this
         // arrives as itself.
         vm.prank(WALLET_OWNER);
-        vm.expectRevert(IUCEP.InvalidConfigField.selector);
+        vm.expectRevert(IURP.InvalidConfigField.selector);
         wallet.grantMandate(s);
     }
 
@@ -392,7 +392,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
      * W-10 — THE CANONICAL PERMISSION-CHANGE FLOW, in ONE owner signature, ONE execute batch.
      *
      * There is no "reconfigure". Change is atomic revoke-and-regrant:
-     *     UCEP.assertSpent(old) -> stopMandate(old) -> grantMandate(new) -> approval payload
+     *     URP.assertSpent(old) -> stopMandate(old) -> grantMandate(new) -> approval payload
      *
      * The two lifecycle legs target the WALLET, so they arrive with `msg.sender == address(this)`
      * and reach `onlyOwnerOrSelf`. That modifier exists for exactly this batch (ruling A).
@@ -428,9 +428,9 @@ contract PushAgentWalletLifecycleTest is BaseTest {
     {
         batch = new Execution[](4);
         batch[0] = Execution({
-            target: address(ucep),
+            target: address(urp),
             value: 0,
-            callData: abi.encodeCall(UCEP.assertSpent, (ConfigId.wrap(configId), address(wallet), believedSpent))
+            callData: abi.encodeCall(URP.assertSpent, (ConfigId.wrap(configId), address(wallet), believedSpent))
         });
         batch[1] = Execution({
             target: address(wallet), value: 0, callData: abi.encodeCall(PushAgentWallet.stopMandate, (oldPid))
@@ -459,7 +459,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         Execution[] memory batch = _changeBatch(configId, oldPid, 5 ether, token);
 
         vm.prank(WALLET_OWNER);
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.SpentMismatch.selector, uint256(5 ether), uint256(0)));
+        vm.expectRevert(abi.encodeWithSelector(IURP.SpentMismatch.selector, uint256(5 ether), uint256(0)));
         wallet.execute(ModeCode.unwrap(ModeLib.encodeSimpleBatch()), ExecutionLib.encodeBatch(batch));
 
         assertTrue(engine.isPermissionEnabled(PermissionId.wrap(oldPid), address(wallet)), "old permission INTACT");
@@ -546,7 +546,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
      * U-19 (deferred from Phase 1 — it needed removeSession on a real wallet).
      *
      * Configs are NEVER deleted. Upstream `removeSession` is pure storage deletion on the engine's
-     * side and calls no policy de-init, so a revoked permission's UCEP config persists as inert
+     * side and calls no policy de-init, so a revoked permission's URP config persists as inert
      * orphan data. This is HARMLESS AND DOCUMENTED, not a leak to "fix": the permission id can
      * never validate again, so the orphan config is unreachable through the agent door.
      *
@@ -558,8 +558,8 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         bytes32 configId = _configIdFor(pid);
 
         // the config exists and is initialised
-        IUCEP.Config memory before = ucep.getConfig(ConfigId.wrap(configId), address(wallet));
-        assertTrue(before.initialized, "UCEP config written during the grant");
+        IURP.Config memory before = urp.getConfig(ConfigId.wrap(configId), address(wallet));
+        assertTrue(before.initialized, "URP config written during the grant");
         assertEq(before.asset, _addr("prc20"), "and carries the terms");
 
         vm.prank(WALLET_OWNER);
@@ -569,7 +569,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         assertFalse(engine.isPermissionEnabled(PermissionId.wrap(pid), address(wallet)), "permission gone");
 
         // ...but the config PERSISTS and getConfig still reads it
-        IUCEP.Config memory orphan = ucep.getConfig(ConfigId.wrap(configId), address(wallet));
+        IURP.Config memory orphan = urp.getConfig(ConfigId.wrap(configId), address(wallet));
         assertTrue(orphan.initialized, "the config persists as inert orphan data");
         assertEq(orphan.asset, before.asset, "unchanged");
         assertEq(orphan.maxAmountTotal, before.maxAmountTotal, "unchanged");
@@ -577,13 +577,13 @@ contract PushAgentWalletLifecycleTest is BaseTest {
 
         // and a late credit still lands on it, harmlessly
         vm.prank(EXECUTOR_MODULE);
-        ucep.creditRevert(ConfigId.wrap(configId), address(wallet), keccak256("late"), 1 ether);
-        assertEq(ucep.getConfig(ConfigId.wrap(configId), address(wallet)).spent, 0, "saturated, harmless");
+        urp.creditRevert(ConfigId.wrap(configId), address(wallet), keccak256("late"), 1 ether);
+        assertEq(urp.getConfig(ConfigId.wrap(configId), address(wallet)).spent, 0, "saturated, harmless");
 
         // The orphan is NOT reusable: re-initialising that config id is refused.
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.AlreadyInitialized.selector, ConfigId.wrap(configId)));
-        ucep.initializeWithMultiplexer(address(wallet), ConfigId.wrap(configId), _ucepInitData());
+        vm.expectRevert(abi.encodeWithSelector(IURP.AlreadyInitialized.selector, ConfigId.wrap(configId)));
+        urp.initializeWithMultiplexer(address(wallet), ConfigId.wrap(configId), _urpInitData());
     }
 }
 

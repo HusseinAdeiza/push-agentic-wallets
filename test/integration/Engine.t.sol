@@ -8,8 +8,8 @@ import { MockUniversalGateway, MockPRC20 } from "../mocks/MockUniversalGateway.s
 
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
-import { IUCEP } from "../../src/interfaces/IUCEP.sol";
-import { UCEP } from "../../src/policies/UCEP.sol";
+import { IURP } from "../../src/interfaces/IURP.sol";
+import { URP } from "../../src/policies/URP.sol";
 import { ModeLib, ModeCode } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib } from "../../src/libraries/ExecutionLib.sol";
 import { Multicall } from "../../src/libraries/PushWalletTypes.sol";
@@ -77,9 +77,9 @@ contract EngineTest is BaseTest {
 
     // ─────────────────────────────── fixtures ───────────────────────────────
 
-    function _ucepConfig() internal view returns (bytes memory) {
-        IUCEP.AllowedCall[] memory rules = new IUCEP.AllowedCall[](1);
-        rules[0] = IUCEP.AllowedCall({
+    function _urpConfig() internal view returns (bytes memory) {
+        IURP.AllowedCall[] memory rules = new IURP.AllowedCall[](1);
+        rules[0] = IURP.AllowedCall({
             target: PROTOCOL,
             selector: SUPPLY_SELECTOR,
             beneficiaryOffset: BENEFICIARY_OFFSET,
@@ -87,7 +87,7 @@ contract EngineTest is BaseTest {
             maxValue: 0
         });
         return abi.encode(
-            IUCEP.Config({
+            IURP.Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 30 days),
                 destChainHash: keccak256("eip155:1"),
@@ -145,7 +145,7 @@ contract EngineTest is BaseTest {
 
     function _grant(address signer) internal returns (bytes32) {
         vm.prank(WALLET_OWNER);
-        return wallet.grantMandate(canonicalSession(ecdsaConfig(signer), _ucepConfig()));
+        return wallet.grantMandate(canonicalSession(ecdsaConfig(signer), _urpConfig()));
     }
 
     // ═══════════════════════════════════ S-01 ═══════════════════════════════════
@@ -221,7 +221,7 @@ contract EngineTest is BaseTest {
      *      the ENABLE-path refusal rather than a malformed-input refusal.
      */
     function _enableBody(SmartSessionMode mode) internal view returns (bytes memory) {
-        Session memory toEnable = canonicalSession(ecdsaConfig(agentAddr), _ucepConfig());
+        Session memory toEnable = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
         toEnable.salt = bytes32(uint256(0x5001));
 
         // The REAL digest for this session, from the engine itself. A zero digest fails the
@@ -255,39 +255,39 @@ contract EngineTest is BaseTest {
         assertTrue(engine.isPermissionEnabled(PermissionId.wrap(pid), address(wallet)), "canonical grants");
 
         // RULE 2 — nothing in the zero-floor policy class
-        Session memory s1 = canonicalSession(ecdsaConfig(agentAddr), _ucepConfig());
+        Session memory s1 = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
         s1.userOpPolicies = new PolicyData[](1);
-        s1.userOpPolicies[0] = PolicyData({ policy: address(ucep), initData: "" });
+        s1.userOpPolicies[0] = PolicyData({ policy: address(urp), initData: "" });
         _expectShape(s1);
 
         // RULE 1 — no wildcard/fallback action: exactly one action
-        Session memory s2 = canonicalSession(ecdsaConfig(agentAddr), _ucepConfig());
+        Session memory s2 = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
         ActionData[] memory two = new ActionData[](2);
         two[0] = s2.actions[0];
         two[1] = s2.actions[0];
         s2.actions = two;
         _expectShape(s2);
 
-        // RULE 4 — UCEP is the SOLE action policy (the fail-closed anchor)
-        Session memory s3 = canonicalSession(ecdsaConfig(agentAddr), _ucepConfig());
+        // RULE 4 — URP is the SOLE action policy (the fail-closed anchor)
+        Session memory s3 = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
         s3.actions[0].actionPolicies = new PolicyData[](0);
         _expectShape(s3);
 
-        UCEP other = new UCEP(GATEWAY, EXECUTOR_MODULE, address(engine));
-        _expectShape(sessionWithPolicy(address(other), ecdsaConfig(agentAddr), _ucepConfig()));
+        URP other = new URP(GATEWAY, EXECUTOR_MODULE, address(engine));
+        _expectShape(sessionWithPolicy(address(other), ecdsaConfig(agentAddr), _urpConfig()));
 
         // RULE 5 — the paymaster flag is always false
-        Session memory s4 = canonicalSession(ecdsaConfig(agentAddr), _ucepConfig());
+        Session memory s4 = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
         s4.permitERC4337Paymaster = true;
         _expectShape(s4);
 
         // the 7739 path stays walled
-        Session memory s5 = canonicalSession(ecdsaConfig(agentAddr), _ucepConfig());
+        Session memory s5 = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
         s5.erc7739Policies.allowedERC7739Content = new ERC7739Context[](1);
         _expectShape(s5);
 
         // and the validator is pinned
-        Session memory s6 = canonicalSession(ecdsaConfig(agentAddr), _ucepConfig());
+        Session memory s6 = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
         s6.sessionValidator = ISessionValidator(makeAddr("notOurValidator"));
         _expectShape(s6);
     }
@@ -308,13 +308,13 @@ contract EngineTest is BaseTest {
      * If the order were reversed the signature error would surface instead.
      *
      * The consequence every future policy inherits: policies run on calldata from an arbitrary
-     * caller that has not been authenticated. UCEP is safe by construction — no external calls,
+     * caller that has not been authenticated. URP is safe by construction — no external calls,
      * effects last, revert on every failure.
      */
     function test_S03_SignatureVerifiedLast() public {
         bytes32 pid = _grant(agentAddr);
 
-        // A payload that violates UCEP gate 15 (beneficiary is the agent, not the CEA)...
+        // A payload that violates URP gate 15 (beneficiary is the agent, not the CEA)...
         bytes memory badPayload = _ecd(CAP, agentAddr);
 
         // ...signed by a key that is NOT the mandate's signer, so the signature is invalid too.
@@ -323,7 +323,7 @@ contract EngineTest is BaseTest {
 
         // The POLICY error surfaces — proving the gauntlet ran BEFORE the signature was checked.
         vm.prank(RELAYER);
-        expectUcepGate(abi.encodeWithSelector(IUCEP.BeneficiaryMismatch.selector, CEA, agentAddr));
+        expectUrpGate(abi.encodeWithSelector(IURP.BeneficiaryMismatch.selector, CEA, agentAddr));
         wallet.executeWithSession(address(engine), _mode(), badPayload, badSig, 0, 0, 0);
 
         // CONTROL: with a VALID payload, the same invalid signature is what fails — so the policy
@@ -339,15 +339,15 @@ contract EngineTest is BaseTest {
     // ═══════════════════════════════════ S-04 ═══════════════════════════════════
 
     /**
-     * S-04 — THE ENGINE'S FLOORS. A session stripped of UCEP validates NOTHING.
+     * S-04 — THE ENGINE'S FLOORS. A session stripped of URP validates NOTHING.
      *
      * This is the fail-closed anchor of the whole design: the engine requires a minimum of one
-     * action policy (`SmartSession.sol:285,299,334`), and UCEP is the only one v3 ever attaches.
+     * action policy (`SmartSession.sol:285,299,334`), and URP is the only one v3 ever attaches.
      * Strip it and every request dies — rather than passing unchecked.
      */
     function test_S04_EngineFloors() public {
         // The wallet's shape check refuses a zero-policy grant outright...
-        Session memory stripped = canonicalSession(ecdsaConfig(agentAddr), _ucepConfig());
+        Session memory stripped = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
         stripped.actions[0].actionPolicies = new PolicyData[](0);
         _expectShape(stripped);
 

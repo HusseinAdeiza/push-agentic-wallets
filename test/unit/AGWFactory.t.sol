@@ -542,7 +542,7 @@ contract AGWFactoryTest is BaseTest {
     /// A second factory proxy is a NEW ADDRESS SPACE. This documents the ruled versioning model:
     /// a new wallet implementation ships as a brand-new factory, never as a setter.
     function test_T12_SecondFactory_NewAddressSpace() public {
-        PushAgentWallet implV2 = new PushAgentWallet(address(engine), address(ucep), address(validator), GATEWAY);
+        PushAgentWallet implV2 = new PushAgentWallet(address(engine), address(urp), address(validator), GATEWAY);
         AGWFactory f2 = _freshFactory(address(implV2));
 
         address owner = makeAddr("twoFactoryOwner");

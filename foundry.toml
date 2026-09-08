@@ -15,7 +15,7 @@ optimizer = true
 # our gas profile. Do not raise this without re-checking `forge build --sizes`.
 optimizer_runs = 833
 auto_detect_solc = false
-# cancun is REQUIRED: UCEP's _slice helper uses MCOPY. Lowering this breaks the
+# cancun is REQUIRED: URP's _slice helper uses MCOPY. Lowering this breaks the
 # build at deploy time rather than at compile time.
 evm_version = "cancun"
 via_ir = true

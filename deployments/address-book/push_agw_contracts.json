@@ -39,9 +39,9 @@
       "verified": true,
       "note": "Clone template. Every wallet is a minimal clone of this with 40 bytes of immutable args (owner 0-19, factory 20-39)."
     },
-    "ucep": {
+    "urp": {
       "address": "0x79F07D379BdC26468E48025a61bC955909522c1D",
-      "contract": "UCEP",
+      "contract": "URP",
       "txHash": "0x27948df316e91f8c78eb1a79d7d632c0de7a74f59cb81b44cf799fd1c0ffce00",
       "runtimeSize": 6833,
       "verified": true,

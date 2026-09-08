@@ -6,7 +6,7 @@ import { ConfigId } from "smartsessions/DataTypes.sol";
 import { IActionPolicy, IPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { IERC165 } from "forge-std/interfaces/IERC165.sol";
 
-import { IUCEP } from "../interfaces/IUCEP.sol";
+import { IURP } from "../interfaces/IURP.sol";
 import {
     UniversalOutboundTxRequest,
     Multicall,
@@ -15,7 +15,7 @@ import {
 } from "../libraries/PushWalletTypes.sol";
 
 /**
- * @title  UCEP — Universal CrossChain Execution Policy
+ * @title  URP — Universal Rules Policy
  * @notice The security boundary of the whole system: the only contract that ever inspects what an
  *         agent really does on the far chain. Everything else routes, stores, or signs.
  *
@@ -30,7 +30,7 @@ import {
  *           trust anchors.
  *         - It never makes an external call, and writes only after every gate has passed.
  */
-contract UCEP is IUCEP {
+contract URP is IURP {
     /// @dev Maximum inner calls in one request. Bounds the gate-13 loop.
     uint256 internal constant MAX_ACTIONS_PER_REQUEST = 10;
 
@@ -110,7 +110,7 @@ contract UCEP is IUCEP {
      *           protocol must ship a test rejecting a wrong beneficiary and an oversized amount.
      *         - Anyone may call this with themselves as the multiplexer; that writes into their own
      *           keyed slice and the engine never reads it.
-     *         - Writes the config, sets the initialised flag, and emits `UCEPPolicySet` and
+     *         - Writes the config, sets the initialised flag, and emits `URPPolicySet` and
      *           `PolicySet`.
      *
      * @param  account   The wallet this config belongs to.
@@ -135,7 +135,7 @@ contract UCEP is IUCEP {
         _store(cfg, incoming);
         cfg.initialized = true;
 
-        emit UCEPPolicySet(configId, msg.sender, account);
+        emit URPPolicySet(configId, msg.sender, account);
         emit PolicySet(configId, msg.sender, account);
     }
 

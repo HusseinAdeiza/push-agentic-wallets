@@ -5,7 +5,7 @@ import { IActionPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { ConfigId } from "smartsessions/DataTypes.sol";
 
 /**
- * @title  IUCEP — the Universal CrossChain Execution Policy's v3 surface.
+ * @title  IURP — the Universal Rules Policy's v3 surface.
  * @notice The engine-facing functions (`initializeWithMultiplexer`, `checkAction`) and
  *         `supportsInterface` are INHERITED from upstream `IActionPolicy`, never repeated here.
  *         Duplicating a signature across a trust boundary is the drift this project removes.
@@ -19,10 +19,10 @@ import { ConfigId } from "smartsessions/DataTypes.sol";
  * @dev    Revert data truncates to 32 bytes through the engine (`PolicyLib.sol:139-152`,
  *         `_maxCopy: 32`, surfacing as `PolicyCheckReverted(bytes32)`). The 4-byte selector
  *         survives; multi-argument custom errors do not round-trip to the caller. Errors below
- *         still carry their arguments because UCEP is also called directly (owner path,
+ *         still carry their arguments because URP is also called directly (owner path,
  *         executor module) where they do survive.
  */
-interface IUCEP is IActionPolicy {
+interface IURP is IActionPolicy {
     // ──────────────────────────────── structs ────────────────────────────────
 
     /// @param target            far-chain contract
@@ -63,7 +63,7 @@ interface IUCEP is IActionPolicy {
 
     // ──────────────────────────────── events ────────────────────────────────
 
-    event UCEPPolicySet(ConfigId indexed id, address indexed multiplexer, address indexed account);
+    event URPPolicySet(ConfigId indexed id, address indexed multiplexer, address indexed account);
     event OutboundMetered(ConfigId indexed id, address indexed multiplexer, address indexed account, uint256 amount);
     event RevertCredited(
         bytes32 indexed outboundTxId, ConfigId indexed id, address indexed account, uint256 amountApplied

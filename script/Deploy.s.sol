@@ -8,7 +8,7 @@ import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy
 
 import { SmartSession } from "smartsessions/SmartSession.sol";
 import { PushSessionValidator } from "../src/validators/PushSessionValidator.sol";
-import { UCEP } from "../src/policies/UCEP.sol";
+import { URP } from "../src/policies/URP.sol";
 import { PushAgentWallet } from "../src/PushAgentWallet.sol";
 import { AGWFactory } from "../src/AGWFactory.sol";
 
@@ -18,8 +18,8 @@ import { AGWFactory } from "../src/AGWFactory.sol";
  * @dev    THE ORDER IS A DEPENDENCY GRAPH, not a preference. Each step consumes only addresses
  *         recorded by earlier steps:
  *
- *           engine -> validator -> UCEP (needs engine)
- *                  -> wallet implementation (needs engine, UCEP, validator, gateway)
+ *           engine -> validator -> URP (needs engine)
+ *                  -> wallet implementation (needs engine, URP, validator, gateway)
  *                  -> factory (needs the wallet implementation)
  *
  *         The validator has no on-chain dependencies and could go first; it is second only to keep
@@ -80,13 +80,13 @@ contract Deploy is Script {
         // 2 · PushSessionValidator — stateless; never installed, only named inside each permission.
         PushSessionValidator validator = new PushSessionValidator();
 
-        // 3 · UCEP — three constructor args. The engine is a STATED dependency here, not a
-        //     coincidence of ordering: UCEP keys its storage on a SESSION_ENGINE immutable.
-        UCEP ucep = new UCEP(gatewayPC, executorModule, address(engine));
+        // 3 · URP — three constructor args. The engine is a STATED dependency here, not a
+        //     coincidence of ordering: URP keys its storage on a SESSION_ENGINE immutable.
+        URP urp = new URP(gatewayPC, executorModule, address(engine));
 
         // 4 · The wallet implementation. Its constructor rejects any zero.
         PushAgentWallet walletImplementation =
-            new PushAgentWallet(address(engine), address(ucep), address(validator), gatewayPC);
+            new PushAgentWallet(address(engine), address(urp), address(validator), gatewayPC);
 
         // 5 · The factory: logic + proxy, initialised in the SAME transaction so no initialisation
         //     front-run window exists. THE PROXY ADDRESS IS PERMANENT and user-facing.
@@ -101,7 +101,7 @@ contract Deploy is Script {
             chainId,
             address(engine),
             address(validator),
-            address(ucep),
+            address(urp),
             gatewayPC,
             executorModule,
             address(walletImplementation),
@@ -120,7 +120,7 @@ contract Deploy is Script {
         uint256 chainId,
         address sessionEngine,
         address sessionValidator,
-        address ucep,
+        address urp,
         address universalGateway,
         address universalExecutorModule,
         address walletImplementation,
@@ -134,7 +134,7 @@ contract Deploy is Script {
         vm.serializeString(obj, "engineForkCommit", ENGINE_FORK_COMMIT);
         vm.serializeAddress(obj, "sessionEngine", sessionEngine);
         vm.serializeAddress(obj, "sessionValidator", sessionValidator);
-        vm.serializeAddress(obj, "ucep", ucep);
+        vm.serializeAddress(obj, "urp", urp);
         vm.serializeAddress(obj, "universalGateway", universalGateway);
         vm.serializeAddress(obj, "universalExecutorModule", universalExecutorModule);
         vm.serializeAddress(obj, "walletImplementation", walletImplementation);

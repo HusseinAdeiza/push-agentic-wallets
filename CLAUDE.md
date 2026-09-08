@@ -27,9 +27,9 @@ rest on a reporting default that has already changed once.
 Narrower runs:
 
 ```
-forge test --match-path test/unit/UCEP.t.sol -vv
+forge test --match-path test/unit/URP.t.sol -vv
 forge test --match-test test_U09_ -vvv           # one test, full traces
-forge test --match-contract UCEPTest
+forge test --match-contract URPTest
 forge coverage --ir-minimum                       # via_ir is on; plain coverage will not compile
 forge test --gas-report
 ```
@@ -60,7 +60,7 @@ action is checked by contracts at execution time; the agent's honesty is never a
 **The one hard problem.** Push Chain reaches other chains through a single frozen gateway function, so every
 agent action — a trade, a deposit, a theft — is the *same* Push-side call: the wallet calling
 `sendUniversalTxOutbound`. To the permission engine they are indistinguishable. Everything the user cares
-about lives inside the payload, two decode levels down. **UCEP is the contract that opens that payload.**
+about lives inside the payload, two decode levels down. **URP is the contract that opens that payload.**
 
 ### Five contracts
 
@@ -68,7 +68,7 @@ about lives inside the payload, two decode levels down. **UCEP is the contract t
 |---|---|
 | `AGWFactory` (`src/`) | UUPS proxy. Deploys wallet clones at pre-computable addresses; the registry of record for "is this a real wallet, and who owns it?" The caller is always the owner — there is no owner parameter. |
 | `PushAgentWallet` (`src/`) | Holds funds. Minimal clone with 40 bytes of immutable args (owner 0–19, factory 20–39). Push Chain has no ERC-4337 EntryPoint, so the wallet does the EntryPoint's jobs itself. |
-| `UCEP` (`src/policies/`) | The only novel contract and the security boundary. Sixteen gates, in normative order, fail closed. |
+| `URP` (`src/policies/`) | The only novel contract and the security boundary. Sixteen gates, in normative order, fail closed. |
 | `PushSessionValidator` (`src/validators/`) | Stateless signature check: secp256k1, or Ed25519 via a raw `staticcall` to the USV precompile. |
 | `SmartSession` (`lib/smartsessions/`) | Adopted unmodified. Stores mandates, runs policies, deletes on revoke. The wallet's only installed module. |
 
@@ -80,16 +80,16 @@ about lives inside the payload, two decode levels down. **UCEP is the contract t
   any check is the catastrophic regression. `executeWithSession` (agent door) is permissionless — signature,
   nonce and bound op-hash are the authority, never the caller.
 - **`execute(bytes32,bytes)` is a frozen signature.** The engine branches on this selector; any other shape
-  routes validation to a path where UCEP's value gate sees a hardcoded zero instead of the real value.
+  routes validation to a path where URP's value gate sees a hardcoded zero instead of the real value.
 - **The ten-field operation hash** (`_computeOpHash`) uses `abi.encode`, never `encodePacked`. Fields 5
   (permissionId) and 10 (requestExpiry) are v3 additions over shipped v2's eight; regressing to eight is
   forbidden. Field 5 is what makes a banked signed request die on regrant.
 - **`grantMandate` enforces the canonical session shape and nothing else** — the skeleton, not the organs.
-  Term validation is UCEP's own init guards. Its monotonic `_grantNonce` becomes the session salt, so every
+  Term validation is URP's own init guards. Its monotonic `_grantNonce` becomes the session salt, so every
   grant yields a distinct permission id that never recurs.
 - **`stopMandate` / `stopAll` must have nothing on them that can fail.** No guard, no probe, no extra
   external call. Blockable revocation is the one regression these functions can develop.
-- **UCEP's `checkAction` makes no external calls.** It runs *before* the session signature is verified, on
+- **URP's `checkAction` makes no external calls.** It runs *before* the session signature is verified, on
   unauthenticated calldata from an arbitrary caller; its safety rests on having no external calls, all
   effects last, and reverting on every failure. Do not wrap its `abi.decode` in `try/catch` to name an
   error — that introduces the external call the argument forbids.
@@ -106,15 +106,15 @@ about lives inside the payload, two decode levels down. **UCEP is the contract t
 
 - `SEND_OUTBOUND_SELECTOR` and `MULTICALL_SELECTOR` are declared **once**, in
   `src/libraries/PushWalletTypes.sol`, beside the struct mirrors they derive from. The wallet's grant-shape
-  check and UCEP's request gate both read from there so they cannot disagree. `PushWalletTypes` is the
+  check and URP's request gate both read from there so they cannot disagree. `PushWalletTypes` is the
   authoritative mirror of the gateway's frozen structs — reordering a field silently breaks the selector.
-- UCEP's config is keyed `configId => multiplexer => account`. `ConfigId` already binds account and
-  permission (see the derivation chain in UCEP's storage comment — note it mixes `abi.encode` and
+- URP's config is keyed `configId => multiplexer => account`. `ConfigId` already binds account and
+  permission (see the derivation chain in URP's storage comment — note it mixes `abi.encode` and
   `abi.encodePacked` across levels; an SDK that assumes one throughout derives every id wrong). The middle
   level isolates *callers*: `msg.sender` on the two engine-driven entry points, the `SESSION_ENGINE`
   immutable everywhere else.
 - The engine truncates policy revert data to 32 bytes and rewraps it as `PolicyCheckReverted(bytes32)`. Use
-  `BaseTest.expectUcepGate(...)` so negative tests name *which* gate fired; never hand-encode this.
+  `BaseTest.expectUrpGate(...)` so negative tests name *which* gate fired; never hand-encode this.
 
 ## Standing build rules
 
@@ -135,7 +135,7 @@ about lives inside the payload, two decode levels down. **UCEP is the contract t
 
 ## Standing test rules
 
-1. **Every negative test names its expected error.** Two documented exceptions only: UCEP gate 4 case (d)
+1. **Every negative test names its expected error.** Two documented exceptions only: URP gate 4 case (d)
    (correct-length, malformed-offset body) and validator P-05 — both assert "reverts" because both fail at
    the same un-named `abi.decode` step.
 2. **A mock may be the OBSERVER, never the ORACLE.** A mock that supplies the behaviour under test can make
@@ -154,7 +154,7 @@ about lives inside the payload, two decode levels down. **UCEP is the contract t
 
 ## Test harness
 
-Every suite extends `BaseTest` (`test/Base.t.sol`), which deploys the real engine, validator, UCEP, wallet
+Every suite extends `BaseTest` (`test/Base.t.sol`), which deploys the real engine, validator, URP, wallet
 implementation and an ERC-1967 factory proxy, then hands out wallets via `newWallet(owner)` — the real
 `deployWallet` path, not a simulated factory. It also carries the canonical session builder, the outbound
 request builder, the gate-naming helper, the USV observers and the call recorder. Test ids (`T-`, `W-`,
@@ -177,7 +177,7 @@ request builder, the gate-naming helper, the USV observers and the call recorder
   move bytecode.
 
 **`optimizer_runs` and `evm_version` are load-bearing.** The vendored engine exceeds EIP-170 above ~833 runs
-and becomes undeployable; `cancun` is required for `MCOPY` in UCEP's `_slice` helper. A local `anvil` deploy
+and becomes undeployable; `cancun` is required for `MCOPY` in URP's `_slice` helper. A local `anvil` deploy
 will not catch the size problem — anvil does not enforce EIP-170.
 
 `fs_permissions` grants read access to `out/` and write access to `deployments/`. Both are required, not
@@ -188,9 +188,9 @@ conveniences: the artifact-based storage-layout and selector-set assertions depe
 | Path | Contents |
 |---|---|
 | `src/` (root) | `PushAgentWallet.sol`, `AGWFactory.sol` |
-| `src/policies/` | `UCEP.sol` |
+| `src/policies/` | `URP.sol` |
 | `src/validators/` | `PushSessionValidator.sol` |
-| `src/interfaces/` | `IUCEP`, `IPushSessionValidator`, `IAGWFactory`, `IPushAgentWallet`, `IPushAgentWalletInit`, gateway + module interfaces |
+| `src/interfaces/` | `IURP`, `IPushSessionValidator`, `IAGWFactory`, `IPushAgentWallet`, `IPushAgentWalletInit`, gateway + module interfaces |
 | `src/libraries/` | `PushWalletTypes` (authoritative gateway struct mirror), `ModeLib`, `ExecutionLib`, `PushWalletErrors` |
 | `test/Base.t.sol` | Shared harness — every suite extends `BaseTest` |
 | `test/unit/`, `test/integration/`, `test/mocks/` | Per-contract suites, end-to-end flows, observers |
@@ -203,7 +203,7 @@ conveniences: the artifact-based storage-layout and selector-set assertions depe
 | Phase | Deliverable |
 |---|---|
 | 0 | Baseline: build green, harness, size gate |
-| 1 | `UCEP` |
+| 1 | `URP` |
 | 2 | `PushSessionValidator` — `validateConfig` addition + full suite |
 | 3 | `PushAgentWallet` |
 | 4 | `AGWFactory` |

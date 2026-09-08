@@ -18,7 +18,7 @@ import {
     MODE_DEFAULT
 } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib, Execution } from "../../src/libraries/ExecutionLib.sol";
-import { IUCEP } from "../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../src/interfaces/IURP.sol";
 import { IERC7579Account } from "erc7579/interfaces/IERC7579Account.sol";
 import { Session, PermissionId } from "smartsessions/DataTypes.sol";
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
@@ -64,7 +64,7 @@ contract PushAgentWalletTest is BaseTest {
         return ExecutionLib.encodeSingle(target, value, data);
     }
 
-    /// @dev A gateway-shaped call — the owner composing an outbound request freely (no UCEP pin).
+    /// @dev A gateway-shaped call — the owner composing an outbound request freely (no URP pin).
     function _gatewayShapedCalldata() internal view returns (bytes memory) {
         return _singleCalldata(GATEWAY, 0, abi.encodeWithSelector(SEND_OUTBOUND_SELECTOR, ""));
     }
@@ -73,17 +73,17 @@ contract PushAgentWalletTest is BaseTest {
     ///      engine because grantMandate was a placeholder; 3b switched it, per the instruction.)
     function _grant(PushAgentWallet w, address agentKey) internal returns (bytes32 pid) {
         vm.prank(WALLET_OWNER);
-        return w.grantMandate(canonicalSession(ecdsaConfig(agentKey), _ucepInitData()));
+        return w.grantMandate(canonicalSession(ecdsaConfig(agentKey), _urpInitData()));
     }
 
     function _grant(PushAgentWallet w) internal returns (bytes32) {
         return _grant(w, AGENT);
     }
 
-    /// @dev A minimal valid UCEP config, so enableSessions' policy init succeeds.
-    function _ucepInitData() internal view returns (bytes memory) {
-        IUCEP.AllowedCall[] memory rules = new IUCEP.AllowedCall[](1);
-        rules[0] = IUCEP.AllowedCall({
+    /// @dev A minimal valid URP config, so enableSessions' policy init succeeds.
+    function _urpInitData() internal view returns (bytes memory) {
+        IURP.AllowedCall[] memory rules = new IURP.AllowedCall[](1);
+        rules[0] = IURP.AllowedCall({
             target: _addr("farProtocol"),
             selector: bytes4(keccak256("swap(uint256,address)")),
             beneficiaryOffset: 36,
@@ -91,7 +91,7 @@ contract PushAgentWalletTest is BaseTest {
             maxValue: 1 ether
         });
         return abi.encode(
-            IUCEP.Config({
+            IURP.Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 365 days),
                 destChainHash: keccak256("eip155:11155111"),
@@ -175,7 +175,7 @@ contract PushAgentWalletTest is BaseTest {
         w.execute(_singleMode(), _singleCalldata(sink, 1 ether, ""));
         assertEq(sink.balance, before + 1 ether, string.concat(cell, ": single transfer"));
 
-        // (b) SINGLE — a gateway-shaped call. The owner composes outbound requests freely; no UCEP
+        // (b) SINGLE — a gateway-shaped call. The owner composes outbound requests freely; no URP
         //     pin applies on this door.
         etchCallRecorder(GATEWAY);
         vm.store(GATEWAY, bytes32(uint256(0)), bytes32(0));
@@ -651,7 +651,7 @@ contract PushAgentWalletTest is BaseTest {
         expected[i++] = PushAgentWallet.grantNonce.selector;
         expected[i++] = PushAgentWallet.accountId.selector;
         expected[i++] = PushAgentWallet.sessionEngine.selector;
-        expected[i++] = PushAgentWallet.ucep.selector;
+        expected[i++] = PushAgentWallet.urp.selector;
         expected[i++] = PushAgentWallet.sessionValidator.selector;
         expected[i++] = PushAgentWallet.universalGateway.selector;
         // reception plumbing
@@ -715,28 +715,28 @@ contract PushAgentWalletTest is BaseTest {
     function test_W27_Immutables_SetAndReadableByClones() public {
         // (a) every zero constructor argument reverts
         vm.expectRevert(PushWalletErrors.InvalidModuleAddress.selector);
-        new PushAgentWallet(address(0), address(ucep), address(validator), GATEWAY);
+        new PushAgentWallet(address(0), address(urp), address(validator), GATEWAY);
         vm.expectRevert(PushWalletErrors.InvalidModuleAddress.selector);
         new PushAgentWallet(address(engine), address(0), address(validator), GATEWAY);
         vm.expectRevert(PushWalletErrors.InvalidModuleAddress.selector);
-        new PushAgentWallet(address(engine), address(ucep), address(0), GATEWAY);
+        new PushAgentWallet(address(engine), address(urp), address(0), GATEWAY);
         vm.expectRevert(PushWalletErrors.InvalidModuleAddress.selector);
-        new PushAgentWallet(address(engine), address(ucep), address(validator), address(0));
+        new PushAgentWallet(address(engine), address(urp), address(validator), address(0));
 
         // (b) a deployed CLONE returns all four through its views — proving immutables resolve
         //     through delegatecall from the implementation's own bytecode
         assertEq(wallet.sessionEngine(), address(engine), "engine");
-        assertEq(wallet.ucep(), address(ucep), "ucep");
+        assertEq(wallet.urp(), address(urp), "urp");
         assertEq(wallet.sessionValidator(), address(validator), "validator");
         assertEq(wallet.universalGateway(), GATEWAY, "gateway");
 
         // (c) two implementations wired DIFFERENTLY produce clones that behave differently —
         //     the values are not shared state
         address altEngine = makeAddr("altEngine");
-        address altUcep = makeAddr("altUcep");
+        address altUrp = makeAddr("altUrp");
         address altValidator = makeAddr("altValidator");
         address altGateway = makeAddr("altGateway");
-        PushAgentWallet altImpl = new PushAgentWallet(altEngine, altUcep, altValidator, altGateway);
+        PushAgentWallet altImpl = new PushAgentWallet(altEngine, altUrp, altValidator, altGateway);
 
         PushAgentWallet altClone = PushAgentWallet(
             payable(Clones.cloneDeterministicWithImmutableArgs(
@@ -745,7 +745,7 @@ contract PushAgentWalletTest is BaseTest {
         );
 
         assertEq(altClone.sessionEngine(), altEngine, "alt engine");
-        assertEq(altClone.ucep(), altUcep, "alt ucep");
+        assertEq(altClone.urp(), altUrp, "alt urp");
         assertEq(altClone.sessionValidator(), altValidator, "alt validator");
         assertEq(altClone.universalGateway(), altGateway, "alt gateway");
 

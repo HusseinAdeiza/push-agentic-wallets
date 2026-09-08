@@ -8,7 +8,7 @@ import { MockUniversalGateway, MockPRC20 } from "../mocks/MockUniversalGateway.s
 
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
-import { IUCEP } from "../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../src/interfaces/IURP.sol";
 import { ModeLib, ModeCode } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib } from "../../src/libraries/ExecutionLib.sol";
 import { Multicall } from "../../src/libraries/PushWalletTypes.sol";
@@ -18,11 +18,11 @@ import { ISmartSession } from "smartsessions/ISmartSession.sol";
 
 /**
  * @notice E2E — Bob lends 100 USDC. The flow document's stages 3, 5, 7 and 7b, end to end, against
- *         the real engine, the real UCEP, the real validator, the real wallet and the real factory.
+ *         the real engine, the real URP, the real validator, the real wallet and the real factory.
  *
  * @dev    THE ONLY MOCK IS THE GATEWAY, and it is an OBSERVER: it records the exact bytes it
  *         received and decides nothing. Every judgement about whether a request is legal is made
- *         upstream by UCEP and the wallet.
+ *         upstream by URP and the wallet.
  *
  * @dev    WHAT THIS DOES NOT PROVE: stages 2, 4 and 6 are off-chain or far-chain (the Ethereum
  *         lock, the agent's research, the TSS settlement). They have no contract in the v3 set.
@@ -32,7 +32,7 @@ import { ISmartSession } from "smartsessions/ISmartSession.sol";
  *         fund verification. The real gateway burns the bridged PRC20; the mock only RECORDS, so
  *         the burn below is performed by the test to keep the ledger observable. What is genuinely
  *         verified on the money path is narrower and stated where it happens: the exact validated
- *         bytes reached the gateway, `msg.sender` was the wallet, and UCEP's counter moved by
+ *         bytes reached the gateway, `msg.sender` was the wallet, and URP's counter moved by
  *         exactly the bridged amount.
  */
 contract E2ETest is BaseTest {
@@ -64,7 +64,7 @@ contract E2ETest is BaseTest {
     function setUp() public override {
         super.setUp();
 
-        // The gateway mock lives AT the address the wallet and UCEP were wired to, so no contract
+        // The gateway mock lives AT the address the wallet and URP were wired to, so no contract
         // is rewired for the test — the production wiring is exercised as-is.
         vm.etch(GATEWAY, type(MockUniversalGateway).runtimeCode);
         gateway = MockUniversalGateway(payable(GATEWAY));
@@ -82,9 +82,9 @@ contract E2ETest is BaseTest {
 
     /// @dev The mandate of the flow document, verbatim: one asset, 100e6 per call and lifetime,
     ///      one Morpho-shaped rule with the beneficiary pinned to the CEA, 30-day expiry.
-    function _ucepConfig() internal view returns (bytes memory) {
-        IUCEP.AllowedCall[] memory rules = new IUCEP.AllowedCall[](1);
-        rules[0] = IUCEP.AllowedCall({
+    function _urpConfig() internal view returns (bytes memory) {
+        IURP.AllowedCall[] memory rules = new IURP.AllowedCall[](1);
+        rules[0] = IURP.AllowedCall({
             target: MORPHO_BLUE,
             selector: SUPPLY_SELECTOR,
             beneficiaryOffset: BENEFICIARY_OFFSET,
@@ -93,7 +93,7 @@ contract E2ETest is BaseTest {
         });
 
         return abi.encode(
-            IUCEP.Config({
+            IURP.Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 30 days),
                 destChainHash: keccak256("eip155:1"),
@@ -156,7 +156,7 @@ contract E2ETest is BaseTest {
     }
 
     function _spent(bytes32 pid) internal view returns (uint256) {
-        return ucep.getConfig(_configId(pid), address(bobAgw)).spent;
+        return urp.getConfig(_configId(pid), address(bobAgw)).spent;
     }
 
     // ═══════════════════════════════ THE BOB FLOW ═══════════════════════════════
@@ -195,7 +195,7 @@ contract E2ETest is BaseTest {
         bytes memory keyConfig = ed25519 ? ed25519Config(bytes32(uint256(uint160(agentAddr)))) : ecdsaConfig(agentAddr);
 
         vm.prank(BOB_UEA);
-        permissionId = bobAgw.grantMandate(canonicalSession(keyConfig, _ucepConfig()));
+        permissionId = bobAgw.grantMandate(canonicalSession(keyConfig, _urpConfig()));
         assertTrue(engine.isPermissionEnabled(PermissionId.wrap(permissionId), address(bobAgw)), "mandate live");
 
         // Steps 3 and 4: funds and gas reach the wallet.
@@ -205,15 +205,15 @@ contract E2ETest is BaseTest {
         // ── LEDGER after stage 3 ──
         assertEq(pUSDC.balanceOf(address(bobAgw)), HUNDRED_USDC, "stage 3: wallet holds 100 pUSDC");
         assertEq(pUSDC.balanceOf(BOB_UEA), 0, "stage 3: the UEA is identity only, clean");
-        assertEq(_spent(permissionId), 0, "stage 3: UCEP.spent == 0");
+        assertEq(_spent(permissionId), 0, "stage 3: URP.spent == 0");
 
         // ── STAGE 5 · execution through the agent door ──
         bytes memory ecd = _executionCalldata(HUNDRED_USDC, 0.05 ether);
         bytes32 opHash = _opHash(ecd, 0, 0, 0, permissionId);
         bytes memory sig = _sessionSig(opHash, permissionId, ed25519);
 
-        vm.expectEmit(true, true, true, true, address(ucep));
-        emit IUCEP.OutboundMetered(_configId(permissionId), address(engine), address(bobAgw), HUNDRED_USDC);
+        vm.expectEmit(true, true, true, true, address(urp));
+        emit IURP.OutboundMetered(_configId(permissionId), address(engine), address(bobAgw), HUNDRED_USDC);
 
         vm.expectEmit(true, true, true, true, address(bobAgw));
         emit IPushAgentWallet.MandateActionAuthorized(permissionId, 0, 0, opHash);
@@ -242,7 +242,7 @@ contract E2ETest is BaseTest {
 
         // ── LEDGER after stage 5 ──
         assertEq(pUSDC.balanceOf(address(bobAgw)), 0, "stage 5: 100 pUSDC left the wallet");
-        assertEq(_spent(permissionId), HUNDRED_USDC, "stage 5: UCEP.spent == 100e6");
+        assertEq(_spent(permissionId), HUNDRED_USDC, "stage 5: URP.spent == 100e6");
         assertEq(bobAgw.getNonce(0), 1, "stage 5: the replay lane advanced");
 
         // ── STAGE 7b · the redeploy path — amount 0, and `spent` does NOT move ──
@@ -274,7 +274,7 @@ contract E2ETest is BaseTest {
         // wallet's monotonic grantNonce gave the replacement a different permissionId, which is
         // bound into op-hash field 5.
         vm.prank(BOB_UEA);
-        bytes32 newPid = bobAgw.grantMandate(canonicalSession(keyConfig, _ucepConfig()));
+        bytes32 newPid = bobAgw.grantMandate(canonicalSession(keyConfig, _urpConfig()));
         assertTrue(newPid != permissionId, "the regranted mandate has a NEW id");
 
         vm.prank(RELAYER);
@@ -317,7 +317,7 @@ contract E2ETest is BaseTest {
     // ═══════════════════ the caps still bind at system level ═══════════════════
 
     /// The lifetime cap is real end to end: a second BRIDGING request past the cap is refused by
-    /// UCEP gate 7, seen through the engine's rewrap.
+    /// URP gate 7, seen through the engine's rewrap.
     function test_LifetimeCap_BindsEndToEnd() public {
         _deployAndGrant();
 
@@ -333,16 +333,16 @@ contract E2ETest is BaseTest {
         bytes32 h = _opHash(over, 0, 1, 0, permissionId);
 
         vm.prank(RELAYER);
-        expectUcepGate(
+        expectUrpGate(
             abi.encodeWithSelector(
-                IUCEP.TotalSpendCapExceeded.selector, uint256(HUNDRED_USDC + 1), uint256(HUNDRED_USDC)
+                IURP.TotalSpendCapExceeded.selector, uint256(HUNDRED_USDC + 1), uint256(HUNDRED_USDC)
             )
         );
         bobAgw.executeWithSession(address(engine), _singleMode(), over, _signEcdsa(h), 0, 1, 0);
     }
 
     /// The beneficiary pin is real end to end: an agent trading honestly but for ITSELF is refused
-    /// by UCEP gate 15.
+    /// by URP gate 15.
     function test_BeneficiaryPin_BindsEndToEnd() public {
         _deployAndGrant();
 
@@ -359,14 +359,14 @@ contract E2ETest is BaseTest {
         bytes32 h = _opHash(ecd, 0, 0, 0, permissionId);
 
         vm.prank(RELAYER);
-        expectUcepGate(abi.encodeWithSelector(IUCEP.BeneficiaryMismatch.selector, BOB_AGW_CEA, agentAddr));
+        expectUrpGate(abi.encodeWithSelector(IURP.BeneficiaryMismatch.selector, BOB_AGW_CEA, agentAddr));
         bobAgw.executeWithSession(address(engine), _singleMode(), ecd, _signEcdsa(h), 0, 0, 0);
 
         assertEq(gateway.callCount(), 0, "nothing dispatched");
         assertEq(_spent(permissionId), 0, "nothing metered");
     }
 
-    /// Failure atomicity at system level: the gateway reverts, and the nonce, UCEP's counter and
+    /// Failure atomicity at system level: the gateway reverts, and the nonce, URP's counter and
     /// the metering event all unwind (W-18 / U-18, end to end).
     function test_GatewayRevert_UnwindsEverything() public {
         _deployAndGrant();
@@ -381,7 +381,7 @@ contract E2ETest is BaseTest {
         bobAgw.executeWithSession(address(engine), _singleMode(), ecd, _signEcdsa(h), 0, 0, 0);
 
         assertEq(bobAgw.getNonce(0), 0, "the nonce unwound");
-        assertEq(_spent(permissionId), 0, "UCEP's counter unwound");
+        assertEq(_spent(permissionId), 0, "URP's counter unwound");
         assertEq(pUSDC.balanceOf(address(bobAgw)), HUNDRED_USDC, "the funds are untouched");
 
         // and it works once the gateway recovers — the lane was never burned
@@ -418,7 +418,7 @@ contract E2ETest is BaseTest {
         bobAgw = PushAgentWallet(payable(factory.deployWallet("lending")));
 
         vm.prank(BOB_UEA);
-        permissionId = bobAgw.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _ucepConfig()));
+        permissionId = bobAgw.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _urpConfig()));
 
         pUSDC.mint(address(bobAgw), HUNDRED_USDC);
         vm.deal(address(bobAgw), 1 ether);

@@ -5,7 +5,7 @@ pragma solidity 0.8.26;
  * @title  IPushAgentWallet — the wallet's observable event surface.
  * @notice Every event `PushAgentWallet` emits is declared here, so indexers, monitoring and the SDK
  *         compile against an interface rather than against the implementation. This matches the
- *         other two contracts in the system, whose events live in `IAGWFactory` and `IUCEP`.
+ *         other two contracts in the system, whose events live in `IAGWFactory` and `IURP`.
  *
  * @dev    EVENTS ONLY, DELIBERATELY. The wallet's function ABI is specified in the contract itself
  *         and nowhere else. Restating it here would create a second place for it to be edited, and

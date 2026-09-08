@@ -61,7 +61,7 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
     address internal immutable DEFAULT_SESSION_ENGINE;
 
     /// @dev The canonical action policy every mandate must name.
-    address internal immutable CANONICAL_UCEP;
+    address internal immutable CANONICAL_URP;
 
     /// @dev The canonical session validator every mandate must name.
     address internal immutable CANONICAL_SESSION_VALIDATOR;
@@ -89,19 +89,19 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
      *           driven directly; only clones of it can.
      *
      * @param  sessionEngine_       Permission engine installed as the default validator.
-     * @param  ucep_                Canonical action policy every mandate must name.
+     * @param  urp_                Canonical action policy every mandate must name.
      * @param  sessionValidator_    Canonical session validator every mandate must name.
      * @param  universalGatewayPC_  Push-side outbound gateway.
      */
-    constructor(address sessionEngine_, address ucep_, address sessionValidator_, address universalGatewayPC_) {
+    constructor(address sessionEngine_, address urp_, address sessionValidator_, address universalGatewayPC_) {
         if (
-            sessionEngine_ == address(0) || ucep_ == address(0) || sessionValidator_ == address(0)
+            sessionEngine_ == address(0) || urp_ == address(0) || sessionValidator_ == address(0)
                 || universalGatewayPC_ == address(0)
         ) {
             revert PushWalletErrors.InvalidModuleAddress();
         }
         DEFAULT_SESSION_ENGINE = sessionEngine_;
-        CANONICAL_UCEP = ucep_;
+        CANONICAL_URP = urp_;
         CANONICAL_SESSION_VALIDATOR = sessionValidator_;
         UNIVERSAL_GATEWAY_PC = universalGatewayPC_;
 
@@ -309,7 +309,7 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
 
         if (
             session.actions[0].actionPolicies.length != 1
-                || session.actions[0].actionPolicies[0].policy != CANONICAL_UCEP
+                || session.actions[0].actionPolicies[0].policy != CANONICAL_URP
         ) revert PushWalletErrors.MalformedSessionShape();
 
         if (address(session.sessionValidator) != CANONICAL_SESSION_VALIDATOR) {
@@ -738,8 +738,8 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
     }
 
     /// @notice The canonical action policy every mandate on this wallet must name.
-    function ucep() external view returns (address) {
-        return CANONICAL_UCEP;
+    function urp() external view returns (address) {
+        return CANONICAL_URP;
     }
 
     /// @notice The canonical session validator every mandate on this wallet must name.
