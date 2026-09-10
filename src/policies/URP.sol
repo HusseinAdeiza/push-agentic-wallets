@@ -7,11 +7,13 @@ import { IActionPolicy, IPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { IERC165 } from "forge-std/interfaces/IERC165.sol";
 import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 
-import { IURP } from "../interfaces/IURP.sol";
+import { IURP, MAX_PINS } from "../interfaces/IURP.sol";
 import {
     UniversalOutboundTxRequest,
     Multicall,
+    MandateType,
     MULTICALL_SELECTOR,
+    VALUE_SELECTOR,
     SEND_OUTBOUND_SELECTOR as GATEWAY_SEND_OUTBOUND_SELECTOR
 } from "../libraries/PushWalletTypes.sol";
 
@@ -81,7 +83,16 @@ contract URP is IURP, Initializable {
     // slot 2  SESSION_ENGINE
     // slot 3  $configs
     // slot 4  $credited
-    // slots 5..49  __gap
+    // slot 5  $mode      APPENDED 2026-09-09 (native mode)
+    // slot 6  $native    APPENDED 2026-09-09 (native mode)
+    // slots 7..49  __gap (uint256[43])
+    //
+    // THE 2026-09-09 APPEND, AND WHY IT IS SAFE. `$mode` and `$native` were added AFTER `$credited`
+    // and `__gap` was shrunk 45 -> 43 in the same commit, so slots 0-4 are byte-identical to the
+    // deployed layout and `__gap` still ends at slot 49. Nothing that holds data moved. The
+    // alternative that was rejected — renaming `$configs` to `$universal` and inserting `$native`
+    // beside it — would have shifted `$credited` and silently reinterpreted the live idempotency
+    // set. Measured with `forge inspect` before the change, not assumed.
     //
     // `Initializable` adds nothing here: OZ 5.x keeps its initialisation flags in an ERC-7201
     // namespaced slot, not slot 0. A test pins this exact layout against solc's own output.
@@ -110,15 +121,30 @@ contract URP is IURP, Initializable {
     /// @dev outbound tx id => credited already; idempotency for the refund path.
     mapping(bytes32 => bool) internal $credited;
 
+    /// @dev configId => multiplexer => account => which rulebook this config uses.
+    /// @dev THE MODE DISCRIMINATOR. Stored rather than derived from `$native[...].initialized`,
+    ///      because a one-bit derived mode cannot grow: URP is upgradeable behind a proxy, and the
+    ///      register's extensibility item points at MORE MODES. `ModeSlot.initialized` is
+    ///      authoritative for emptiness; `mode` is meaningless when it is false.
+    mapping(ConfigId => mapping(address => mapping(address => ModeSlot))) internal $mode;
+
+    /// @dev configId => multiplexer => account => the native rulebook.
+    /// @dev One entry per ACTION, not per mandate: a native mandate with eight actions writes eight
+    ///      of these under eight distinct config ids.
+    mapping(ConfigId => mapping(address => mapping(address => NativeConfig))) internal $native;
+
     /**
-     * @dev Reserved so a later version can add state without shifting `$configs` or `$credited`.
+     * @dev Reserved so a later version can add state without shifting anything above.
      *
      *      Adding a variable means DECREMENTING this by exactly the number of slots consumed, in
      *      the same commit. A mapping or dynamic array costs one slot; a struct costs its packed
      *      size. `Config` itself lives inside a mapping, so APPENDING a field to that struct is
      *      safe and costs nothing here — reordering or removing one is not.
+     *
+     *      Was `uint256[45]` before the 2026-09-09 native-mode append; `$mode` and `$native` took
+     *      two slots, so it is 43. `__gap` still ends at slot 49.
      */
-    uint256[45] private __gap;
+    uint256[43] private __gap;
 
     /**
      * @notice Locks the implementation so it can never be initialised in its own context.
@@ -159,6 +185,28 @@ contract URP is IURP, Initializable {
     }
 
     /**
+     * @dev The EFFECTIVE mode of a config — legacy-aware. A config written before native mode existed
+     *      has an empty `$mode` slot but an initialised `$configs` entry, and it IS a universal
+     *      config. Every mode-sensitive entry point that is not `checkAction` reads through this, so a
+     *      pre-upgrade mandate is protected against re-initialisation and reported correctly by the
+     *      getters, with no migration. `checkAction` keeps its direct routing: an empty `$mode` slot
+     *      already falls through to `_checkUniversal`, which is the same answer one SLOAD cheaper.
+     *
+     * @return initialized  true if either rulebook has been written for this config
+     * @return mode         the rulebook; meaningless when `initialized` is false
+     */
+    function _modeOf(ConfigId id, address mux, address account)
+        internal
+        view
+        returns (bool initialized, MandateType mode)
+    {
+        ModeSlot storage slot = $mode[id][mux][account];
+        if (slot.initialized) return (true, slot.mode);
+        if ($configs[id][mux][account].initialized) return (true, MandateType.UNIVERSAL);
+        return (false, MandateType.UNIVERSAL);
+    }
+
+    /**
      * @notice Writes one permission's configuration. Reached inside `enableSessions` during the
      *         wallet's `grantMandate`, where `msg.sender` becomes the multiplexer key.
      *
@@ -182,16 +230,52 @@ contract URP is IURP, Initializable {
      *         - Writes the config, sets the initialised flag, and emits `URPPolicySet` and
      *           `PolicySet`.
      *
+     *         - THE MODE WRAPPER. `initData` is `abi.encode(uint8 mode, bytes body)`. The mode is
+     *           decoded as a `uint8` and range-checked by hand, NOT decoded straight into
+     *           `MandateType`: decoding an out-of-range value into the enum reverts with an unnamed
+     *           compiler panic, whereas this yields a named `InvalidPolicyMode`. A v2-style bare
+     *           `abi.encode(Config)` reverts here rather than mis-decoding — verified, and the one
+     *           unnamed revert this function has.
+     *         - Re-initialisation is refused ACROSS MODES: the `ModeSlot` is the single flag, so a
+     *           config initialised universal cannot be re-initialised native or vice versa.
+     *
      * @param  account   The wallet this config belongs to.
      * @param  configId  Engine-derived id binding the account and the permission.
-     * @param  initData  `abi.encode(Config)`.
+     * @param  initData  `abi.encode(uint8 mode, bytes body)`, body being `abi.encode(Config)` or
+     *                   `abi.encode(NativeConfig)` according to the mode.
      */
     function initializeWithMultiplexer(address account, ConfigId configId, bytes calldata initData) external {
-        Config storage cfg = $configs[configId][msg.sender][account];
+        ModeSlot storage slot = $mode[configId][msg.sender][account];
 
-        if (cfg.initialized) revert AlreadyInitialized(configId);
+        // Legacy-aware: a pre-upgrade universal config has an empty `$mode` slot but MUST still refuse
+        // re-initialisation — otherwise the owner door could reset its spend counter or flip its mode.
+        (bool already,) = _modeOf(configId, msg.sender, account);
+        if (already) revert AlreadyInitialized(configId);
 
-        Config memory incoming = abi.decode(initData, (Config));
+        (uint8 modeRaw, bytes memory body) = abi.decode(initData, (uint8, bytes));
+        if (modeRaw > uint8(MandateType.NATIVE)) revert InvalidPolicyMode(modeRaw);
+        MandateType mode = MandateType(modeRaw);
+
+        if (mode == MandateType.UNIVERSAL) {
+            _initUniversal($configs[configId][msg.sender][account], body);
+        } else {
+            _initNative($native[configId][msg.sender][account], body);
+        }
+
+        slot.initialized = true;
+        slot.mode = mode;
+
+        emit URPPolicySet(configId, msg.sender, account, mode);
+        emit PolicySet(configId, msg.sender, account);
+    }
+
+    /**
+     * @dev The universal init guards — unchanged from the single-mode contract, only relocated.
+     * @param cfg   Storage slot to write.
+     * @param body  `abi.encode(Config)`.
+     */
+    function _initUniversal(Config storage cfg, bytes memory body) internal {
+        Config memory incoming = abi.decode(body, (Config));
 
         uint256 listLength = incoming.allowedCalls.length;
         if (listLength == 0 || listLength > MAX_ALLOWED_CALLS) revert AllowListOutOfRange(listLength);
@@ -203,9 +287,43 @@ contract URP is IURP, Initializable {
 
         _store(cfg, incoming);
         cfg.initialized = true;
+    }
 
-        emit URPPolicySet(configId, msg.sender, account);
-        emit PolicySet(configId, msg.sender, account);
+    /**
+     * @dev The native init guards.
+     *
+     *      - Refuses a zero target, and the GATEWAY as a target: the mirror of gate 3, and half of
+     *        the consistency lock. A native config can never be written against the gateway.
+     *      - Refuses a value-only config carrying pins or an amount rule. That combination can never
+     *        authorise anything — every request under it would die at N7/N8 — so it is a
+     *        misconfiguration the owner believes they granted, not a valid ascetic config. Same
+     *        reasoning as the empty-allow-list refusal in universal mode.
+     *      - Deliberately does NOT validate cap values (zero and max are both legal), pin offsets or
+     *        `amount.offset` — they cannot be checked against calldata that does not exist yet, and a
+     *        wrong offset fails closed at N7/N8 rather than widening anything. Nor the selector
+     *        against the engine's fallback flags: the wallet refuses those at grant, and a
+     *        stranger-slice config the engine never reads is harmless.
+     *
+     * @param cfg   Storage slot to write.
+     * @param body  `abi.encode(NativeConfig)`.
+     */
+    function _initNative(NativeConfig storage cfg, bytes memory body) internal {
+        NativeConfig memory incoming = abi.decode(body, (NativeConfig));
+
+        if (incoming.validUntil == 0 || incoming.validUntil <= block.timestamp) {
+            revert InvalidExpiry(incoming.validUntil);
+        }
+        if (incoming.target == address(0)) revert NativeTargetZero();
+        if (incoming.target == UNIVERSAL_GATEWAY_PC) revert NativeTargetIsGateway(incoming.target);
+        if (incoming.pins.length > MAX_PINS) revert TooManyPins(incoming.pins.length);
+
+        if (incoming.selector == VALUE_SELECTOR) {
+            if (incoming.pins.length != 0) revert ValueOnlyWithPins();
+            if (incoming.amount.enabled) revert ValueOnlyWithAmountRule();
+        }
+
+        _storeNative(cfg, incoming);
+        cfg.initialized = true;
     }
 
     /**
@@ -269,6 +387,35 @@ contract URP is IURP, Initializable {
         external
         returns (uint256)
     {
+        // MODE ROUTING. An EMPTY slot falls through to the universal path, whose gate 1 reverts
+        // `NotInitialized` — fail-closed either way. The `initialized &&` conjunction is what makes
+        // that safe: `MandateType.UNIVERSAL` is the zero value, so testing `mode` alone could not
+        // tell an empty slot from a real universal one.
+        //
+        // This is also what lets pre-upgrade universal mandates keep working with no migration:
+        // their `$mode` slot is empty, so they route to `_checkUniversal`, which is correct.
+        ModeSlot storage slot = $mode[id][msg.sender][account];
+        if (slot.initialized && slot.mode == MandateType.NATIVE) {
+            return _checkNative(id, account, target, value, data);
+        }
+        return _checkUniversal(id, account, target, value, data);
+    }
+
+    /**
+     * @dev The universal gauntlet — gates 1 to 16, unchanged from the single-mode contract. Only the
+     *      function name and visibility changed; the body is byte-for-byte what `checkAction` was.
+     *
+     * @param  id       Config id identifying the mandate.
+     * @param  account  The wallet.
+     * @param  target   Push-side call target; must be the gateway.
+     * @param  value    Push-native value attached to the call.
+     * @param  data     The gateway calldata.
+     * @return The engine's success sentinel.
+     */
+    function _checkUniversal(ConfigId id, address account, address target, uint256 value, bytes calldata data)
+        internal
+        returns (uint256)
+    {
         Config storage cfg = $configs[id][msg.sender][account];
 
         if (!cfg.initialized) revert NotInitialized(id, account);
@@ -305,6 +452,114 @@ contract URP is IURP, Initializable {
             cfg.spent = newSpent;
             emit OutboundMetered(id, msg.sender, account, req.amount);
         }
+
+        return VALIDATION_SUCCESS;
+    }
+
+    /**
+     * @dev The native gauntlet — gates N1 to N9, then effects. The same discipline as the universal
+     *      path and for the same reason: this runs BEFORE the session signature is verified, on
+     *      unauthenticated calldata from an arbitrary caller.
+     *
+     *      - NO EXTERNAL CALLS. Pins and the metered amount are read by slicing `data` directly,
+     *        never through `_slice` into memory and never through a helper that calls out.
+     *      - ALL EFFECTS LAST. `newValueSpent` and `newAmountSpent` are computed at N6/N8 and
+     *        assigned only after N9 passes, exactly as `_checkUniversal` handles `newSpent`. A
+     *        request that fails at N7 leaves every counter untouched.
+     *      - BOUNDS ARITHMETIC IS DONE IN `uint256`. `pin.offset` is `uint16`, so
+     *        `uint256(offset) + 32` cannot wrap — but written as `uint16` arithmetic it would, and
+     *        the check would pass on a crafted offset. Do not "simplify" the cast away.
+     *      - `callsUsed` ALWAYS increments on success, including on a zero-value zero-amount call.
+     *        A call is a use; mirroring universal's zero-amount rule (which writes nothing) would
+     *        make `maxCalls` bypassable by zero-value calls, i.e. advisory. This is the one
+     *        deliberate divergence between the two rulebooks.
+     *      - Value-only configs carry no pins and no amount rule — init refuses that combination —
+     *        so with `data.length == 0` the N7 loop does not execute and N8 is skipped.
+     *
+     * @param  id       Config id identifying the mandate.
+     * @param  account  The wallet.
+     * @param  target   Push-side call target; must be the configured native target.
+     * @param  value    Push-native value attached to the call.
+     * @param  data     The native calldata, read but never decoded as a structure.
+     * @return The engine's success sentinel.
+     */
+    function _checkNative(ConfigId id, address account, address target, uint256 value, bytes calldata data)
+        internal
+        returns (uint256)
+    {
+        NativeConfig storage cfg = $native[id][msg.sender][account];
+
+        // N1
+        if (!cfg.initialized) revert NotInitialized(id, account);
+
+        // N2
+        if (block.timestamp > cfg.validUntil) revert MandateExpired(cfg.validUntil);
+
+        // N3 — the consistency lock, mirror of universal gate 3. Init refuses a gateway target, so
+        // this can only fire on state the wallet's grant check makes unreachable. It is defence in
+        // depth against a mis-wired grant, not dead code.
+        if (target == UNIVERSAL_GATEWAY_PC) revert NativeTargetIsGateway(target);
+
+        // N4
+        if (target != cfg.target) revert TargetMismatch(target, cfg.target);
+
+        // N5 — under four bytes is the engine's value-only selector; four or more is a real one.
+        bytes4 sel = data.length < 4 ? VALUE_SELECTOR : bytes4(data[0:4]);
+        if (sel != cfg.selector) revert SelectorMismatch(sel, cfg.selector);
+        // Value-only means EMPTY calldata (register N-46). The engine buckets 1..3 bytes under the
+        // same actionId, so URP is the layer that makes the documented meaning true.
+        if (sel == VALUE_SELECTOR && data.length != 0) revert ValueOnlyCalldataNotEmpty(data.length);
+
+        // N6
+        if (value > cfg.maxValuePerCall) revert ValueExceedsCap(value, cfg.maxValuePerCall);
+        uint256 newValueSpent = cfg.valueSpent + value;
+        if (newValueSpent > cfg.maxValueTotal) revert TotalValueExceeded(newValueSpent, cfg.maxValueTotal);
+
+        // N7
+        uint256 pinCount = cfg.pins.length;
+        for (uint256 i; i < pinCount;) {
+            ArgPin storage pin = cfg.pins[i];
+            uint256 needed = uint256(pin.offset) + 32;
+            if (data.length < needed) revert CalldataTooShortForPin(data.length, i, needed);
+
+            bytes32 actual = bytes32(data[pin.offset:needed]);
+            if (actual != pin.expected) revert ArgPinMismatch(actual, i, pin.expected);
+
+            unchecked {
+                ++i;
+            }
+        }
+
+        // N8
+        uint256 amt;
+        uint256 newAmountSpent = cfg.amountSpent;
+        if (cfg.amount.enabled) {
+            uint256 neededAmt = uint256(cfg.amount.offset) + 32;
+            if (data.length < neededAmt) revert CalldataTooShortForAmount(data.length, neededAmt);
+
+            amt = uint256(bytes32(data[cfg.amount.offset:neededAmt]));
+            if (amt > cfg.amount.maxPerCall) revert NativeAmountExceedsCap(amt, cfg.amount.maxPerCall);
+
+            newAmountSpent = cfg.amountSpent + amt;
+            if (newAmountSpent > cfg.amount.maxTotal) {
+                revert TotalNativeAmountExceeded(newAmountSpent, cfg.amount.maxTotal);
+            }
+        }
+
+        // N9
+        if (cfg.maxCalls != 0 && cfg.callsUsed >= cfg.maxCalls) {
+            revert CallLimitReached(cfg.callsUsed, cfg.maxCalls);
+        }
+
+        // Effects, last.
+        cfg.valueSpent = newValueSpent;
+        cfg.amountSpent = newAmountSpent;
+        unchecked {
+            // Bounded by N9 when maxCalls != 0; when it is 0 the counter is informational and a
+            // uint32 overflow is unreachable at any realistic call volume.
+            cfg.callsUsed = cfg.callsUsed + 1;
+        }
+        emit NativeCallMetered(id, msg.sender, account, value, amt);
 
         return VALIDATION_SUCCESS;
     }
@@ -382,11 +637,51 @@ contract URP is IURP, Initializable {
      * @param  expectedSpent  The spend total the caller composed its change against.
      */
     function assertSpent(ConfigId id, address account, uint256 expectedSpent) external view {
+        (bool init, MandateType mode) = _modeOf(id, SESSION_ENGINE, account);
+        if (init && mode == MandateType.NATIVE) revert WrongModeForCall(MandateType.NATIVE);
+
         Config storage cfg = $configs[id][SESSION_ENGINE][account];
 
         if (!cfg.initialized) revert NotInitialized(id, account);
 
         if (cfg.spent != expectedSpent) revert SpentMismatch(expectedSpent, cfg.spent);
+    }
+
+    /**
+     * @notice The native change-flow race guard: exact equality on all three counters.
+     *
+     * @dev    - The native counterpart of the universal `assertSpent`, and the same intent: the
+     *           first entry of the owner's atomic change batch — assert, revoke, grant.
+     *         - Reverts `WrongModeForCall(UNIVERSAL)` on a universal config and `NotInitialized` on
+     *           a ghost. It must not have a silent-pass mode: reading zero from a ghost config is
+     *           indistinguishable from reading zero from a real unused mandate, and this function
+     *           exists to catch stale belief.
+     *         - Exact equality on every counter, in both directions.
+     *         - Callable by anyone; it is a pure read.
+     *
+     * @param  id                   Config id identifying the mandate.
+     * @param  account              The wallet the mandate belongs to.
+     * @param  expectedValueSpent   Native value total the caller composed against.
+     * @param  expectedAmountSpent  Metered calldata-amount total the caller composed against.
+     * @param  expectedCalls        Call count the caller composed against.
+     */
+    function assertSpent(
+        ConfigId id,
+        address account,
+        uint256 expectedValueSpent,
+        uint256 expectedAmountSpent,
+        uint32 expectedCalls
+    ) external view {
+        (bool init, MandateType mode) = _modeOf(id, SESSION_ENGINE, account);
+
+        if (!init) revert NotInitialized(id, account);
+        if (mode != MandateType.NATIVE) revert WrongModeForCall(MandateType.UNIVERSAL);
+
+        NativeConfig storage cfg = $native[id][SESSION_ENGINE][account];
+
+        if (cfg.valueSpent != expectedValueSpent) revert SpentMismatch(expectedValueSpent, cfg.valueSpent);
+        if (cfg.amountSpent != expectedAmountSpent) revert SpentMismatch(expectedAmountSpent, cfg.amountSpent);
+        if (cfg.callsUsed != expectedCalls) revert SpentMismatch(expectedCalls, cfg.callsUsed);
     }
 
     /**
@@ -429,13 +724,52 @@ contract URP is IURP, Initializable {
     }
 
     /**
-     * @notice The full config including the allow-list, keyed on the session engine.
+     * @notice The full universal config including the allow-list, keyed on the session engine.
+     *
+     * @dev    Reverts `WrongModeForCall(NATIVE)` on a native slot. An EMPTY slot returns the zeroed
+     *         struct exactly as it always has — an empty slot is a STATE, a wrong-mode read is a
+     *         CALLER BUG, and only the second is worth a revert. `getMode` is the documented first
+     *         call for anything that does not already know a mandate's mode.
+     *
      * @param  id       Config id identifying the mandate.
      * @param  account  The wallet the mandate belongs to.
      * @return The stored config.
      */
     function getConfig(ConfigId id, address account) external view returns (Config memory) {
+        (bool init, MandateType mode) = _modeOf(id, SESSION_ENGINE, account);
+        if (init && mode == MandateType.NATIVE) revert WrongModeForCall(MandateType.NATIVE);
+
         return $configs[id][SESSION_ENGINE][account];
+    }
+
+    /**
+     * @notice The full native config including its pins, keyed on the session engine.
+     * @dev    Reverts `WrongModeForCall(UNIVERSAL)` on a universal slot; an empty slot returns the
+     *         zeroed struct. See `getConfig`.
+     * @param  id       Config id identifying the mandate.
+     * @param  account  The wallet the mandate belongs to.
+     * @return The stored native config.
+     */
+    function getNativeConfig(ConfigId id, address account) external view returns (NativeConfig memory) {
+        (bool init, MandateType mode) = _modeOf(id, SESSION_ENGINE, account);
+        if (init && mode == MandateType.UNIVERSAL) revert WrongModeForCall(MandateType.UNIVERSAL);
+
+        return $native[id][SESSION_ENGINE][account];
+    }
+
+    /**
+     * @notice Which rulebook a config uses. NEVER REVERTS.
+     * @dev    The documented first call for any integrator that does not already know a mandate's
+     *         mode. An empty slot returns `(initialized: false, mode: UNIVERSAL)` — and the mode
+     *         value is MEANINGLESS when `initialized` is false, because `UNIVERSAL` is the enum's
+     *         zero value. Read `initialized` first, always.
+     * @param  id       Config id identifying the mandate.
+     * @param  account  The wallet the mandate belongs to.
+     * @return The stored mode record.
+     */
+    function getMode(ConfigId id, address account) external view returns (ModeSlot memory) {
+        (bool init, MandateType mode) = _modeOf(id, SESSION_ENGINE, account);
+        return ModeSlot({ initialized: init, mode: mode });
     }
 
     /**
@@ -564,6 +898,43 @@ contract URP is IURP, Initializable {
         uint256 len = incoming.allowedCalls.length;
         for (uint256 i; i < len;) {
             cfg.allowedCalls.push(incoming.allowedCalls[i]);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @dev Copies a decoded native config into storage. The native counterpart of `_store`.
+     *
+     *      - Forces `valueSpent`, `amountSpent` and `callsUsed` to zero, ignoring anything the
+     *        caller supplied. A caller-set counter would be a granted head start on every cap.
+     *      - `amount` is a value struct with no dynamic members, so it assigns wholesale.
+     *      - `pins` must be copied ELEMENT BY ELEMENT: Solidity cannot assign a memory dynamic array
+     *        into a storage struct field. Same shape as `allowedCalls` above, same reason.
+     *      - Does not set `initialized`; the caller does, immediately after this returns.
+     *
+     * @param cfg       Storage slot to write into.
+     * @param incoming  Decoded native config to copy from.
+     */
+    function _storeNative(NativeConfig storage cfg, NativeConfig memory incoming) internal {
+        cfg.validUntil = incoming.validUntil;
+        cfg.target = incoming.target;
+        cfg.selector = incoming.selector;
+        cfg.maxValuePerCall = incoming.maxValuePerCall;
+        cfg.maxValueTotal = incoming.maxValueTotal;
+        cfg.valueSpent = 0;
+        cfg.amount = incoming.amount;
+        cfg.amountSpent = 0;
+        cfg.maxCalls = incoming.maxCalls;
+        cfg.callsUsed = 0;
+
+        // Re-initialisation is refused, so in production this array is always empty here. The
+        // delete is kept for the stranger-slice path and for tests.
+        delete cfg.pins;
+        uint256 len = incoming.pins.length;
+        for (uint256 i; i < len;) {
+            cfg.pins.push(incoming.pins[i]);
             unchecked {
                 ++i;
             }

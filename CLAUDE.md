@@ -135,9 +135,22 @@ about lives inside the payload, two decode levels down. **URP is the contract th
 
 ## Standing test rules
 
-1. **Every negative test names its expected error.** Two documented exceptions only: URP gate 4 case (d)
-   (correct-length, malformed-offset body) and validator P-05 — both assert "reverts" because both fail at
-   the same un-named `abi.decode` step.
+1. **Every negative test names its expected error.** Three documented exceptions only: URP gate 4 case (d)
+   (correct-length, malformed-offset body), validator P-05 — both assert "reverts" because both fail at
+   the same un-named `abi.decode` step — and, added 2026-09-09, the **legacy `initData` rejection test**: a
+   v2-style bare-struct `abi.encode(Config)` passed to URP's `(uint8 mode, bytes body)` decoder reverts
+   unnamed **on an UNINITIALISED config**. Naming it would require heuristic decoding, which is worse
+   than the unnamed revert; the important property, which the test does assert, is that it **reverts
+   rather than mis-decoding**. The exception is narrow, and narrower than it first shipped: on an
+   ALREADY-INITIALISED config the re-init guard now runs before the decode, so the same malformed
+   blob reverts with a named `AlreadyInitialized` instead.
+
+   **A bare `vm.expectRevert()` is permitted only where the revert genuinely carries no data, and
+   only with an in-line justification saying so.** Before writing one, **grep the repo for the same
+   assertion elsewhere** — twice now a bare form was written where the named form already existed in
+   the same file (`test_W29_Native`, Block A §2.2; the native revoke in `E2E.t.sol`, Block B §2.1).
+   A bare `expectRevert` on a revocation or authorisation claim passes on an out-of-gas, a signature
+   failure or a nonce collision — the weakest assertion in the suite sitting on the strongest claim.
 2. **A mock may be the OBSERVER, never the ORACLE.** A mock that supplies the behaviour under test can make
    a dead branch look live. That is how this repo's one shipped critical bug survived review: the Ed25519
    branch called the precompile through a typed interface, solc inserted an `extcodesize` check, precompiles

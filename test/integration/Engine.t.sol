@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import { Vm } from "forge-std/Vm.sol";
 
 import { BaseTest } from "../Base.t.sol";
+import { MandateType } from "../../src/libraries/PushWalletTypes.sol";
 import { MockUniversalGateway, MockPRC20 } from "../mocks/MockUniversalGateway.sol";
 
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
@@ -86,7 +87,7 @@ contract EngineTest is BaseTest {
             hasBeneficiary: true,
             maxValue: 0
         });
-        return abi.encode(
+        return universalInitData(
             IURP.Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 30 days),
@@ -145,7 +146,7 @@ contract EngineTest is BaseTest {
 
     function _grant(address signer) internal returns (bytes32) {
         vm.prank(WALLET_OWNER);
-        return wallet.grantMandate(canonicalSession(ecdsaConfig(signer), _urpConfig()));
+        return wallet.grantMandate(canonicalSession(ecdsaConfig(signer), _urpConfig()), MandateType.UNIVERSAL);
     }
 
     // ═══════════════════════════════════ S-01 ═══════════════════════════════════
@@ -297,7 +298,7 @@ contract EngineTest is BaseTest {
     function _expectShape(Session memory s) internal {
         vm.prank(WALLET_OWNER);
         vm.expectRevert(PushWalletErrors.MalformedSessionShape.selector);
-        wallet.grantMandate(s);
+        wallet.grantMandate(s, MandateType.UNIVERSAL);
     }
 
     // ═══════════════════════════════════ S-03 ═══════════════════════════════════

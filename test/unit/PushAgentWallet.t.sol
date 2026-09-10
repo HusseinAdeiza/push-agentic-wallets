@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import { BaseTest } from "../Base.t.sol";
+import { MandateType } from "../../src/libraries/PushWalletTypes.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
@@ -73,7 +74,7 @@ contract PushAgentWalletTest is BaseTest {
     ///      engine because grantMandate was a placeholder; 3b switched it, per the instruction.)
     function _grant(PushAgentWallet w, address agentKey) internal returns (bytes32 pid) {
         vm.prank(WALLET_OWNER);
-        return w.grantMandate(canonicalSession(ecdsaConfig(agentKey), _urpInitData()));
+        return w.grantMandate(canonicalSession(ecdsaConfig(agentKey), _urpInitData()), MandateType.UNIVERSAL);
     }
 
     function _grant(PushAgentWallet w) internal returns (bytes32) {
@@ -90,7 +91,7 @@ contract PushAgentWalletTest is BaseTest {
             hasBeneficiary: true,
             maxValue: 1 ether
         });
-        return abi.encode(
+        return universalInitData(
             IURP.Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 365 days),

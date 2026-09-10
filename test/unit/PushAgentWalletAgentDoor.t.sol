@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import { Vm } from "forge-std/Vm.sol";
 
 import { BaseTest } from "../Base.t.sol";
+import { MandateType } from "../../src/libraries/PushWalletTypes.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
@@ -88,7 +89,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
             hasBeneficiary: true,
             maxValue: 1 ether
         });
-        return abi.encode(
+        return universalInitData(
             IURP.Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 365 days),
@@ -106,7 +107,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
 
     function _grant() internal returns (bytes32) {
         vm.prank(WALLET_OWNER);
-        return wallet.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _urpInitData()));
+        return wallet.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _urpInitData()), MandateType.UNIVERSAL);
     }
 
     function _calls() internal view returns (Multicall[] memory c) {
@@ -256,7 +257,8 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         // the owner revokes and regrants IDENTICAL terms
         vm.startPrank(WALLET_OWNER);
         wallet.stopMandate(permissionId);
-        bytes32 newPid = wallet.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _urpInitData()));
+        bytes32 newPid =
+            wallet.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _urpInitData()), MandateType.UNIVERSAL);
         vm.stopPrank();
 
         assertTrue(newPid != permissionId, "the regranted mandate has a NEW id");
@@ -333,7 +335,8 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
     function test_W03_OpHash_Field5_PermissionId() public {
         // grant a second mandate, so a real second id exists
         vm.prank(WALLET_OWNER);
-        bytes32 otherPid = wallet.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _urpInitData()));
+        bytes32 otherPid =
+            wallet.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _urpInitData()), MandateType.UNIVERSAL);
 
         Req memory r = _defaultReq();
         bytes32 h = _opHash(r); // hash commits to permissionId A

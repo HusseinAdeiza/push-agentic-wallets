@@ -15,7 +15,13 @@ import { PushSessionValidator } from "../src/validators/PushSessionValidator.sol
 import { URP } from "../src/policies/URP.sol";
 import { PushAgentWallet } from "../src/PushAgentWallet.sol";
 import { AGWFactory } from "../src/AGWFactory.sol";
-import { UniversalOutboundTxRequest, Multicall, MULTICALL_SELECTOR } from "../src/libraries/PushWalletTypes.sol";
+import {
+    UniversalOutboundTxRequest,
+    Multicall,
+    MandateType,
+    MULTICALL_SELECTOR
+} from "../src/libraries/PushWalletTypes.sol";
+import { IURP } from "../src/interfaces/IURP.sol";
 
 /**
  * @title  BaseTest — the shared harness every v3 suite extends.
@@ -429,6 +435,33 @@ abstract contract BaseTest is Test {
             actions: actions,
             permitERC4337Paymaster: false
         });
+    }
+
+    // ─────────────────────── the initData mode wrapper ───────────────────────
+
+    /**
+     * @notice Wrap an encoded config in URP's `(uint8 mode, bytes body)` envelope.
+     * @dev    SHARED HELPER — use this everywhere a policy `initData` is built. Since native mode
+     *         landed, `initializeWithMultiplexer` decodes the wrapper first and branches on the
+     *         mode, so a bare `abi.encode(Config)` is no longer a valid `initData` and reverts.
+     *
+     *         The mode travels as a `uint8`, not as the enum, deliberately — see URP's decoder
+     *         NatSpec. Tests that want to prove an OUT-OF-RANGE mode is rejected must hand-encode
+     *         `abi.encode(uint8(2), body)` rather than reach for this helper, which cannot express
+     *         an invalid mode.
+     */
+    function urpInitData(MandateType mode, bytes memory body) internal pure returns (bytes memory) {
+        return abi.encode(uint8(mode), body);
+    }
+
+    /// @dev The universal case, which is most of them.
+    function universalInitData(IURP.Config memory cfg) internal pure returns (bytes memory) {
+        return urpInitData(MandateType.UNIVERSAL, abi.encode(cfg));
+    }
+
+    /// @dev The native case.
+    function nativeInitData(IURP.NativeConfig memory cfg) internal pure returns (bytes memory) {
+        return urpInitData(MandateType.NATIVE, abi.encode(cfg));
     }
 
     // ─────────────────────────── outbound request ───────────────────────────

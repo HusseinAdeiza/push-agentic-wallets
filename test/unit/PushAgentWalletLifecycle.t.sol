@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import { Vm } from "forge-std/Vm.sol";
 
 import { BaseTest } from "../Base.t.sol";
+import { MandateType } from "../../src/libraries/PushWalletTypes.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
@@ -49,7 +50,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
             hasBeneficiary: true,
             maxValue: 1 ether
         });
-        return abi.encode(
+        return universalInitData(
             IURP.Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 365 days),
@@ -72,14 +73,14 @@ contract PushAgentWalletLifecycleTest is BaseTest {
 
     function _grant(Session memory s) internal returns (bytes32) {
         vm.prank(WALLET_OWNER);
-        return wallet.grantMandate(s);
+        return wallet.grantMandate(s, MandateType.UNIVERSAL);
     }
 
     /// @dev Assert a deviation is refused with the ONE error the shape check ever raises.
     function _expectMalformed(Session memory s) internal {
         vm.prank(WALLET_OWNER);
         vm.expectRevert(PushWalletErrors.MalformedSessionShape.selector);
-        wallet.grantMandate(s);
+        wallet.grantMandate(s, MandateType.UNIVERSAL);
     }
 
     // ═══════════════════════════════════ W-24 ═══════════════════════════════════
@@ -124,13 +125,16 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         _expectMalformed(s);
     }
 
-    /// Rule 1, both directions: exactly one action, so no wildcard/fallback action can exist.
+    /// Rule 1 under UNIVERSAL: still exactly one action. PRESERVED VERBATIM through the 2026-09-09
+    /// rewrite — the one-action rule was relaxed for NATIVE only, never for UNIVERSAL.
     function test_W24_Deviation_ZeroActions() public {
         Session memory s = _canonical();
         s.actions = new ActionData[](0);
         _expectMalformed(s);
     }
 
+    /// ⚠️ THE ASSERTION §8.2 REQUIRES BE PRESERVED. Under `UNIVERSAL` a second action is still
+    /// `MalformedSessionShape`. Only `NATIVE` admits more than one, and it admits at most eight.
     function test_W24_Deviation_TwoActions() public {
         Session memory s = _canonical();
         ActionData[] memory actions = new ActionData[](2);
@@ -140,16 +144,147 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         _expectMalformed(s);
     }
 
-    function test_W24_Deviation_WrongTarget() public {
-        Session memory s = _canonical();
-        s.actions[0].actionTarget = _addr("notTheGateway");
-        _expectMalformed(s);
+    // ─────────────────── W-24, the NATIVE branch (added 2026-09-09) ───────────────────
+
+    /// @dev A native action on an arbitrary Push-side target, carrying the canonical policy.
+    function _nativeAction(address target, bytes4 selector) internal view returns (ActionData memory) {
+        PolicyData[] memory ps = new PolicyData[](1);
+        ps[0] = PolicyData({ policy: address(urp), initData: _nativeInitDataFor(target, selector) });
+        return ActionData({ actionTargetSelector: selector, actionTarget: target, actionPolicies: ps });
     }
 
+    function _nativeInitDataFor(address target, bytes4 selector) internal view returns (bytes memory) {
+        IURP.NativeConfig memory cfg;
+        cfg.validUntil = uint48(block.timestamp + 365 days);
+        cfg.target = target;
+        cfg.selector = selector;
+        return nativeInitData(cfg);
+    }
+
+    function _nativeSession(ActionData[] memory actions) internal view returns (Session memory s) {
+        s = _canonical();
+        s.actions = actions;
+    }
+
+    function _grantNative(Session memory s) internal returns (bytes32) {
+        vm.prank(WALLET_OWNER);
+        return wallet.grantMandate(s, MandateType.NATIVE);
+    }
+
+    /// One action is a legal native mandate.
+    function test_W24_Native_OneActionGrants() public {
+        ActionData[] memory a = new ActionData[](1);
+        a[0] = _nativeAction(_addr("stakeDummy"), bytes4(keccak256("stake(uint256)")));
+        bytes32 pid = _grantNative(_nativeSession(a));
+        assertTrue(engine.isPermissionEnabled(PermissionId.wrap(pid), address(wallet)), "one native action grants");
+    }
+
+    /// And so are eight — the ceiling, inclusive.
+    function test_W24_Native_EightActionsGrant() public {
+        ActionData[] memory a = new ActionData[](8);
+        for (uint256 i; i < 8; ++i) {
+            a[i] = _nativeAction(_addr(string(abi.encodePacked("proto", i))), bytes4(uint32(0x11000000 + i)));
+        }
+        bytes32 pid = _grantNative(_nativeSession(a));
+        assertTrue(engine.isPermissionEnabled(PermissionId.wrap(pid), address(wallet)), "eight native actions grant");
+    }
+
+    function test_W24_Native_ZeroActionsRejected() public {
+        Session memory s = _nativeSession(new ActionData[](0));
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.TooManyActions.selector, uint256(0)));
+        wallet.grantMandate(s, MandateType.NATIVE);
+    }
+
+    function test_W24_Native_NineActionsRejected() public {
+        ActionData[] memory a = new ActionData[](9);
+        for (uint256 i; i < 9; ++i) {
+            a[i] = _nativeAction(_addr(string(abi.encodePacked("proto", i))), bytes4(uint32(0x11000000 + i)));
+        }
+        Session memory s = _nativeSession(a);
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.TooManyActions.selector, uint256(9)));
+        wallet.grantMandate(s, MandateType.NATIVE);
+    }
+
+    /// The same (target, selector) twice would hash to one actionId.
+    function test_W24_Native_DuplicateActionRejected() public {
+        address t = _addr("stakeDummy");
+        bytes4 sel = bytes4(keccak256("stake(uint256)"));
+        ActionData[] memory a = new ActionData[](2);
+        a[0] = _nativeAction(t, sel);
+        a[1] = _nativeAction(t, sel);
+
+        Session memory s = _nativeSession(a);
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.DuplicateAction.selector, t, sel));
+        wallet.grantMandate(s, MandateType.NATIVE);
+    }
+
+    /// The COMMON rules apply identically to both types.
+    function test_W24_Native_CommonRulesStillApply() public {
+        ActionData[] memory a = new ActionData[](1);
+        a[0] = _nativeAction(_addr("stakeDummy"), bytes4(keccak256("stake(uint256)")));
+
+        Session memory s = _nativeSession(a);
+        s.permitERC4337Paymaster = true;
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.MalformedSessionShape.selector);
+        wallet.grantMandate(s, MandateType.NATIVE);
+    }
+
+    /// A wrong POLICY is `MalformedSessionShape` in BOTH modes — the invariant, stated once.
+    function test_W24_Native_WrongPolicyIsMalformed() public {
+        URP otherUrp = new URP();
+        address t = _addr("stakeDummy");
+        bytes4 sel = bytes4(keccak256("stake(uint256)"));
+
+        PolicyData[] memory ps = new PolicyData[](1);
+        ps[0] = PolicyData({ policy: address(otherUrp), initData: _nativeInitDataFor(t, sel) });
+        ActionData[] memory a = new ActionData[](1);
+        a[0] = ActionData({ actionTargetSelector: sel, actionTarget: t, actionPolicies: ps });
+
+        Session memory s = _nativeSession(a);
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.MalformedSessionShape.selector);
+        wallet.grantMandate(s, MandateType.NATIVE);
+    }
+
+    /**
+     * ⚠️ SEMANTIC REWRITE, 2026-09-09 (§8.2). Same name, same intent, a more precise error.
+     *
+     * A target wrong FOR THE DECLARED TYPE is now `MandateTypeMismatch`, not
+     * `MalformedSessionShape` — the wallet can say WHICH action was wrong and what it named, which
+     * matters once a mandate may hold eight of them. The rule is unchanged: a `UNIVERSAL` mandate
+     * may name nothing but the gateway.
+     */
+    function test_W24_Deviation_WrongTarget() public {
+        Session memory s = _canonical();
+        address wrong = _addr("notTheGateway");
+        s.actions[0].actionTarget = wrong;
+
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PushWalletErrors.MandateTypeMismatch.selector, MandateType.UNIVERSAL, uint256(0), wrong
+            )
+        );
+        wallet.grantMandate(s, MandateType.UNIVERSAL);
+    }
+
+    /// Same rewrite: the gateway with the wrong selector is still a type mismatch, and the reported
+    /// target is the gateway — which is what tells an integrator the SELECTOR was the problem.
     function test_W24_Deviation_WrongSelector() public {
         Session memory s = _canonical();
         s.actions[0].actionTargetSelector = bytes4(keccak256("somethingElse()"));
-        _expectMalformed(s);
+
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                PushWalletErrors.MandateTypeMismatch.selector, MandateType.UNIVERSAL, uint256(0), GATEWAY
+            )
+        );
+        wallet.grantMandate(s, MandateType.UNIVERSAL);
     }
 
     /// Rule 4 — THE FAIL-CLOSED ANCHOR. Zero action policies would mean the engine's minimum-one
@@ -219,7 +354,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         Session memory s = _canonical();
         vm.prank(AGENT);
         vm.expectRevert(PushWalletErrors.NotOwner.selector);
-        wallet.grantMandate(s);
+        wallet.grantMandate(s, MandateType.UNIVERSAL);
     }
 
     /// grantMandate does NOT validate URP's config CONTENTS — that is URP's own job, and it fails
@@ -243,7 +378,10 @@ contract PushAgentWalletLifecycleTest is BaseTest {
             allowedCalls: rules
         });
 
-        Session memory s = canonicalSession(ecdsaConfig(AGENT), abi.encode(bad));
+        // Correctly WRAPPED — the point of this test is that URP's own TERM guard fires, so the
+        // config has to get past the mode decoder to reach it. A bare `abi.encode(bad)` would now
+        // die at `InvalidPolicyMode` instead and the test would prove nothing about overreach.
+        Session memory s = canonicalSession(ecdsaConfig(AGENT), universalInitData(bad));
         // URP's OWN error, surfacing through the engine — NOT MalformedSessionShape. Naming it is
         // the whole point of this test: it proves the shape check did not overreach into term
         // validation. URP reverts during initializeWithMultiplexer, which the engine does not
@@ -251,7 +389,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         // arrives as itself.
         vm.prank(WALLET_OWNER);
         vm.expectRevert(IURP.InvalidConfigField.selector);
-        wallet.grantMandate(s);
+        wallet.grantMandate(s, MandateType.UNIVERSAL);
     }
 
     // ═══════════════════════════════════ W-17 ═══════════════════════════════════
@@ -327,7 +465,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
     function test_W15_OtherWalletsIdIsAGhost() public {
         PushAgentWallet other = newWallet(WALLET_OWNER);
         vm.prank(WALLET_OWNER);
-        bytes32 theirs = other.grantMandate(_canonical());
+        bytes32 theirs = other.grantMandate(_canonical(), MandateType.UNIVERSAL);
 
         vm.prank(WALLET_OWNER);
         vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.UnknownPermission.selector, theirs));
@@ -394,7 +532,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
      * W-10 — THE CANONICAL PERMISSION-CHANGE FLOW, in ONE owner signature, ONE execute batch.
      *
      * There is no "reconfigure". Change is atomic revoke-and-regrant:
-     *     URP.assertSpent(old) -> stopMandate(old) -> grantMandate(new) -> approval payload
+     *     URP.assertSpent(old) -> stopMandate(old) -> grantMandate(new, MandateType.UNIVERSAL) -> approval payload
      *
      * The two lifecycle legs target the WALLET, so they arrive with `msg.sender == address(this)`
      * and reach `onlyOwnerOrSelf`. That modifier exists for exactly this batch (ruling A).
@@ -432,13 +570,20 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         batch[0] = Execution({
             target: address(urp),
             value: 0,
-            callData: abi.encodeCall(URP.assertSpent, (ConfigId.wrap(configId), address(wallet), believedSpent))
+            // `assertSpent` is overloaded since native mode landed, and `abi.encodeCall` cannot
+            // disambiguate a function reference by arity. Encode the universal (three-argument)
+            // form by its explicit signature instead. The selector is unchanged — 0x85859f51.
+            callData: abi.encodeWithSignature(
+                "assertSpent(bytes32,address,uint256)", configId, address(wallet), believedSpent
+            )
         });
         batch[1] = Execution({
             target: address(wallet), value: 0, callData: abi.encodeCall(PushAgentWallet.stopMandate, (oldPid))
         });
         batch[2] = Execution({
-            target: address(wallet), value: 0, callData: abi.encodeCall(PushAgentWallet.grantMandate, (_canonical()))
+            target: address(wallet),
+            value: 0,
+            callData: abi.encodeCall(PushAgentWallet.grantMandate, (_canonical(), MandateType.UNIVERSAL))
         });
         batch[3] = Execution({
             target: token,
@@ -527,9 +672,15 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         for (uint256 i; i < grantLogs.length; ++i) {
             if (
                 grantLogs[i].emitter == address(wallet)
-                    && grantLogs[i].topics[0] == keccak256("MandateGranted(bytes32)")
+                    && grantLogs[i].topics[0] == keccak256("MandateGranted(bytes32,uint8)")
             ) {
                 assertEq(grantLogs[i].topics[1], pid, "MandateGranted carries the returned id");
+                // The type is an unindexed enum, so it lands in `data` as a padded uint8.
+                assertEq(
+                    abi.decode(grantLogs[i].data, (uint8)),
+                    uint8(MandateType.UNIVERSAL),
+                    "MandateGranted carries the declared type"
+                );
                 sawGrant = true;
             }
         }

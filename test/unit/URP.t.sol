@@ -7,7 +7,13 @@ import { IURP } from "../../src/interfaces/IURP.sol";
 import { ConfigId } from "smartsessions/DataTypes.sol";
 import { IActionPolicy, IPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { IERC165 } from "forge-std/interfaces/IERC165.sol";
-import { Multicall, MULTICALL_SELECTOR, UniversalOutboundTxRequest } from "../../src/libraries/PushWalletTypes.sol";
+import {
+    Multicall,
+    MandateType,
+    MULTICALL_SELECTOR,
+    VALUE_SELECTOR,
+    UniversalOutboundTxRequest
+} from "../../src/libraries/PushWalletTypes.sol";
 import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import { ProxyAdmin } from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
 import {
@@ -105,7 +111,7 @@ contract URPTest is BaseTest {
     /// @dev Initialise as the engine — the only multiplexer the non-engine paths read.
     function _init(IURP.Config memory cfg) internal {
         vm.prank(address(engine));
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(cfg));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(cfg));
     }
 
     function _initDefault() internal {
@@ -258,13 +264,20 @@ contract URPTest is BaseTest {
      *      almost certainly wrong — extend the list only for a genuine append.
      */
     function test_upgradeable_storageLayoutIsFrozen() public view {
-        string[] memory expected = new string[](6);
+        // APPENDED 2026-09-09 for native mode: `$mode` and `$native` after `$credited`, `__gap`
+        // shrunk 45 -> 43 in the same commit so it still ends at slot 49. Slots 0-4 are unchanged
+        // from the deployed layout — that is what makes this an APPEND and not a reinterpretation.
+        // The rejected alternative (renaming `$configs` to `$universal`) would have failed here,
+        // which is the whole point of the assertion.
+        string[] memory expected = new string[](8);
         expected[0] = "UNIVERSAL_GATEWAY_PC";
         expected[1] = "UNIVERSAL_EXECUTOR_MODULE";
         expected[2] = "SESSION_ENGINE";
         expected[3] = "$configs";
         expected[4] = "$credited";
-        expected[5] = "__gap";
+        expected[5] = "$mode";
+        expected[6] = "$native";
+        expected[7] = "__gap";
 
         assertStorageLayout("URP", expected);
     }
@@ -273,6 +286,163 @@ contract URPTest is BaseTest {
     ///      constructor and is not returned anywhere, so it must be read from that slot.
     function _urpAdmin() internal view returns (address) {
         return address(uint160(uint256(vm.load(address(urp), ERC1967Utils.ADMIN_SLOT))));
+    }
+
+    /**
+     * @dev ⚠️ NEVER-DELETE (the seventeenth). URP's EXACT external selector set.
+     *
+     *      URP is the security boundary AND it is upgradeable, so an external function appearing on
+     *      it that nobody intended is exactly the thing worth pinning. An EXACT set, not a denylist:
+     *      a negative assertion cannot fail against a MISNAMED addition, which is the defect class
+     *      this form exists to catch.
+     *
+     *      Extend this list ONLY for a deliberate addition, in the same commit that adds it.
+     */
+    function test_URP_exactSelectorSet() public view {
+        bytes4[] memory expected = new bytes4[](16);
+        uint256 i;
+
+        // Wiring anchors and the public constant. Addressed by SIGNATURE, not `.selector`: solc
+        // does not expose a `.selector` member on a public state variable's or constant's
+        // auto-generated getter.
+        expected[i++] = bytes4(keccak256("SEND_OUTBOUND_SELECTOR()"));
+        expected[i++] = bytes4(keccak256("SESSION_ENGINE()"));
+        expected[i++] = bytes4(keccak256("UNIVERSAL_EXECUTOR_MODULE()"));
+        expected[i++] = bytes4(keccak256("UNIVERSAL_GATEWAY_PC()"));
+        expected[i++] = bytes4(keccak256("version()"));
+
+        // initialisation
+        expected[i++] = URP.initialize.selector;
+        expected[i++] = URP.initializeWithMultiplexer.selector;
+
+        // the engine-facing check
+        expected[i++] = URP.checkAction.selector;
+
+        // assertions — BOTH overloads, addressed by signature because `.selector` is ambiguous
+        expected[i++] = bytes4(keccak256("assertSpent(bytes32,address,uint256)"));
+        expected[i++] = bytes4(keccak256("assertSpent(bytes32,address,uint256,uint256,uint32)"));
+
+        // the refund path
+        expected[i++] = URP.creditRevert.selector;
+        expected[i++] = URP.isCredited.selector;
+
+        // views
+        expected[i++] = URP.getConfig.selector;
+        expected[i++] = URP.getNativeConfig.selector;
+        expected[i++] = URP.getMode.selector;
+
+        expected[i++] = URP.supportsInterface.selector;
+
+        assertEq(i, 16, "the hard-coded list must be complete");
+        assertSelectorSet("URP", expected);
+    }
+
+    /**
+     * @dev DECISION 47 — pre-upgrade universal mandates keep working with NO migration.
+     *
+     *      This is the property the whole append-only storage design exists to deliver, and it is
+     *      the one that would fail silently if the layout had been reordered. A config written
+     *      BEFORE native mode existed has an EMPTY `$mode` slot; `checkAction`'s routing sends an
+     *      empty slot to `_checkUniversal`, which is exactly right.
+     *
+     *      SIMULATING A PRE-UPGRADE CONFIG HONESTLY. The current code writes `$mode` on every init,
+     *      so a config created here is NOT pre-upgrade-shaped. The distinguishing feature of a real
+     *      one is precisely that `$mode` was never written — the slot did not exist when the config
+     *      was created. So the mode slot is zeroed with `vm.store` after init, reproducing the exact
+     *      storage state the deployed contract holds today: `$configs` populated, `$mode` empty.
+     *
+     *      That is a state manipulation, not a mock: nothing supplies behaviour to the code under
+     *      test. It only removes a write that the pre-upgrade implementation never made.
+     *
+     *      ⚠️ AMENDED 2026-09-09 (Phase 3b, review §2.1/§4.1). This test previously asserted that
+     *      `getMode` REPORTS a legacy config as uninitialised. That was the symptom of a real bug
+     *      dressed as a property: because the re-init guard read the same empty slot, a pre-upgrade
+     *      config was RE-INITIALISABLE — its `spent` could be reset to zero, or its mode flipped to
+     *      NATIVE, through the owner door. `_modeOf` is now legacy-aware, so the truthful statement
+     *      is TWO separate facts, asserted separately:
+     *        1. the RAW SLOT is still empty — nothing moved, which is the storage claim;
+     *        2. the DERIVED view reports `(true, UNIVERSAL)` — which is what the config actually is.
+     */
+    function test_upgradeable_preUpgradeUniversalConfigStillValidates() public {
+        _initDefault();
+        vm.prank(address(engine));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
+        uint256 spentBefore = _spent();
+
+        bytes32 modeSlot = _modeSlotOf(CID, ACCOUNT);
+        vm.store(address(urp), modeSlot, bytes32(0));
+
+        // 1. the raw slot is empty — the pre-upgrade storage state, unmoved
+        assertEq(vm.load(address(urp), modeSlot), bytes32(0), "the raw $mode slot is empty");
+        // 2. and the derived view tells the truth about what the config IS
+        assertTrue(urp.getMode(CID, ACCOUNT).initialized, "a legacy config reports as initialised");
+        assertEq(uint8(urp.getMode(CID, ACCOUNT).mode), uint8(MandateType.UNIVERSAL), "and reports as UNIVERSAL");
+
+        URP next = new URP();
+        vm.prank(URP_ADMIN_OWNER);
+        ProxyAdmin(_urpAdmin()).upgradeAndCall(ITransparentUpgradeableProxy(address(urp)), address(next), "");
+
+        // Still routes to the universal gauntlet and still meters, with no migration of any kind.
+        vm.prank(address(engine));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
+
+        assertEq(_spent(), spentBefore + 1 ether, "the pre-upgrade config still meters through gates 1-16");
+        assertEq(vm.load(address(urp), modeSlot), bytes32(0), "and its raw $mode slot is STILL empty");
+        assertTrue(urp.getMode(CID, ACCOUNT).initialized, "and it still reports as initialised");
+    }
+
+    /**
+     * @dev ⚠️ NEVER-DELETE — the EIGHTEENTH. Added 2026-09-09 (Phase 3b, review §2.1).
+     *
+     *      THE TEST THAT WOULD HAVE CAUGHT THE BUG. A pre-upgrade universal config has an empty
+     *      `$mode` slot, and the first native-mode implementation keyed its re-initialisation guard
+     *      on that slot alone. So every config that exists on Donut today was re-initialisable
+     *      through the owner door: re-init UNIVERSAL reset `spent` to zero; re-init NATIVE flipped
+     *      the mode under live universal data.
+     *
+     *      Reach was owner-door only — `grantMandate` always mints a fresh permission id, and the
+     *      agent door cannot target the engine — so it was owner self-harm rather than an agent
+     *      escalation. It is fixed anyway: it silently removed a documented invariant from exactly
+     *      the state an upgrade must not weaken.
+     *
+     *      If this test starts passing for the wrong reason, check that `_modeOf` still consults
+     *      `$configs[..].initialized` and not just `$mode`.
+     */
+    function test_upgradeable_preUpgradeConfigRefusesReinit() public {
+        _initDefault();
+        vm.prank(address(engine));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
+        uint256 spentBefore = _spent();
+        assertGt(spentBefore, 0, "the counter must have moved, or this test proves nothing");
+
+        // The legacy shape: $configs live, $mode never written.
+        vm.store(address(urp), _modeSlotOf(CID, ACCOUNT), bytes32(0));
+
+        // (a) re-init as UNIVERSAL would have RESET `spent`.
+        vm.prank(address(engine));
+        vm.expectRevert(abi.encodeWithSelector(IURP.AlreadyInitialized.selector, CID));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(_defaultConfig()));
+
+        // (b) re-init as NATIVE would have FLIPPED the mode under live universal data.
+        IURP.NativeConfig memory native;
+        native.validUntil = VALID_UNTIL;
+        native.target = PROTOCOL;
+        native.selector = SWAP_SELECTOR;
+        vm.prank(address(engine));
+        vm.expectRevert(abi.encodeWithSelector(IURP.AlreadyInitialized.selector, CID));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, nativeInitData(native));
+
+        // Neither attempt touched anything.
+        assertEq(_spent(), spentBefore, "spend counter untouched by the refused re-inits");
+        assertEq(urp.getConfig(CID, ACCOUNT).asset, ASSET, "and the live config is still readable");
+    }
+
+    /// @dev `$mode` is slot 5: keccak(account . keccak(multiplexer . keccak(configId . 5))).
+    function _modeSlotOf(ConfigId id, address account) internal view returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(account, keccak256(abi.encode(address(engine), keccak256(abi.encode(id, uint256(5))))))
+            );
     }
 
     /// The hand-hashed constant must equal the interface's own selector.
@@ -319,7 +489,7 @@ contract URPTest is BaseTest {
 
     function test_init_emitsBothPolicySetEvents() public {
         vm.expectEmit(true, true, true, true, address(urp));
-        emit IURP.URPPolicySet(CID, address(engine), ACCOUNT);
+        emit IURP.URPPolicySet(CID, address(engine), ACCOUNT, MandateType.UNIVERSAL);
         vm.expectEmit(true, true, true, true, address(urp));
         emit IPolicy.PolicySet(CID, address(engine), ACCOUNT);
         _initDefault();
@@ -330,13 +500,13 @@ contract URPTest is BaseTest {
         noAsset.asset = address(0);
         vm.prank(address(engine));
         vm.expectRevert(IURP.InvalidConfigField.selector);
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(noAsset));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(noAsset));
 
         IURP.Config memory noCEA = _defaultConfig();
         noCEA.expectedCEA = address(0);
         vm.prank(address(engine));
         vm.expectRevert(IURP.InvalidConfigField.selector);
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(noCEA));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(noCEA));
     }
 
     /// §6.1: a per-call cap of zero is a LEGAL redeploy-only mandate. Do not reject it at init.
@@ -355,21 +525,21 @@ contract URPTest is BaseTest {
         zero.validUntil = 0;
         vm.prank(address(engine));
         vm.expectRevert(abi.encodeWithSelector(IURP.InvalidExpiry.selector, uint48(0)));
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(zero));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(zero));
 
         // init with validUntil in the past
         IURP.Config memory past = _defaultConfig();
         past.validUntil = uint48(block.timestamp - 1);
         vm.prank(address(engine));
         vm.expectRevert(abi.encodeWithSelector(IURP.InvalidExpiry.selector, past.validUntil));
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(past));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(past));
 
         // init with validUntil exactly now — also refused: "in the future" is strict
         IURP.Config memory now_ = _defaultConfig();
         now_.validUntil = uint48(block.timestamp);
         vm.prank(address(engine));
         vm.expectRevert(abi.encodeWithSelector(IURP.InvalidExpiry.selector, now_.validUntil));
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(now_));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(now_));
 
         // a live config validates; once expired it rejects everything
         _initDefault();
@@ -415,13 +585,13 @@ contract URPTest is BaseTest {
         IURP.Config memory empty = _config(new IURP.AllowedCall[](0));
         vm.prank(address(engine));
         vm.expectRevert(abi.encodeWithSelector(IURP.AllowListOutOfRange.selector, uint256(0)));
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(empty));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(empty));
 
         // 33 entries
         IURP.Config memory tooMany = _config(_nRules(33));
         vm.prank(address(engine));
         vm.expectRevert(abi.encodeWithSelector(IURP.AllowListOutOfRange.selector, uint256(33)));
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(tooMany));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(tooMany));
 
         // 1 entry initialises
         _initDefault();
@@ -430,7 +600,7 @@ contract URPTest is BaseTest {
         // 32 entries initialise, under a different config id
         ConfigId other = ConfigId.wrap(bytes32(uint256(0xBEEF)));
         vm.prank(address(engine));
-        urp.initializeWithMultiplexer(ACCOUNT, other, abi.encode(_config(_nRules(32))));
+        urp.initializeWithMultiplexer(ACCOUNT, other, universalInitData(_config(_nRules(32))));
         assertEq(urp.getConfig(other, ACCOUNT).allowedCalls.length, 32, "32 entries accepted");
     }
 
@@ -472,7 +642,7 @@ contract URPTest is BaseTest {
         //     engine's owner-only in-place counter-reset lever into a wall.
         vm.prank(address(engine));
         vm.expectRevert(abi.encodeWithSelector(IURP.AlreadyInitialized.selector, CID));
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(_defaultConfig()));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(_defaultConfig()));
         assertEq(_spent(), 10 ether, "spent survives the refused re-init");
 
         // (b) creditRevert from any non-module caller reverts — the agent cannot fabricate a
@@ -1298,7 +1468,7 @@ contract URPTest is BaseTest {
         IURP.Config memory attackerCfg = _defaultConfig();
         attackerCfg.maxAmountTotal = type(uint256).max;
         vm.prank(AGENT);
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(attackerCfg));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(attackerCfg));
 
         // The engine-keyed config is untouched — including its spend counter.
         IURP.Config memory real = urp.getConfig(CID, ACCOUNT);
@@ -1308,7 +1478,7 @@ contract URPTest is BaseTest {
         // And the stranger's write did NOT clear the engine's initialized flag: re-init still fails.
         vm.prank(address(engine));
         vm.expectRevert(abi.encodeWithSelector(IURP.AlreadyInitialized.selector, CID));
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(_defaultConfig()));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(_defaultConfig()));
     }
 
     /**
@@ -1324,7 +1494,7 @@ contract URPTest is BaseTest {
         IURP.Config memory strangerCfg = _defaultConfig();
         strangerCfg.spent = 999 ether; // ignored by _store anyway
         vm.prank(AGENT);
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(strangerCfg));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(strangerCfg));
 
         // getConfig reads the engine slice
         assertEq(urp.getConfig(CID, ACCOUNT).spent, 10 ether, "getConfig is engine-keyed");

@@ -31,6 +31,51 @@ struct Multicall {
 bytes4 constant MULTICALL_SELECTOR = bytes4(keccak256("UEA_MULTICALL"));
 
 /**
+ * @dev The two kinds of mandate. Declared by the owner at grant, asserted by the wallet, stored by
+ *      URP as the config's mode.
+ *
+ *      DECLARED ONCE, HERE, AND IMPORTED BY BOTH THE WALLET AND `IURP`. Two enums with identical
+ *      values that must always agree is the duplication this file exists to prevent — see the note
+ *      on `SEND_OUTBOUND_SELECTOR` below. The wallet asserts the declared type against the action
+ *      set at grant; URP stores it and branches on it at validation. They must be the same type.
+ *
+ *      `UNIVERSAL` is the zero value, so an uninitialised slot reads as `UNIVERSAL`. That is why
+ *      URP's `ModeSlot` carries an explicit `initialized` flag and never infers emptiness from the
+ *      mode alone.
+ */
+enum MandateType {
+    UNIVERSAL,
+    NATIVE
+}
+
+/**
+ * @dev Mirrors of engine constants that are not importable — `IdLib.VALUE_SELECTOR` is `internal`
+ *      to a library, and the fallback flags are file-level constants in the vendored fork.
+ *
+ *      MIRRORED, NOT GUESSED: each is pinned by a constant-mirror test against the upstream value,
+ *      exactly as `MULTICALL_SELECTOR` is. If the fork moves, the test fails rather than the wallet
+ *      silently permitting an action it means to forbid.
+ */
+
+/// @dev `IdLib.VALUE_SELECTOR` — the action selector the engine assigns when calldata is under four
+///      bytes. A native action carrying this selector is a value-only transfer with EMPTY calldata;
+///      a no-argument function like `unstake()` still carries its own four bytes and is a normal
+///      selector action.
+bytes4 constant VALUE_SELECTOR = 0xFFFFFFFF;
+
+/// @dev `DataTypes.FALLBACK_TARGET_FLAG`. Refused by name at grant time: the engine does NOT reject
+///      it at enable time (only at check time, `PolicyLib.sol:200`), so the wallet is the only
+///      grant-time layer for this value.
+address constant ENGINE_FALLBACK_TARGET = address(1);
+
+/// @dev `DataTypes.FALLBACK_TARGET_SELECTOR_FLAG` — the wildcard action's selector.
+bytes4 constant ENGINE_FALLBACK_SELECTOR = 0x00000001;
+
+/// @dev `DataTypes.FALLBACK_TARGET_SELECTOR_FLAG_PERMITTED_TO_CALL_SMARTSESSION` — the sentinel that
+///      routes a request to the engine itself. An agent reaching this could configure sessions.
+bytes4 constant ENGINE_FALLBACK_SELECTOR_SMARTSESSION = 0x00000002;
+
+/**
  * @dev The gateway's outbound entry point — the ONE selector an agent mandate may ever name.
  *
  *      DECLARED HERE, BESIDE THE STRUCT IT TAKES, AND NOWHERE ELSE. The wallet's grant-shape check

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import { MandateType } from "../libraries/PushWalletTypes.sol";
+
 /**
  * @title  IPushAgentWallet — the wallet's observable event surface.
  * @notice Every event `PushAgentWallet` emits is declared here, so indexers, monitoring and the SDK
@@ -41,7 +43,9 @@ interface IPushAgentWallet {
 
     // ────────────────────────────── mandate lifecycle ──────────────────────────────
 
-    event MandateGranted(bytes32 indexed permissionId);
+    /// @dev Carries the declared `MandateType`, so an indexer can tell a native mandate from a
+    ///      universal one without re-deriving it from the session's actions.
+    event MandateGranted(bytes32 indexed permissionId, MandateType mandateType);
     event MandateRevoked(bytes32 indexed permissionId);
 
     /// @notice An agent request passed validation and was dispatched.

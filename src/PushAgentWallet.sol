@@ -6,14 +6,21 @@ import { ReentrancyGuardTransient } from "@openzeppelin/contracts/utils/Reentran
 import { IERC165 } from "forge-std/interfaces/IERC165.sol";
 
 import { ISmartSession } from "smartsessions/ISmartSession.sol";
-import { Session, PermissionId, ValidationData, SmartSessionMode } from "smartsessions/DataTypes.sol";
+import { Session, ActionData, PermissionId, ValidationData, SmartSessionMode } from "smartsessions/DataTypes.sol";
 import { PackedUserOperation } from "account-abstraction/interfaces/PackedUserOperation.sol";
 import { IModule as IERC7579Module } from "erc7579/interfaces/IERC7579Module.sol";
 
 import { IPushSessionValidator } from "./interfaces/IPushSessionValidator.sol";
 import { IPushAgentWallet } from "./interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "./libraries/PushWalletErrors.sol";
-import { SEND_OUTBOUND_SELECTOR, OP_HASH_DOMAIN } from "./libraries/PushWalletTypes.sol";
+import {
+    SEND_OUTBOUND_SELECTOR,
+    OP_HASH_DOMAIN,
+    MandateType,
+    ENGINE_FALLBACK_TARGET,
+    ENGINE_FALLBACK_SELECTOR,
+    ENGINE_FALLBACK_SELECTOR_SMARTSESSION
+} from "./libraries/PushWalletTypes.sol";
 import {
     ModeCode,
     CallType,
@@ -53,6 +60,20 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
 
     /// @dev Gas cap on the pre-uninstall state probe of the session engine.
     uint256 internal constant ENGINE_STATE_PROBE_GAS = 30_000;
+
+    /**
+     * @dev Maximum actions in one NATIVE mandate. `UNIVERSAL` is always exactly one.
+     *
+     *      A SANITY BOUND, NOT A GAS BOUND — measured, a maximal 8x8 grant sits far inside the
+     *      budget. It caps the O(n^2) duplicate scan below, the per-mandate audit and UI surface a
+     *      human has to reason about, and `stopMandate`'s engine-side cleanup cost.
+     *
+     *      Lives HERE, not in `PushWalletTypes`, because it is a wallet policy number that URP never
+     *      reads — unlike the engine mirrors, which are shared. Do not confuse it with URP's
+     *      `MAX_ACTIONS_PER_REQUEST` (10): that bounds multicall ENTRIES inside one universal
+     *      payload, two layers down. Different layers, different numbers, never conflated.
+     */
+    uint256 internal constant MAX_NATIVE_ACTIONS = 8;
 
     // The four wiring addresses. Resolved from the implementation's runtime bytecode, so every
     // clone reads them correctly through delegatecall.
@@ -120,9 +141,17 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
      *
      *      - A batch entry targeting the wallet arrives with `msg.sender == address(this)`, so
      *        without this the owner's own one-signature change batch reverts against itself.
-     *      - Widening to self is safe because self is reachable only through the owner door: the
-     *        only thing that can make the wallet call itself is `_execute`, and the agent door's
-     *        dispatch is refused three independent ways.
+     *      - Widening to self is safe because self is reachable only through the owner door. From
+     *        the agent door it is refused FOUR ways, in the order they fire:
+     *          (a) at grant time, by `_requireGrantableTarget` — the wallet is never a grantable
+     *              native action target;
+     *          (b) at dispatch time, by the guard in `_gateAndDispatch` — which holds even for a
+     *              session the owner enabled on the engine directly through the owner door,
+     *              bypassing `grantMandate` entirely;
+     *          (c) by the engine's `NoPoliciesSet`, because (a) guarantees the wallet is never a
+     *              configured action — true regardless of how many actions a mandate holds;
+     *          (d) by the engine's `InvalidSelfCall`, for the `execute` selector specifically.
+     *        (a) and (b) are never-delete tests.
      *      - Not applied to installModule or uninstallModule; nothing needs them batched.
      */
     modifier onlyOwnerOrSelf() {
@@ -290,7 +319,13 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
      * @param  session       The session to enable. Its `salt` field is ignored and overwritten.
      * @return permissionId  The engine's id for the newly enabled mandate.
      */
-    function grantMandate(Session calldata session) external onlyOwnerOrSelf returns (bytes32 permissionId) {
+    function grantMandate(Session calldata session, MandateType mandateType)
+        external
+        onlyOwnerOrSelf
+        returns (bytes32 permissionId)
+    {
+        // ─── rules COMMON to both types, first ───
+
         if (session.userOpPolicies.length != 0) revert PushWalletErrors.MalformedSessionShape();
 
         if (
@@ -300,17 +335,61 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
 
         if (session.permitERC4337Paymaster) revert PushWalletErrors.MalformedSessionShape();
 
-        if (session.actions.length != 1) revert PushWalletErrors.MalformedSessionShape();
+        // ─── the type branch ───
+        //
+        // THE INVARIANT, STATED ONCE: a wrong POLICY is always `MalformedSessionShape`; a target
+        // wrong FOR THE DECLARED TYPE is always `MandateTypeMismatch`. Between the two branches
+        // there is no shape in which a gateway call reaches a native config, and none in which a
+        // native call reaches a universal one — which, with URP's N3 and gate 3 at runtime, is the
+        // whole consistency argument.
 
-        if (
-            session.actions[0].actionTarget != UNIVERSAL_GATEWAY_PC
-                || session.actions[0].actionTargetSelector != SEND_OUTBOUND_SELECTOR
-        ) revert PushWalletErrors.MalformedSessionShape();
+        uint256 n = session.actions.length;
 
-        if (
-            session.actions[0].actionPolicies.length != 1
-                || session.actions[0].actionPolicies[0].policy != CANONICAL_URP
-        ) revert PushWalletErrors.MalformedSessionShape();
+        if (mandateType == MandateType.UNIVERSAL) {
+            if (n != 1) revert PushWalletErrors.MalformedSessionShape();
+
+            ActionData calldata a = session.actions[0];
+            if (a.actionTarget != UNIVERSAL_GATEWAY_PC || a.actionTargetSelector != SEND_OUTBOUND_SELECTOR) {
+                revert PushWalletErrors.MandateTypeMismatch(mandateType, 0, a.actionTarget);
+            }
+            if (a.actionPolicies.length != 1 || a.actionPolicies[0].policy != CANONICAL_URP) {
+                revert PushWalletErrors.MalformedSessionShape();
+            }
+        } else {
+            if (n == 0 || n > MAX_NATIVE_ACTIONS) revert PushWalletErrors.TooManyActions(n);
+
+            // Hoisted: `_factory()` does an extcodecopy of the clone's own bytecode on every call.
+            address factoryAddr = _factory();
+
+            for (uint256 i; i < n;) {
+                ActionData calldata a = session.actions[i];
+
+                _requireGrantableTarget(a.actionTarget, factoryAddr, i);
+                _requireGrantableSelector(a.actionTargetSelector);
+
+                if (a.actionPolicies.length != 1 || a.actionPolicies[0].policy != CANONICAL_URP) {
+                    revert PushWalletErrors.MalformedSessionShape();
+                }
+
+                // O(n^2) by design: 28 comparisons at the n=8 ceiling, which beats a mapping and its
+                // clear-down. Two identical (target, selector) pairs would hash to one actionId.
+                for (uint256 j; j < i;) {
+                    if (
+                        session.actions[j].actionTarget == a.actionTarget
+                            && session.actions[j].actionTargetSelector == a.actionTargetSelector
+                    ) {
+                        revert PushWalletErrors.DuplicateAction(a.actionTarget, a.actionTargetSelector);
+                    }
+                    unchecked {
+                        ++j;
+                    }
+                }
+
+                unchecked {
+                    ++i;
+                }
+            }
+        }
 
         if (address(session.sessionValidator) != CANONICAL_SESSION_VALIDATOR) {
             revert PushWalletErrors.MalformedSessionShape();
@@ -335,7 +414,64 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
         PermissionId[] memory ids = ISmartSession(DEFAULT_SESSION_ENGINE).enableSessions(sessions);
 
         permissionId = PermissionId.unwrap(ids[0]);
-        emit MandateGranted(permissionId);
+        emit MandateGranted(permissionId, mandateType);
+    }
+
+    /**
+     * @dev Every grant-time target rule for a NATIVE action, in one place.
+     *
+     *      TWO RULES, TWO ERRORS, AND THE DISTINCTION IS THE POINT:
+     *
+     *      - **The gateway → `MandateTypeMismatch`.** The session is well-formed; the owner declared
+     *        the wrong TYPE. A gateway target is perfectly grantable — as `UNIVERSAL`. Carries the
+     *        action index, because with up to eight actions "something was wrong" is not a usable
+     *        diagnostic. This is one half of the consistency lock; URP's N3 is the runtime mirror.
+     *      - **The other seven → `ForbiddenActionTarget`.** Never grantable, under any type.
+     *
+     *      Of those seven the severe pair is the wallet and the engine: from the agent door,
+     *      `_execute(wallet, 0, grantMandate(...))` would arrive with `msg.sender == address(this)`,
+     *      pass `onlyOwnerOrSelf`, and the agent would have granted itself a mandate of its own
+     *      design. `stopAll` is the mirror.
+     *
+     *      LAYER CREDIT, so nobody deletes the wrong one as redundant: the engine independently
+     *      refuses `address(0)` and ITSELF at enable time (`ConfigLib.sol:139-143`), but it does NOT
+     *      refuse `address(1)` there — only at check time. **This is the only grant-time layer for
+     *      the fallback flag.**
+     *
+     *      The action-policy check is deliberately NOT here. That is a SHAPE rule — it raises
+     *      `MalformedSessionShape`, and the UNIVERSAL branch and the common rules raise the same
+     *      error for the same class of defect. It belongs with them, not inside a target helper.
+     *
+     * @param t            Action target to vet.
+     * @param factoryAddr  The clone's factory, hoisted by the caller so the loop reads it once.
+     *                     `_factory()` does an extcodecopy of the clone's own bytecode; the other
+     *                     six comparands are immutables and are free to read here.
+     * @param index        Index of this action, reported by `MandateTypeMismatch`.
+     */
+    function _requireGrantableTarget(address t, address factoryAddr, uint256 index) internal view {
+        if (t == UNIVERSAL_GATEWAY_PC) {
+            revert PushWalletErrors.MandateTypeMismatch(MandateType.NATIVE, index, t);
+        }
+        if (
+            t == address(0) || t == ENGINE_FALLBACK_TARGET || t == address(this) || t == DEFAULT_SESSION_ENGINE
+                || t == CANONICAL_URP || t == CANONICAL_SESSION_VALIDATOR || t == factoryAddr
+        ) {
+            revert PushWalletErrors.ForbiddenActionTarget(t);
+        }
+    }
+
+    /**
+     * @dev The grant-time forbidden-selector list for NATIVE actions.
+     *
+     *      Refuses the engine's two fallback selectors by name. `0xFFFFFFFF` (value-only) is
+     *      PERMITTED and is deliberately not on this list.
+     *
+     * @param s  Action selector to vet.
+     */
+    function _requireGrantableSelector(bytes4 s) internal pure {
+        if (s == ENGINE_FALLBACK_SELECTOR || s == ENGINE_FALLBACK_SELECTOR_SMARTSESSION) {
+            revert PushWalletErrors.ForbiddenActionSelector(s);
+        }
     }
 
     /**
@@ -476,6 +612,22 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
             revert PushWalletErrors.UnsupportedExecutionMode();
         }
         (address target, uint256 value, bytes calldata callData) = ExecutionLib.decodeSingle(executionCalldata);
+
+        // ⚠️ THE DISPATCH GUARD — never-delete, and it belongs HERE, after validation.
+        //
+        // Two comparisons, no storage, no module or policy state. It holds regardless of how the
+        // session was enabled — including a session the owner enabled on the engine DIRECTLY
+        // through the owner door, bypassing `grantMandate` and its forbidden-target list entirely.
+        // That path exists today and is legitimate; this is what stops it reaching the wallet's own
+        // lifecycle functions from the agent side.
+        //
+        // DO NOT MOVE IT BEFORE `_validate`. Placed earlier it would pre-empt the engine's own
+        // refusals and change which error surfaces, and the engine-target case only ever reaches
+        // this point through the fallback sentinel, which validation has to run to resolve.
+        if (target == address(this) || target == DEFAULT_SESSION_ENGINE) {
+            revert PushWalletErrors.ForbiddenDispatchTarget(target);
+        }
+
         _execute(target, value, callData);
     }
 
