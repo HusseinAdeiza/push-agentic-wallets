@@ -26,7 +26,7 @@ contract MockUSDC is ERC20 {
  * @notice Unit tests for the demo's far-chain target.
  *
  * @dev    These cover the contract's own behaviour only. That the MANDATE constrains calls to it
- *         is UCEP's property and is proven by the gauntlet scripts against the live chain, not
+ *         is URP's property and is proven by the gauntlet scripts against the live chain, not
  *         here — a unit test of StakeDummy cannot demonstrate anything about the policy.
  */
 contract StakeDummyTest is Test {
@@ -87,7 +87,7 @@ contract StakeDummyTest is Test {
     }
 
     /// @dev The beneficiary must sit at calldata offset 4 — the first argument word. The mandate
-    ///      names that offset, and UCEP reads a 32-byte word there and compares it to the expected
+    ///      names that offset, and URP reads a 32-byte word there and compares it to the expected
     ///      CEA. If the signature ever gained a leading parameter this assertion fails, which is
     ///      the point: the offset is a contract between this file and the mandate.
     function test_stakeFor_beneficiaryIsAtCalldataOffset4() public pure {

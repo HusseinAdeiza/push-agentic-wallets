@@ -6,7 +6,7 @@ import { IERC20 } from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import { AddressBook } from "./AddressBook.sol";
 import { DemoLog } from "./DemoLog.sol";
 import { Ledger } from "./Ledger.sol";
-import { IUCEP } from "../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../src/interfaces/IURP.sol";
 import { ConfigId } from "smartsessions/DataTypes.sol";
 import { SEND_OUTBOUND_SELECTOR } from "../../src/libraries/PushWalletTypes.sol";
 
@@ -69,7 +69,7 @@ library Inspect {
         bytes32 pid = Ledger.word("permissionId", "14_GrantMandate");
 
         bool live = IEngineState(AddressBook.ours("sessionEngine")).isPermissionEnabled(pid, agw);
-        IUCEP.Config memory cfg = IUCEP(AddressBook.ours("ucep")).getConfig(configId(agw), agw);
+        IURP.Config memory cfg = IURP(AddressBook.ours("urp")).getConfig(configId(agw), agw);
 
         DemoLog.line(DemoLog.bold("The mandate"));
         DemoLog.kv("Status", live ? DemoLog.green("live") : DemoLog.red("revoked"));
@@ -94,7 +94,7 @@ library Inspect {
         DemoLog.kv("Allow-list", string.concat(vm.toString(cfg.allowedCalls.length), " calls"));
 
         for (uint256 i; i < cfg.allowedCalls.length; ++i) {
-            IUCEP.AllowedCall memory a = cfg.allowedCalls[i];
+            IURP.AllowedCall memory a = cfg.allowedCalls[i];
             DemoLog.note(
                 string.concat(
                     "    ",

@@ -11,17 +11,22 @@ import { Keys } from "../../lib/Keys.sol";
 import { Ledger } from "../../lib/Ledger.sol";
 import { Amounts } from "../../lib/Amounts.sol";
 import { BobPayload, IUEA, UniversalPayload } from "../../lib/BobPayload.sol";
-import { IUCEP } from "../../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../../src/interfaces/IURP.sol";
 import { IPushAgentWallet } from "../../../src/interfaces/IPushAgentWallet.sol";
-import { SEND_OUTBOUND_SELECTOR } from "../../../src/libraries/PushWalletTypes.sol";
+import { SEND_OUTBOUND_SELECTOR, MandateType } from "../../../src/libraries/PushWalletTypes.sol";
 import { StakeDummy } from "../../contracts/StakeDummy.sol";
 
 /// @dev `IPushAgentWallet` carries the wallet's EVENTS only — it deliberately declares no
 ///      functions — so the one call this script encodes is declared here. The signature mirrors
 ///      `PushAgentWallet.grantMandate` exactly; `Session` is the same `smartsessions` type the
 ///      wallet takes, so `abi.encodeCall` type-checks against the real ABI.
+///
+/// @dev  THE SECOND ARGUMENT IS NEW. URP became a two-mode policy, and the type is now an explicit
+///       parameter rather than something inferred from the action's target — so the SELECTOR
+///       CHANGED. A payload built against the old one-argument shape does not fail a shape check;
+///       it misses the function entirely.
 interface IWalletGrant {
-    function grantMandate(Session calldata session) external returns (bytes32 permissionId);
+    function grantMandate(Session calldata session, MandateType mandateType) external returns (bytes32 permissionId);
 }
 
 /**
@@ -38,7 +43,7 @@ interface IWalletGrant {
  *
  *         THE SHAPE IS ENFORCED BY THE WALLET, NOT BY CONVENTION. `grantMandate` refuses anything
  *         but the canonical shape: exactly one action, the canonical validator, exactly one action
- *         policy which must be the deployed UCEP, no user-op policies, no ERC-7739 policies, and
+ *         policy which must be the deployed URP, no user-op policies, no ERC-7739 policies, and
  *         `permitERC4337Paymaster` false. The salt passed here is discarded — the wallet overwrites
  *         it with its own monotonic grant counter, so every grant yields a permission id that never
  *         recurs.
@@ -72,14 +77,18 @@ contract GrantMandate is Script {
         address stakeDummy = AddressBook.sepolia("StakeDummy");
         address prc20 = AddressBook.donut("PRC20_USDC");
         address validator = AddressBook.ours("sessionValidator");
-        address ucep = AddressBook.ours("ucep");
+        address urp = AddressBook.ours("urp");
 
         uint256 maxPCPerCall = Ledger.num("quote.maxPCPerCall", "01_Quote");
 
-        Session memory session = _session(validator, ucep, agent, cea, prc20, stakeDummy, maxPCPerCall);
+        Session memory session = _session(validator, urp, agent, cea, prc20, stakeDummy, maxPCPerCall);
 
-        (UniversalPayload memory payload, bytes memory signature) =
-            BobPayload.signedCall(uea, agw, abi.encodeCall(IWalletGrant.grantMandate, (session)), bobPk, VALID_FOR);
+        // UNIVERSAL: this mandate's one action is the gateway's outbound send. The wallet asserts
+        // the declared type against the action target, so a mismatch is `MandateTypeMismatch` rather
+        // than a silent acceptance.
+        (UniversalPayload memory payload, bytes memory signature) = BobPayload.signedCall(
+            uea, agw, abi.encodeCall(IWalletGrant.grantMandate, (session, MandateType.UNIVERSAL)), bobPk, VALID_FOR
+        );
 
         vm.recordLogs();
         vm.startBroadcast(relayerPk);
@@ -97,16 +106,24 @@ contract GrantMandate is Script {
     /// @dev The canonical session shape. Every field is checked by `grantMandate`; see the contract.
     function _session(
         address validator,
-        address ucep,
+        address urp,
         address agent,
         address cea,
         address prc20,
         address stakeDummy,
         uint256 maxPCPerCall
     ) internal view returns (Session memory) {
+        // THE MODE WRAPPER. URP's `initData` is `abi.encode(uint8 mode, bytes body)` — no longer a
+        // bare `abi.encode(Config)`. A legacy bare struct does not mis-decode into something wrong;
+        // it reverts, UNNAMED, which is the one unnamed revert `initializeWithMultiplexer` has. That
+        // is a deliberate design choice upstream, and it is why this wrapper is not optional.
         PolicyData[] memory actionPolicies = new PolicyData[](1);
-        actionPolicies[0] =
-            PolicyData({ policy: ucep, initData: abi.encode(_config(cea, prc20, stakeDummy, maxPCPerCall)) });
+        actionPolicies[0] = PolicyData({
+            policy: urp,
+            initData: abi.encode(
+                uint8(MandateType.UNIVERSAL), abi.encode(_config(cea, prc20, stakeDummy, maxPCPerCall))
+            )
+        });
 
         ActionData[] memory actions = new ActionData[](1);
         // Selector BEFORE target — that is the declaration order in DataTypes.sol.
@@ -135,12 +152,12 @@ contract GrantMandate is Script {
     function _config(address cea, address prc20, address stakeDummy, uint256 maxPCPerCall)
         internal
         view
-        returns (IUCEP.Config memory)
+        returns (IURP.Config memory)
     {
-        IUCEP.AllowedCall[] memory allowed = new IUCEP.AllowedCall[](2);
+        IURP.AllowedCall[] memory allowed = new IURP.AllowedCall[](2);
 
         // The agent may stake — but the beneficiary is pinned to the CEA, one argument deep.
-        allowed[0] = IUCEP.AllowedCall({
+        allowed[0] = IURP.AllowedCall({
             target: stakeDummy,
             selector: StakeDummy.stakeFor.selector,
             beneficiaryOffset: BENEFICIARY_OFFSET,
@@ -149,7 +166,7 @@ contract GrantMandate is Script {
         });
 
         // And unstake, which takes no arguments — the caller is the staker.
-        allowed[1] = IUCEP.AllowedCall({
+        allowed[1] = IURP.AllowedCall({
             target: stakeDummy,
             selector: StakeDummy.unstake.selector,
             beneficiaryOffset: 0,
@@ -157,7 +174,7 @@ contract GrantMandate is Script {
             maxValue: 0
         });
 
-        return IUCEP.Config({
+        return IURP.Config({
             initialized: false,
             validUntil: uint48(block.timestamp) + VALIDITY,
             destChainHash: BobPayload.chainHash("11155111"),

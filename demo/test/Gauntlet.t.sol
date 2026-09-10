@@ -4,7 +4,7 @@ pragma solidity 0.8.26;
 import { Test } from "forge-std/Test.sol";
 import { Gauntlet } from "../lib/Gauntlet.sol";
 import { Requests } from "../lib/Requests.sol";
-import { IUCEP } from "../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../src/interfaces/IURP.sol";
 import { ExecutionLib } from "../../src/libraries/ExecutionLib.sol";
 
 /// @dev Exposes the library's internals for testing. `_decodeSingle` is private by design — the
@@ -30,7 +30,7 @@ contract GauntletHarness {
  * @notice Pins the two things the gauntlet's layer 2 silently depends on.
  *
  * @dev    WHY THIS MATTERS MORE THAN IT LOOKS. Layer 2 unpacks `executionCalldata` with raw
- *         assembly offsets and hands the pieces to `UCEP.checkAction`. If those offsets were wrong,
+ *         assembly offsets and hands the pieces to `URP.checkAction`. If those offsets were wrong,
  *         `checkAction` would be called with a mangled target or value — and it would still REVERT,
  *         just for the wrong reason. Every gauntlet script would print an amber refusal and none of
  *         them would be demonstrating the gate they name.
@@ -96,16 +96,16 @@ contract GauntletTest is Test {
     }
 
     /**
-     * @dev The five refusals, pinned. These come from `IUCEP` via `.selector` in the scripts, so a
+     * @dev The five refusals, pinned. These come from `IURP` via `.selector` in the scripts, so a
      *      signature change breaks the build — but the VALUES are asserted here so a change is
      *      visible rather than merely compiling.
      */
     function test_gauntletErrorSelectors() public pure {
-        assertEq(IUCEP.CallNotAllowed.selector, bytes4(0x805043f9), "G1");
-        assertEq(IUCEP.ForbiddenInnerTarget.selector, bytes4(0xffd57c0d), "G2");
-        assertEq(IUCEP.BeneficiaryMismatch.selector, bytes4(0x65aedd5a), "G3");
-        assertEq(IUCEP.AmountExceedsCap.selector, bytes4(0xcd0f2fa9), "G4");
-        assertEq(IUCEP.TotalSpendCapExceeded.selector, bytes4(0x7c9c949b), "G5");
+        assertEq(IURP.CallNotAllowed.selector, bytes4(0x805043f9), "G1");
+        assertEq(IURP.ForbiddenInnerTarget.selector, bytes4(0xffd57c0d), "G2");
+        assertEq(IURP.BeneficiaryMismatch.selector, bytes4(0x65aedd5a), "G3");
+        assertEq(IURP.AmountExceedsCap.selector, bytes4(0xcd0f2fa9), "G4");
+        assertEq(IURP.TotalSpendCapExceeded.selector, bytes4(0x7c9c949b), "G5");
     }
 
     /**
@@ -114,8 +114,8 @@ contract GauntletTest is Test {
      *      arguments do not — which is the entire reason layer 2 exists.
      */
     function test_truncationPreservesSelectorButLosesArguments() public pure {
-        // What UCEP would revert with: selector + two full words.
-        bytes memory full = abi.encodeWithSelector(IUCEP.AmountExceedsCap.selector, uint256(60e6), uint256(50e6));
+        // What URP would revert with: selector + two full words.
+        bytes memory full = abi.encodeWithSelector(IURP.AmountExceedsCap.selector, uint256(60e6), uint256(50e6));
 
         // What the engine keeps: the first 32 bytes, as a single word.
         bytes32 embedded;
@@ -123,7 +123,7 @@ contract GauntletTest is Test {
             embedded := mload(add(full, 0x20))
         }
 
-        assertEq(bytes4(embedded), IUCEP.AmountExceedsCap.selector, "the selector survives");
+        assertEq(bytes4(embedded), IURP.AmountExceedsCap.selector, "the selector survives");
 
         // The remaining 28 bytes are the HIGH bytes of the first argument - all zero for 60e6.
         assertEq(uint256(embedded) & type(uint224).max, 0, "the argument's surviving bytes carry no information");

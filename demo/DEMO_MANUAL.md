@@ -462,9 +462,16 @@ than he would at full scale.
 | Vault | `0xD019Eb12D0d6eF8D299661f22B4B7d262eD4b965` | Sepolia |
 | **CEAFactory** | **`0x5E191fbBe22F8866C5e4250557664fCE760e8870`** | Sepolia |
 | AGWFactory (proxy) | `0xF1A131571f89fD06890576e6cD0154114ACBBc8b` | Donut |
-| UCEP | `0x79F07D379BdC26468E48025a61bC955909522c1D` | Donut |
+| UCEP *(now URP)* | `0x79F07D379BdC26468E48025a61bC955909522c1D` | Donut |
 | SmartSession engine | `0x7540f9a59693d51CFB4A3727141eAE4836F96749` | Donut |
 | PushSessionValidator | `0x5A59a5Ac94d5190553821307F98e4673BF3c4a1D` | Donut |
+
+> ⚠️ **The four addresses above are the v1 deployment this testimony ran against, and are kept as a
+> historical record.** They are NOT what the demo uses today. The v2 cut redeployed the wallet
+> implementation, the factory, the session engine and the validator, and upgraded URP in place behind
+> its proxy — see `deployments/address-book-v2/`. Push core (gateway, UEA factory, PRC20) and the
+> Sepolia side did not move. A run today produces different UEA, AGW and CEA addresses, because the
+> factory changed.
 | UniversalGatewayPC | `0x00000000000000000000000000000000000000C1` | Donut |
 | PRC20 pUSDC | `0x7A58048036206bB898008b5bBDA85697DB1e5d66` | Donut |
 
@@ -778,3 +785,56 @@ address still shows `totalBalance = 5.00`, the stranded principal from the pre-f
 | 4 | 5 USDC stranded at the ghost CEA | Testnet, written off |
 | 5 | G1's code comment says "gate 13" | Stale — the allow-list is **gate 15** |
 | 6 | Relay latency 20s–7min, inconsistent | Raise `WATCH_TIMEOUT`; never trust a timeout |
+
+---
+
+# Migration to the v2 contracts
+
+The demo was updated for the v2 deployment, in which URP became a **two-mode** policy (universal +
+push-native) and was upgraded in place, while the wallet, factory, engine and validator were
+redeployed. **The cross-chain demo's behaviour is unchanged** — same acts, same gates, same script
+names. Only the wiring moved.
+
+### What actually broke, and why
+
+| # | Change | Why the demo broke |
+|---|---|---|
+| 1 | `IUCEP` → `IURP`, file renamed | 25 demo files imported a path that no longer exists |
+| 2 | `grantMandate(Session)` → `grantMandate(Session, MandateType)` | **Selector changed** `0x83b655f5` → `0xdc22b5a9`. The old payload does not fail a shape check — it misses the function entirely |
+| 3 | URP `initData` is now `abi.encode(uint8 mode, bytes body)` | A bare `abi.encode(Config)` reverts `InvalidPolicyMode(32)` — the ABI head offset read as a mode |
+| 4 | New engine, validator, wallet impl, factory | The validator's address feeds every permission id; a v1/v2 mix derives ids addressing an empty config |
+
+Changes 2 and 3 are the dangerous pair: both are **silent at compile time** against a stale interface
+and only fail on-chain, mid-act.
+
+### What did NOT change
+
+The universal `Config` struct, the `configId` derivation, all sixteen gates, `SEND_OUTBOUND_SELECTOR`,
+and `MandateGranted`'s indexed `permissionId` (it gained a second non-indexed field, but the topic
+layout the demo reads is untouched). Push core and the whole Sepolia side are unmoved.
+
+### The address book is split on purpose
+
+`AddressBook.ours()` reads `deployments/address-book-v2/`; `donut()` and `sepolia()` still read
+`deployments/address-book/`. Only our own five contracts moved, and `sepolia.json` carries the
+corrected `CEAFactory`. Copying files across to unify the directories would recreate the stale
+duplicate that caused the ghost-CEA failure.
+
+### ⚠️ A fresh Act 1 is mandatory
+
+**Any wallet from the v1 run is unusable.** It is bound by immutable to the v1 engine and v1 URP —
+`0xf4C25e8C…` (the last run's AGW) returns the v1 engine from `sessionEngine()` and does not even
+carry the `urp()` accessor. There is no migration; the factory changed, so the derivation changed.
+
+Start from `just act1a` with a funded Bob. The previous ledger is archived at
+`demo/state/ledger.v1run.json` — keep it, it pairs with the testimony above.
+
+### Verified
+
+- `FOUNDRY_PROFILE=demo forge build` clean; **75/76 demo tests pass** (the one failure is the drained
+  StakeDummy reward pool, pre-existing).
+- Main suite **328 passing**, unaffected.
+- Every v2 address resolves and has code; `preflight` clears all contract checks.
+- `act1a` simulates and predicts a new AGW from the v2 factory.
+- Both breaking changes proven against **live** v2 URP: the bare `initData` reverts
+  `InvalidPolicyMode`, the wrapped one passes the mode check.

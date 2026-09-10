@@ -110,7 +110,7 @@ contract Demo101 is Script {
         DemoLog.header("", "Deployed on Push Chain Donut (42101)");
         DemoLog.addrPlain("AGW Factory", AddressBook.ours("factoryProxy"));
         DemoLog.addrPlain("Wallet impl", AddressBook.ours("walletImplementation"));
-        DemoLog.addrPlain("UCEP policy", AddressBook.ours("ucep"));
+        DemoLog.addrPlain("URP policy", AddressBook.ours("urp"));
         DemoLog.addrPlain("Validator", AddressBook.ours("sessionValidator"));
         DemoLog.addrPlain("Session engine", AddressBook.ours("sessionEngine"));
         DemoLog.blank();

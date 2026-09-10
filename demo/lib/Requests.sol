@@ -22,7 +22,7 @@ import { ModeLib, ModeCode } from "../../src/libraries/ModeLib.sol";
  *         every Push-side check, emits its event, and then does nothing useful on Sepolia.
  *
  *         THE FIELDS THAT ARE NOT OPTIONAL, and why each is a whole class of wasted act:
- *           · `recipient` is ALWAYS empty. UCEP gate 11 rejects anything else.
+ *           · `recipient` is ALWAYS empty. URP gate 11 rejects anything else.
  *           · `token` is ALWAYS set, even when `amount` is 0. Gate 5 compares it regardless.
  *           · `maxPCForGas` is ALWAYS non-zero. Gate 9 does not look at amount either.
  *           · `revertRecipient` is ALWAYS the wallet. Gate 10.
@@ -100,7 +100,7 @@ library Requests {
     /**
      * @notice The ERC-7579 execution calldata that carries an outbound to the gateway.
      *
-     * @dev    `pcValue` travels INSIDE this blob and is what UCEP gate 8 compares against
+     * @dev    `pcValue` travels INSIDE this blob and is what URP gate 8 compares against
      *         `maxPCPerCall`. It is Push-native and has nothing to do with gate 16's per-entry
      *         cap, which is in destination-chain units — conflating the two is a real bug this
      *         design once carried.

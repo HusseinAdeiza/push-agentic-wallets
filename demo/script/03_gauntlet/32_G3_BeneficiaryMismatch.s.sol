@@ -8,7 +8,7 @@ import { Keys } from "../../lib/Keys.sol";
 import { Amounts } from "../../lib/Amounts.sol";
 import { Gauntlet } from "../../lib/Gauntlet.sol";
 import { AgentRequest } from "../../lib/AgentRequest.sol";
-import { IUCEP } from "../../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../../src/interfaces/IURP.sol";
 import { StakeDummy } from "../../contracts/StakeDummy.sol";
 
 /**
@@ -47,7 +47,7 @@ contract G3_BeneficiaryMismatch is Script {
 
         Gauntlet.refuse(
             "stakeFor(agent) instead of stakeFor(cea)",
-            IUCEP.BeneficiaryMismatch.selector,
+            IURP.BeneficiaryMismatch.selector,
             "Every other gate passes. Only the pinned beneficiary stops the agent staking Bob's capital for itself.",
             req
         );

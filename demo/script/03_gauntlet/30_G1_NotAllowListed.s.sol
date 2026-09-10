@@ -7,7 +7,7 @@ import { DemoLog } from "../../lib/DemoLog.sol";
 import { Keys } from "../../lib/Keys.sol";
 import { Gauntlet } from "../../lib/Gauntlet.sol";
 import { AgentRequest } from "../../lib/AgentRequest.sol";
-import { IUCEP } from "../../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../../src/interfaces/IURP.sol";
 
 /**
  * @title  G1 — a function nobody allow-listed
@@ -39,7 +39,7 @@ contract G1_NotAllowListed is Script {
 
         Gauntlet.refuse(
             "call an unnamed selector on StakeDummy",
-            IUCEP.CallNotAllowed.selector,
+            IURP.CallNotAllowed.selector,
             "Without this, naming a contract would hand the agent every function on it.",
             req
         );

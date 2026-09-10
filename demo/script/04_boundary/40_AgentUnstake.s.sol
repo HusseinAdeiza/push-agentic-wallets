@@ -24,7 +24,7 @@ import { StakeDummy } from "../../contracts/StakeDummy.sol";
  *           · `maxPCForGas` must STILL be non-zero — gate 9 does not look at amount either.
  *           · `msg.value` must STILL be sent — the gas swap runs, and reverts on a zero swap.
  *
- *         `_burnPRC20` is skipped and UCEP writes nothing to `spent`. So the agent can unwind
+ *         `_burnPRC20` is skipped and URP writes nothing to `spent`. So the agent can unwind
  *         without consuming budget — **the lifetime cap meters what LEAVES Push Chain, not how many
  *         times the agent acts.** That is the design working, not a gap.
  *

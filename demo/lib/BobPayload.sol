@@ -94,7 +94,7 @@ library BobPayload {
     /**
      * @notice The chain hash Push core derives from a namespace and id.
      * @dev    Reused as the mandate's `destChainHash` so the two agree and an indexer can join on
-     *         it. Stored by UCEP but never gated — the destination is already pinned by the asset.
+     *         it. Stored by URP but never gated — the destination is already pinned by the asset.
      */
     function chainHash(string memory chainId) internal pure returns (bytes32) {
         return keccak256(abi.encode(NAMESPACE, chainId));

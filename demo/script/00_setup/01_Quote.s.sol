@@ -19,7 +19,7 @@ import { GasSwap } from "../../lib/GasSwap.sol";
  *           1. `msg.value >= protocolFee`                       — gateway
  *           2. `maxPCForGas <= msg.value - protocolFee`         — gateway
  *           3. `msg.value - protocolFee > 0` after capping      — `_swapAndCollectFees`
- *           4. `msg.value <= cfg.maxPCPerCall`                  — UCEP gate 8
+ *           4. `msg.value <= cfg.maxPCPerCall`                  — URP gate 8
  *
  *         Constraint 4 is the one that bites late: `maxPCPerCall` is frozen into the mandate at
  *         grant time and cannot be raised without revoking and regranting. So this script does not
@@ -111,7 +111,7 @@ contract Quote is Script {
             DemoLog.fail("PC CAP", "the granted mandate cannot pay for an outbound at today's fees");
             DemoLog.kv("  granted", DemoLog.formatAmount(granted, 18, "PC"));
             DemoLog.kv("  needed", DemoLog.formatAmount(msgValue, 18, "PC"));
-            DemoLog.note("Every agent request will be refused by UCEP gate 8 (PCValueExceedsCap).");
+            DemoLog.note("Every agent request will be refused by URP gate 8 (PCValueExceedsCap).");
             DemoLog.note("Revoke and regrant the mandate before presenting.");
         } else {
             DemoLog.ok("PC cap", string.concat("granted ", DemoLog.formatAmount(granted, 18, "PC"), " covers today"));

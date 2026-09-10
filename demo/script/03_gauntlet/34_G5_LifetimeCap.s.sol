@@ -9,7 +9,7 @@ import { Ledger } from "../../lib/Ledger.sol";
 import { Amounts } from "../../lib/Amounts.sol";
 import { Gauntlet } from "../../lib/Gauntlet.sol";
 import { AgentRequest } from "../../lib/AgentRequest.sol";
-import { IUCEP } from "../../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../../src/interfaces/IURP.sol";
 import { ConfigId } from "smartsessions/DataTypes.sol";
 import { SEND_OUTBOUND_SELECTOR } from "../../../src/libraries/PushWalletTypes.sol";
 import { StakeDummy } from "../../contracts/StakeDummy.sol";
@@ -45,7 +45,7 @@ contract G5_LifetimeCap is Script {
 
         DemoLog.header("G5", "The lifetime budget is spent");
 
-        IUCEP.Config memory cfg = IUCEP(AddressBook.ours("ucep")).getConfig(_configId(agw), agw);
+        IURP.Config memory cfg = IURP(AddressBook.ours("urp")).getConfig(_configId(agw), agw);
 
         // The precondition, named. Without Act 2's spend this request FITS and would succeed.
         if (cfg.spent == 0) revert ActTwoHasNotRun(cfg.spent);
@@ -61,7 +61,7 @@ contract G5_LifetimeCap is Script {
 
         Gauntlet.refuse(
             "a second stake, within the per-action cap",
-            IUCEP.TotalSpendCapExceeded.selector,
+            IURP.TotalSpendCapExceeded.selector,
             "A per-action cap alone would let an agent drain a wallet in slices. This bounds the total.",
             req
         );

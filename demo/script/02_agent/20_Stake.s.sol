@@ -21,7 +21,7 @@ import { StakeDummy } from "../../contracts/StakeDummy.sol";
  *
  * @dev    "A key that holds nothing just moved real money across a chain boundary and put it to
  *         work." This is the first time the whole stack runs: the agent's signature, the wallet's
- *         expiry/nonce/validator checks, UCEP's sixteen gates, the gateway's burn, and the relay.
+ *         expiry/nonce/validator checks, URP's sixteen gates, the gateway's burn, and the relay.
  *
  *         THE AGENT KEY HOLDS NOTHING AND OWNS NOTHING. It cannot be topped up, cannot receive
  *         funds, and has no authority beyond this mandate. The PC that pays for the swap comes from
@@ -143,7 +143,7 @@ contract Stake is Script {
                 if (emitted != expected) revert OpHashMismatch(expected, emitted);
 
                 DemoLog.ok("wallet", "expiry, nonce, validator, signature");
-                DemoLog.ok("UCEP", "all 16 gates");
+                DemoLog.ok("URP", "all 16 gates");
                 DemoLog.ok("op hash", "matches the hash we signed, byte for byte");
                 return;
             }

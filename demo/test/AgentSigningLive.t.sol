@@ -3,12 +3,12 @@ pragma solidity 0.8.26;
 
 import { BaseTest } from "../../test/Base.t.sol";
 import { AgentSigning } from "../lib/AgentSigning.sol";
-import { IUCEP } from "../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../src/interfaces/IURP.sol";
 import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { ExecutionLib } from "../../src/libraries/ExecutionLib.sol";
 import { ModeLib, ModeCode } from "../../src/libraries/ModeLib.sol";
-import { Multicall } from "../../src/libraries/PushWalletTypes.sol";
+import { Multicall, MandateType } from "../../src/libraries/PushWalletTypes.sol";
 import { MockUniversalGateway } from "../../test/mocks/MockUniversalGateway.sol";
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 
@@ -37,11 +37,11 @@ contract MockPRC20 is ERC20 {
  *
  *         `_computeOpHash` is `internal` and cannot be called. But the wallet EMITS the hash it
  *         computed, in `MandateActionAuthorized`. Driving a real request through the real engine,
- *         the real validator and the real UCEP, then reading that event, is therefore the only way
+ *         the real validator and the real URP, then reading that event, is therefore the only way
  *         to compare the transcription against the actual bytecode — so that is what this does.
  *
  *         NOTHING HERE IS MOCKED THAT SUPPLIES BEHAVIOUR UNDER TEST. The gateway is a recorder and
- *         the PRC20 is an ordinary ERC-20; the engine, validator, UCEP and wallet are the real
+ *         the PRC20 is an ordinary ERC-20; the engine, validator, URP and wallet are the real
  *         contracts, deployed by `BaseTest`. A mocked engine would be an oracle for precisely the
  *         property being asserted.
  */
@@ -84,13 +84,13 @@ contract AgentSigningLiveTest is BaseTest {
 
     /// @dev Mirrors the demo mandate: one target, one selector, beneficiary pinned at offset 4.
     function _config() internal view returns (bytes memory) {
-        IUCEP.AllowedCall[] memory rules = new IUCEP.AllowedCall[](1);
-        rules[0] = IUCEP.AllowedCall({
+        IURP.AllowedCall[] memory rules = new IURP.AllowedCall[](1);
+        rules[0] = IURP.AllowedCall({
             target: FAR_TARGET, selector: FAR_SELECTOR, beneficiaryOffset: 4, hasBeneficiary: true, maxValue: 0
         });
 
-        return abi.encode(
-            IUCEP.Config({
+        return universalInitData(
+            IURP.Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 7 days),
                 destChainHash: keccak256(abi.encode("eip155", "11155111")),
@@ -130,7 +130,7 @@ contract AgentSigningLiveTest is BaseTest {
      */
     function test_opHash_equalsTheWalletsOwn() public {
         vm.prank(owner);
-        bytes32 permissionId = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()));
+        bytes32 permissionId = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()), MandateType.UNIVERSAL);
 
         bytes memory ecd = _executionCalldata();
         bytes32 mode = ModeCode.unwrap(ModeLib.encodeSimpleSingle());
@@ -184,7 +184,7 @@ contract AgentSigningLiveTest is BaseTest {
      */
     function test_opHash_wrongFieldIsRejected() public {
         vm.prank(owner);
-        bytes32 permissionId = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()));
+        bytes32 permissionId = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()), MandateType.UNIVERSAL);
 
         bytes memory ecd = _executionCalldata();
         bytes32 mode = ModeCode.unwrap(ModeLib.encodeSimpleSingle());
@@ -204,7 +204,7 @@ contract AgentSigningLiveTest is BaseTest {
     ///      byte first, permission id in bytes 1:33. Asserted through acceptance, not by reading.
     function test_envelope_isAcceptedByTheWallet() public {
         vm.prank(owner);
-        bytes32 permissionId = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()));
+        bytes32 permissionId = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()), MandateType.UNIVERSAL);
 
         bytes memory ecd = _executionCalldata();
         bytes32 mode = ModeCode.unwrap(ModeLib.encodeSimpleSingle());

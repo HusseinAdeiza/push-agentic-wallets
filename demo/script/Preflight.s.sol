@@ -9,7 +9,7 @@ import { Keys } from "../lib/Keys.sol";
 import { Ledger } from "../lib/Ledger.sol";
 import { Amounts } from "../lib/Amounts.sol";
 import { IUniversalCore } from "../lib/PushCore.sol";
-import { IUCEP } from "../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../src/interfaces/IURP.sol";
 import { SEND_OUTBOUND_SELECTOR } from "../../src/libraries/PushWalletTypes.sol";
 import { ConfigId } from "smartsessions/DataTypes.sol";
 
@@ -140,7 +140,7 @@ contract Preflight is Script {
      */
     function _addressBook() internal {
         _hasCode(AddressBook.ours("factoryProxy"), "factory", "Act 1b cannot deploy the wallet");
-        _hasCode(AddressBook.ours("ucep"), "ucep", "the mandate has no policy to name");
+        _hasCode(AddressBook.ours("urp"), "urp", "the mandate has no policy to name");
         _hasCode(AddressBook.ours("sessionValidator"), "validator", "no agent signature can be checked");
         _hasCode(AddressBook.ours("sessionEngine"), "engine", "the agent door has no validator");
         _hasCode(AddressBook.donut("UniversalGatewayPC"), "gatewayPC", "every outbound");
@@ -254,7 +254,7 @@ contract Preflight is Script {
             _check(
                 needed == 0 || needed <= granted,
                 "PC cap covers fees",
-                "UCEP gate 8 refuses every agent request; revoke and regrant"
+                "URP gate 8 refuses every agent request; revoke and regrant"
             );
         }
     }
@@ -294,7 +294,7 @@ contract Preflight is Script {
         );
 
         bytes32 pid = Ledger.word("permissionId", "14_GrantMandate");
-        IUCEP.Config memory cfg = IUCEP(AddressBook.ours("ucep")).getConfig(_configId(pid, agw), agw);
+        IURP.Config memory cfg = IURP(AddressBook.ours("urp")).getConfig(_configId(pid, agw), agw);
 
         DemoLog.kv(
             "spend",
