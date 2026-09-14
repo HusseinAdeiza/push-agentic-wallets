@@ -15,7 +15,7 @@ optimizer = true
 # our gas profile. Do not raise this without re-checking `forge build --sizes`.
 optimizer_runs = 833
 auto_detect_solc = false
-# cancun is REQUIRED: UCEP's _slice helper uses MCOPY. Lowering this breaks the
+# cancun is REQUIRED: URP's _slice helper uses MCOPY. Lowering this breaks the
 # build at deploy time rather than at compile time.
 evm_version = "cancun"
 via_ir = true
@@ -31,7 +31,18 @@ no_match_coverage = "(src/interfaces/|test/|script/|lib/)"
 fs_permissions = [
     { access = "read-write", path = "deployments/" },
     { access = "read", path = "out/" },
+    # The Demo Ledger (demo/state/ledger.json). The demo scripts are separate processes with no
+    # shared memory, so the ledger is the only way state survives from one act to the next — it is
+    # what makes a failed step recoverable rather than fatal.
+    { access = "read-write", path = "demo/state/" },
 ]
+
+# The demo's own tests (StakeDummy, and the AgentSigning equivalence proof). A SEPARATE PROFILE,
+# not a change to the default `test` path: the v3 suite is the contracts' specification and must
+# stay exactly what `forge test` runs. Demo tests are run with `FOUNDRY_PROFILE=demo forge test`,
+# which the justfile wraps. Everything else is inherited from [profile.default].
+[profile.demo]
+test = "demo/test"
 
 [fmt]
 line_length = 120

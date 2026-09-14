@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import { MandateType } from "../libraries/PushWalletTypes.sol";
+
 /**
  * @title  IPushAgentWallet — the wallet's observable event surface.
  * @notice Every event `PushAgentWallet` emits is declared here, so indexers, monitoring and the SDK
  *         compile against an interface rather than against the implementation. This matches the
- *         other two contracts in the system, whose events live in `IAGWFactory` and `IUCEP`.
+ *         other two contracts in the system, whose events live in `IAGWFactory` and `IURP`.
  *
  * @dev    EVENTS ONLY, DELIBERATELY. The wallet's function ABI is specified in the contract itself
  *         and nowhere else. Restating it here would create a second place for it to be edited, and
@@ -41,7 +43,9 @@ interface IPushAgentWallet {
 
     // ────────────────────────────── mandate lifecycle ──────────────────────────────
 
-    event MandateGranted(bytes32 indexed permissionId);
+    /// @dev Carries the declared `MandateType`, so an indexer can tell a native mandate from a
+    ///      universal one without re-deriving it from the session's actions.
+    event MandateGranted(bytes32 indexed permissionId, MandateType mandateType);
     event MandateRevoked(bytes32 indexed permissionId);
 
     /// @notice An agent request passed validation and was dispatched.

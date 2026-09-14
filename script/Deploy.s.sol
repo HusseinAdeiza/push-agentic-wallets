@@ -5,10 +5,12 @@ import { Script } from "forge-std/Script.sol";
 import { console2 } from "forge-std/console2.sol";
 
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import { ERC1967Utils } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
+import { TransparentUpgradeableProxy } from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 
 import { SmartSession } from "smartsessions/SmartSession.sol";
 import { PushSessionValidator } from "../src/validators/PushSessionValidator.sol";
-import { UCEP } from "../src/policies/UCEP.sol";
+import { URP } from "../src/policies/URP.sol";
 import { PushAgentWallet } from "../src/PushAgentWallet.sol";
 import { AGWFactory } from "../src/AGWFactory.sol";
 
@@ -18,8 +20,8 @@ import { AGWFactory } from "../src/AGWFactory.sol";
  * @dev    THE ORDER IS A DEPENDENCY GRAPH, not a preference. Each step consumes only addresses
  *         recorded by earlier steps:
  *
- *           engine -> validator -> UCEP (needs engine)
- *                  -> wallet implementation (needs engine, UCEP, validator, gateway)
+ *           engine -> validator -> URP (needs engine)
+ *                  -> wallet implementation (needs engine, URP, validator, gateway)
  *                  -> factory (needs the wallet implementation)
  *
  *         The validator has no on-chain dependencies and could go first; it is second only to keep
@@ -45,6 +47,13 @@ contract Deploy is Script {
     string internal constant ENGINE_FORK_COMMIT = "7dc20e4";
 
     error MissingEnv(string name);
+
+    /// @dev URP's logic contract and the ProxyAdmin that owns its upgrade right. Held here rather
+    ///      than threaded through `_writeRecord`'s already-long parameter list. THE ADMIN ADDRESS
+    ///      MUST BE RECORDED — TUP creates it internally and returns it nowhere, and without it the
+    ///      deployment can never be upgraded.
+    address internal _urpImplementation;
+    address internal _urpProxyAdmin;
 
     /// @dev The environment disagrees with the chain actually being deployed to.
     error ChainIdMismatch(uint256 fromEnv, uint256 fromChain);
@@ -80,13 +89,27 @@ contract Deploy is Script {
         // 2 · PushSessionValidator — stateless; never installed, only named inside each permission.
         PushSessionValidator validator = new PushSessionValidator();
 
-        // 3 · UCEP — three constructor args. The engine is a STATED dependency here, not a
-        //     coincidence of ordering: UCEP keys its storage on a SESSION_ENGINE immutable.
-        UCEP ucep = new UCEP(gatewayPC, executorModule, address(engine));
+        // 3 · URP — logic + Transparent proxy, INITIALISED IN THE SAME TRANSACTION. A proxy left
+        //     uninitialised is front-runnable: whoever calls `initialize` first chooses the engine
+        //     the policy trusts. The engine is a STATED dependency here, not a coincidence of
+        //     ordering: URP keys its storage on SESSION_ENGINE.
+        //
+        //     THE PROXY ADDRESS IS PERMANENT — it is what every wallet pins as its canonical
+        //     policy, and it must not change across upgrades.
+        URP urpLogic = new URP();
+        TransparentUpgradeableProxy urpProxy = new TransparentUpgradeableProxy(
+            address(urpLogic), admin, abi.encodeCall(URP.initialize, (gatewayPC, executorModule, address(engine)))
+        );
+        URP urp = URP(address(urpProxy));
+
+        // TUP creates its own ProxyAdmin and returns it nowhere, so read it from the ERC-1967 admin
+        // slot and RECORD IT. Without that address the deployment cannot be upgraded later.
+        _urpImplementation = address(urpLogic);
+        _urpProxyAdmin = address(uint160(uint256(vm.load(address(urpProxy), ERC1967Utils.ADMIN_SLOT))));
 
         // 4 · The wallet implementation. Its constructor rejects any zero.
         PushAgentWallet walletImplementation =
-            new PushAgentWallet(address(engine), address(ucep), address(validator), gatewayPC);
+            new PushAgentWallet(address(engine), address(urp), address(validator), gatewayPC);
 
         // 5 · The factory: logic + proxy, initialised in the SAME transaction so no initialisation
         //     front-run window exists. THE PROXY ADDRESS IS PERMANENT and user-facing.
@@ -101,7 +124,7 @@ contract Deploy is Script {
             chainId,
             address(engine),
             address(validator),
-            address(ucep),
+            address(urp),
             gatewayPC,
             executorModule,
             address(walletImplementation),
@@ -120,7 +143,7 @@ contract Deploy is Script {
         uint256 chainId,
         address sessionEngine,
         address sessionValidator,
-        address ucep,
+        address urp,
         address universalGateway,
         address universalExecutorModule,
         address walletImplementation,
@@ -129,12 +152,17 @@ contract Deploy is Script {
     ) internal {
         string memory obj = "record";
 
+        // URP's implementation and admin travel in storage rather than as two more parameters:
+        // this function is already at nine, and via_ir's 16-slot reach is not worth spending here.
+        vm.serializeAddress(obj, "urpImplementation", _urpImplementation);
+        vm.serializeAddress(obj, "urpProxyAdmin", _urpProxyAdmin);
+
         vm.serializeUint(obj, "chainId", chainId);
         vm.serializeString(obj, "commit", _repoCommit());
         vm.serializeString(obj, "engineForkCommit", ENGINE_FORK_COMMIT);
         vm.serializeAddress(obj, "sessionEngine", sessionEngine);
         vm.serializeAddress(obj, "sessionValidator", sessionValidator);
-        vm.serializeAddress(obj, "ucep", ucep);
+        vm.serializeAddress(obj, "urp", urp);
         vm.serializeAddress(obj, "universalGateway", universalGateway);
         vm.serializeAddress(obj, "universalExecutorModule", universalExecutorModule);
         vm.serializeAddress(obj, "walletImplementation", walletImplementation);
@@ -146,6 +174,8 @@ contract Deploy is Script {
 
         console2.log("deployment record written to", path);
         console2.log("  factoryProxy (PERMANENT, user-facing)", factoryProxy);
+        console2.log("  urp          (PERMANENT, pinned by every wallet)", urp);
+        console2.log("  urpProxyAdmin (KEEP THIS - no upgrade is possible without it)", _urpProxyAdmin);
     }
 
     /**

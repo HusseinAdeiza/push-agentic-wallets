@@ -58,7 +58,7 @@ contract DeploymentRecordTest is Test {
         // ── the addresses ──
         address sessionEngine = vm.parseJsonAddress(record, ".sessionEngine");
         address sessionValidator = vm.parseJsonAddress(record, ".sessionValidator");
-        address ucep = vm.parseJsonAddress(record, ".ucep");
+        address urp = vm.parseJsonAddress(record, ".urp");
         address universalGateway = vm.parseJsonAddress(record, ".universalGateway");
         address universalExecutorModule = vm.parseJsonAddress(record, ".universalExecutorModule");
         address walletImplementation = vm.parseJsonAddress(record, ".walletImplementation");
@@ -68,7 +68,7 @@ contract DeploymentRecordTest is Test {
         address[8] memory all = [
             sessionEngine,
             sessionValidator,
-            ucep,
+            urp,
             universalGateway,
             universalExecutorModule,
             walletImplementation,
@@ -83,7 +83,7 @@ contract DeploymentRecordTest is Test {
         PushAgentWallet impl = PushAgentWallet(payable(walletImplementation));
         assertEq(impl.sessionEngine(), sessionEngine, "sessionEngine matches the deployed immutable");
         assertEq(impl.sessionValidator(), sessionValidator, "sessionValidator matches the deployed immutable");
-        assertEq(impl.ucep(), ucep, "ucep matches the deployed immutable");
+        assertEq(impl.urp(), urp, "urp matches the deployed immutable");
         assertEq(impl.universalGateway(), universalGateway, "universalGateway matches the deployed immutable");
 
         // the factory points at the same wallet implementation
@@ -95,7 +95,7 @@ contract DeploymentRecordTest is Test {
 
         // ── every address WE deploy must have code on the target network ──
         address[6] memory ours =
-            [sessionEngine, sessionValidator, ucep, walletImplementation, factoryProxy, factoryLogic];
+            [sessionEngine, sessionValidator, urp, walletImplementation, factoryProxy, factoryLogic];
         for (uint256 i; i < ours.length; ++i) {
             assertGt(ours[i].code.length, 0, "a recorded address has no code - it is a placeholder");
         }

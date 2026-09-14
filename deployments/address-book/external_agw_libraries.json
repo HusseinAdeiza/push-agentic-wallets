@@ -7,7 +7,7 @@
     "universalGateway": {
       "address": "0x00000000000000000000000000000000000000C1",
       "implementation": "0x1e412939780f2b834dc42c7ac58d9f99888da659",
-      "consumedBy": ["UCEP", "PushAgentWallet"],
+      "consumedBy": ["URP", "PushAgentWallet"],
       "verified": true,
       "evidence": [
         "cast code -> 1551 bytes; ERC-1967 proxy",
@@ -18,14 +18,14 @@
     },
     "universalExecutorModule": {
       "address": "0x14191Ea54B4c176fCf86f51b0FAc7CB1E71Df7d7",
-      "consumedBy": ["UCEP"],
+      "consumedBy": ["URP"],
       "verified": false,
       "evidence": [
         "cast code -> 0x (no code); balance 0; nonce 0 as of block 22631775",
         "address confirmed correct by the owner, 2026-09-04",
         "matches push-chain-core-contracts/test/helpers/PushChainAddresses.sol"
       ],
-      "impact": "Baked into UCEP as an immutable, and UCEP is not upgradeable, so correcting it would require redeploying UCEP and regranting every mandate. It gates creditRevert only, which Push core does not yet call, so an absent contract costs nothing operationally today.",
+      "impact": "Baked into URP as an immutable, and URP is not upgradeable, so correcting it would require redeploying URP and regranting every mandate. It gates creditRevert only, which Push core does not yet call, so an absent contract costs nothing operationally today.",
       "note": "This is the single reason S-05's live run reports one failing assertion. Re-check once Push core deploys the module."
     },
     "ed25519Precompile": {

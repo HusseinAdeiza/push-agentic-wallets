@@ -1,0 +1,18 @@
+{
+  "network": "ethereum-sepolia",
+  "chainId": 11155111,
+  "note": "Flat name -> address map. Push core addresses are supplied by Push, not deployed by this repo; StakeDummy is demo-only and written by demo/script/00_setup/02_DeployStakeDummy.s.sol. Unknown keys are committed as the zero address so the file's shape is fixed and a gap surfaces as MissingAddress rather than a JSON parse error.",
+  "UniversalGateway": "0x05bD7a3D18324c1F7e216f7fBF2b15985aE5281A",
+  "Vault": "0xD019Eb12D0d6eF8D299661f22B4B7d262eD4b965",
+  "CEAFactory": "0x5E191fbBe22F8866C5e4250557664fCE760e8870",
+  "USDC": "0x97F477B7f970D47a87B42869ceeace218106152a",
+  "StakeDummy": "0x833Ac0BB36ED8199dbC28B9B7B04893D762Ef41C",
+  "evidence": {
+    "CEAFactory": "THE AUTHORITY IS THE VAULT, NEVER A STANDALONE PROBE. Returned by Vault.CEAFactory(), and that factory's VAULT() points back to the same Vault. computeCEA and getCEAForPushAccount agree with the CEA actually deployed on-chain (isCEA -> true). Verified 2026-09-06."
+  },
+  "deprecated": {
+    "note": "Recorded so a stale address found in an older document is recognisable as stale rather than mistaken for live. HAVING CODE IS NOT SUFFICIENT EVIDENCE - this factory is live, answers computeCEA, and is internally consistent; it is simply not the one the Vault deploys through. Choosing it fails SILENTLY: the demo predicted 0x30414c4b... while the Vault deployed 0xCF173d1b..., the mandate pinned the ghost as beneficiary, and 5 USDC was staked to an address with no code. Nothing reverted until Act 4a.",
+    "CEAFactory_stale": "0x8ED594A83301FEc545fC6c19fc12cF7111777029",
+    "whyTheyDiffer": "computeCEA is a CREATE2 prediction over both CEA_PROXY_IMPLEMENTATION and address(this). Both differ between the two factories, so the same salt yields different addresses. Each factory is internally consistent; only one is wired to the Vault."
+  }
+}

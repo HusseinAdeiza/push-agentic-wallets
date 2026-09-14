@@ -18,7 +18,7 @@ ERC-7579 smart accounts on Push Chain that let an autonomous agent execute bound
 | --- | --- |
 | `AGWFactory` | **To build** — creates agent wallets at addresses computable before deployment |
 | `PushAgentWallet` | **To build** — holds funds; an unrestricted owner door and a fully checked agent door |
-| `UCEP` | **To build** — the only novel contract: opens the cross-chain payload and enforces every limit |
+| `URP` | **To build** — the only novel contract: opens the cross-chain payload and enforces every limit |
 | `PushSessionValidator` | **Carried forward** — `src/validators/`, stateless signature check (secp256k1 / Ed25519) |
 | `SmartSession` | **Adopted unmodified** — `lib/smartsessions/`, the permission engine |
 

@@ -1,0 +1,47 @@
+{
+  "network": "push-donut-testnet",
+  "chainId": 42101,
+  "explorer": "https://donut.push.network",
+  "generation": "v3.1",
+  "supersedes": "deployments/address-book/external_agw_libraries.json",
+  "note": "Dependencies this repo does NOT deploy. Each carries a verification status MEASURED AGAINST THE LIVE CHAIN at block 23002669 during the v3.1 deployment, not copied forward from the v1 book — an unconfirmed address is never silently trusted. All three are unchanged from v1.",
+  "dependencies": {
+    "universalGateway": {
+      "address": "0x00000000000000000000000000000000000000C1",
+      "implementation": "0x1e412939780f2b834dc42c7ac58d9f99888da659",
+      "consumedBy": ["URP", "PushAgentWallet"],
+      "verified": true,
+      "evidence": [
+        "cast code -> 1551 bytes; ERC-1967 proxy (re-measured 2026-09-10, block 23002669)",
+        "implementation read live from the ERC-1967 impl slot 0x3608...2bbc -> 0x1e412939780f2b834dc42c7ac58d9f99888da659",
+        "implementation bytecode contains selector 0x77b86bec, and `cast sig` on our own mirrored signature returns the same 0x77b86bec — the two were compared, not assumed",
+        "explorer reports implementation verified as UniversalGatewayPC, solc v0.8.26+commit.8a97fa7a"
+      ],
+      "note": "The only Push-side target a UNIVERSAL agent action may reach. NATIVE mandates deliberately never touch it — URP's gate N3 and the wallet's grant-time type branch both refuse a gateway target under NATIVE, which is the consistency lock. Our PushWalletTypes struct mirror was checked field-for-field against this selector."
+    },
+    "universalExecutorModule": {
+      "address": "0x14191Ea54B4c176fCf86f51b0FAc7CB1E71Df7d7",
+      "consumedBy": ["URP"],
+      "verified": false,
+      "evidence": [
+        "cast code -> 0x (no code); re-measured 2026-09-10 at block 23002669, unchanged from the v1 measurement at block 22631775",
+        "address confirmed correct by the owner, 2026-09-04",
+        "matches push-chain-core-contracts/test/helpers/PushChainAddresses.sol"
+      ],
+      "impact": "IMPROVED SINCE v1. URP is now upgradeable behind a TransparentUpgradeableProxy, so correcting this address no longer requires redeploying URP and regranting every mandate — it requires a proxy upgrade by the ProxyAdmin owner. It remains a storage value with no setter, so an upgrade is still the only route. It gates creditRevert only, which Push core does not yet call, so an absent contract costs nothing operationally today.",
+      "note": "Re-check once Push core deploys the module. This is the one dependency in the set that is not live."
+    },
+    "ed25519Precompile": {
+      "address": "0xEC00000000000000000000000000000000000001",
+      "method": "verifyEd25519RawMessage(bytes,bytes,bytes)",
+      "consumedBy": ["PushSessionValidator"],
+      "verified": true,
+      "evidence": [
+        "cast code -> 0x, codeless exactly as the raw-staticcall design assumes (re-measured 2026-09-10, block 23002669)",
+        "known-good vector returns 0x..01 (true) — measured 2026-09-04",
+        "same vector with its first byte flipped returns 0x..00 (false), so the precompile genuinely discriminates"
+      ],
+      "note": "Called through a raw staticcall, never a typed interface: solc inserts an extcodesize check before any high-level call that ABI-decodes returndata, and a precompile has no code, so a typed call would revert on-chain. The forge fork test (P-03) cannot exercise this — forge's local EVM does not implement the precompile and returns 0 bytes — so the live cast probe is the liveness proof, and P-03 fails in-repo for that reason alone."
+    }
+  }
+}
