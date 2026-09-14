@@ -1,0 +1,134 @@
+{
+  "network": "push-donut-testnet",
+  "chainId": 42101,
+  "explorer": "https://donut.push.network",
+  "generation": "v3.1",
+  "supersedes": "deployments/address-book/push_agw_contracts.json",
+  "deployedAt": "2026-09-10T00:00:00Z",
+  "deployedAtBlock": 23002281,
+  "commit": "685624e2c19b5bad2cc0f8a6f9092a3771425de6",
+  "engineForkCommit": "7dc20e4",
+  "deployer": "0xa89523351BE1e2De64937AA9AF61Ae06eAd199C7",
+  "note": "FULL FRESH DEPLOYMENT of the native-mode (v3.1) contract set. Nothing was upgraded in place: the v1 URP at 0x79F0...2c1D was NOT proxied and cannot be upgraded, so this generation deploys a new upgradeable URP behind a TransparentUpgradeableProxy. Every address below is new. The v1 book is retained, superseded, and universal-only.",
+  "toolchain": {
+    "solc": "0.8.26",
+    "optimizerRuns": 833,
+    "evmVersion": "cancun",
+    "viaIR": true,
+    "forge": "1.5.1-stable"
+  },
+  "contracts": {
+    "factoryProxy": {
+      "address": "0x00350B9DdC33da6eD19Fa2Ec9288fa63e5481B4E",
+      "contract": "ERC1967Proxy -> AGWFactory",
+      "txHash": "0x630742923416e1cb04a904aaa70b35dbd1bc0f13e384874bec460cf66f52ee0a",
+      "verified": true,
+      "note": "PERMANENT, user-facing. This is the address the SDK and every integration uses. It does not change across factory-logic upgrades. Live-checked: deployWallet succeeded and the clone reports isWallet == true."
+    },
+    "factoryLogic": {
+      "address": "0xBee150eeC1813E79636Ad289d94cAcA9b1027175",
+      "contract": "AGWFactory",
+      "txHash": "0x927a456cc85f1d6bfaf81e1c86399976ea0c8fec34ae1fc1eb5c0379c4b60c29",
+      "runtimeSize": 8300,
+      "verified": true,
+      "note": "UUPS implementation behind factoryProxy. Never addressed directly. Source unchanged from v1; redeployed because it must be initialised with the new wallet implementation."
+    },
+    "walletImplementation": {
+      "address": "0xB2AF9f131821114a8B1890424242CC27806c4a83",
+      "contract": "PushAgentWallet",
+      "txHash": "0x0d9cca4600ee36a197bed9b14130ad0a26fdf37529c4c6fcdea0c3b073962f8c",
+      "runtimeSize": 11626,
+      "accountId": "push.agentwallet.1.0.0",
+      "verified": true,
+      "constructorArgs": {
+        "sessionEngine": "0x9354d04e66386693CEAEC931bBDB7b1b369fF1A7",
+        "urp": "0xD03D50531d5803a49F4eC286D2EB6bcBbc5c0F22",
+        "sessionValidator": "0x1aFcb6b3A2D2778355889be8ac35C06997040145",
+        "universalGatewayPC": "0x00000000000000000000000000000000000000C1"
+      },
+      "note": "Clone template. Every wallet is a minimal clone of this with 40 bytes of immutable args (owner 0-19, factory 20-39). NEW IN v3.1: grantMandate takes a MandateType, native mandates carry 1..8 actions, and _gateAndDispatch refuses the wallet and the engine as dispatch targets. Its `urp` arg is the PROXY, so wallets keep working across URP upgrades. Grew 10,515 -> 11,626 B."
+    },
+    "urp": {
+      "address": "0xD03D50531d5803a49F4eC286D2EB6bcBbc5c0F22",
+      "contract": "TransparentUpgradeableProxy -> URP",
+      "txHash": "0xc4b6d0f67b0dc70a6cf9ec82323ed348d9d4ae9eb89dc7f4f327ffddd76260b5",
+      "verified": true,
+      "note": "PERMANENT, and the address every wallet pins as its canonical policy. THIS IS THE PROXY - always address URP here, never at the implementation. Initialised atomically in its constructor, so no front-run window ever existed."
+    },
+    "urpImplementation": {
+      "address": "0x07C978c96218b8347C0886915a409D6Ff8F7F500",
+      "contract": "URP",
+      "txHash": "0x08eda035eec6c1f3ec54494a2d6f78146543c1b789db864e2916ae499ec7c6ee",
+      "runtimeSize": 12134,
+      "version": "1.0.0",
+      "verified": true,
+      "note": "The security boundary, and the only novel contract. Sole action policy on every mandate, in BOTH modes; stripping it fails closed. Storage layout is frozen and append-only: slots 0-2 anchors, 3 $configs, 4 $credited, 5 $mode (NEW), 6 $native (NEW), 7..49 __gap[43]. Read `version()` through the proxy to confirm which implementation is live."
+    },
+    "urpProxyAdmin": {
+      "address": "0x9C7952558C9aF94D92185AB75eC5d4203FA3040f",
+      "contract": "ProxyAdmin",
+      "owner": "0xa89523351BE1e2De64937AA9AF61Ae06eAd199C7",
+      "verified": false,
+      "verificationBlocker": "Created by an INNER CREATE from the TransparentUpgradeableProxy constructor. This Blockscout instance does not index internally-created contracts, so it reports `is_contract: false` and refuses verification with 'Address is not a smart-contract'. The chain disagrees: eth_getCode returns 926 bytes and `owner()` answers correctly. Explorer-indexer limitation, not a deployment defect.",
+      "note": "KEEP THIS ADDRESS - no URP upgrade is possible without it. TUP creates it internally and returns it nowhere; it was read from the ERC-1967 admin slot (0xb531...6103) of the URP proxy and re-read live to confirm. Owner is the deployer EOA for testnet; production should hold this in a multisig."
+    },
+    "sessionValidator": {
+      "address": "0x1aFcb6b3A2D2778355889be8ac35C06997040145",
+      "contract": "PushSessionValidator",
+      "txHash": "0x832885e46be4282592bfacf0b469245ec6505390f0f6b3e930213188e2068e64",
+      "runtimeSize": 1720,
+      "verified": true,
+      "note": "Stateless. Source UNCHANGED from v1. Its address is an input to every permission id, so mandates granted against the v1 validator do not carry over to this generation - which is expected, since this is a fresh deployment and no v1 state is preserved."
+    },
+    "sessionEngine": {
+      "address": "0x9354d04e66386693CEAEC931bBDB7b1b369fF1A7",
+      "contract": "SmartSession",
+      "txHash": "0x7202f5d63545f204d85aa23c6b474fabd70cf3a89aa44fd3a688157b4627d478",
+      "runtimeSize": 22581,
+      "verified": true,
+      "note": "Vendored fork 7dc20e4, adopted unmodified. Installed as each wallet's only validator module. Runtime margin is 1,995 B - the tightest in the set, which is why optimizer_runs is pinned at 833."
+    }
+  },
+  "adminState": {
+    "factoryDefaultAdmin": "0xa89523351BE1e2De64937AA9AF61Ae06eAd199C7",
+    "defaultAdminDelaySeconds": 172800,
+    "urpProxyAdminOwner": "0xa89523351BE1e2De64937AA9AF61Ae06eAd199C7",
+    "paused": false,
+    "note": "Admin is the deployer EOA for testnet. TWO distinct upgrade authorities now exist: the factory's DEFAULT_ADMIN_ROLE (UUPS upgrade of factory logic - the only action that can strand counterfactually funded addresses) and the URP ProxyAdmin owner (can replace every gate in the policy). A production deployment should hold both in a multisig, and they should not be the same key."
+  },
+  "liveVerification": {
+    "verifiedAtBlock": 23002669,
+    "urpProxyWiring": {
+      "UNIVERSAL_GATEWAY_PC": "0x00000000000000000000000000000000000000C1",
+      "UNIVERSAL_EXECUTOR_MODULE": "0x14191Ea54B4c176fCf86f51b0FAc7CB1E71Df7d7",
+      "SESSION_ENGINE": "0x9354d04e66386693CEAEC931bBDB7b1b369fF1A7",
+      "version": "1.0.0"
+    },
+    "walletImplementationViews": {
+      "sessionEngine": "0x9354d04e66386693CEAEC931bBDB7b1b369fF1A7",
+      "urp": "0xD03D50531d5803a49F4eC286D2EB6bcBbc5c0F22",
+      "sessionValidator": "0x1aFcb6b3A2D2778355889be8ac35C06997040145",
+      "universalGateway": "0x00000000000000000000000000000000000000C1",
+      "accountId": "push.agentwallet.1.0.0"
+    },
+    "factoryProxyState": {
+      "walletImplementation": "0xB2AF9f131821114a8B1890424242CC27806c4a83",
+      "defaultAdminDelay": 172800
+    },
+    "smokeTest": {
+      "action": "deployWallet(\"smoke-v2\") from the deployer EOA",
+      "txHash": "0x321ac5d5a0a6ad8fabc498187d6205f6c3684cc98dbc1161acb9bc16c3ea3159",
+      "walletClone": "0x199c5eF60b2619bdd4f0cc381e2754C13Be076De",
+      "assertions": {
+        "factory.isWallet": true,
+        "factory.ownerOf": "0xa89523351BE1e2De64937AA9AF61Ae06eAd199C7",
+        "clone.owner": "0xa89523351BE1e2De64937AA9AF61Ae06eAd199C7",
+        "clone.factory": "0x00350B9DdC33da6eD19Fa2Ec9288fa63e5481B4E",
+        "clone.urp": "0xD03D50531d5803a49F4eC286D2EB6bcBbc5c0F22",
+        "clone.accountId": "push.agentwallet.1.0.0",
+        "clone.engineInstalled": true
+      },
+      "note": "A REAL wallet through the REAL factory, not a simulation. Proves the whole stack is wired: registry, clone immutable args, URP pin, and the engine installed as the sole validator module."
+    }
+  }
+}

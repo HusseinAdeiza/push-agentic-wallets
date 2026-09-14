@@ -30,7 +30,27 @@ import { VmSafe } from "forge-std/Vm.sol";
 library AddressBook {
     VmSafe private constant vm = VmSafe(address(uint160(uint256(keccak256("hevm cheat code")))));
 
+    /// @dev Push core and Sepolia infrastructure. NOT redeployed by the v2 cut — the gateway, the
+    ///      UEA factory, the PRC20 registry and Sepolia's Vault/CEAFactory are all unchanged, and
+    ///      `sepolia.json` additionally carries the corrected `CEAFactory` (the one the Vault
+    ///      actually deploys through). Both files live only here.
     string internal constant DIR = "deployments/address-book/";
+
+    /**
+     * @dev OUR OWN five contracts, from the v2 deployment.
+     *
+     *      SPLIT DELIBERATELY, RATHER THAN COPYING FILES ACROSS. The v2 cut redeployed the wallet
+     *      implementation, the factory and — this is the part that bites — the SESSION ENGINE and
+     *      the VALIDATOR, while upgrading URP in place behind its proxy. Push core did not move at
+     *      all. Pointing one directory at both would mean maintaining duplicate copies of files
+     *      nobody redeployed, and a stale duplicate is exactly how the wrong-CEAFactory bug
+     *      happened: an address that resolves, has code, and is simply not the one in use.
+     *
+     *      The validator's address is an input to every permission id, so mixing a v1 validator
+     *      with a v2 engine would derive ids that address an empty config — failing at gate 1
+     *      rather than anywhere informative.
+     */
+    string internal constant OURS_DIR = "deployments/address-book-v2/";
 
     /// @dev The named failure this library exists to produce. Names the file and the key.
     error MissingAddress(string chain, string name);
@@ -39,7 +59,7 @@ library AddressBook {
 
     /**
      * @notice Resolve one of the five contracts this repo deployed on Donut.
-     * @param  name Key under `.contracts` — e.g. "factoryProxy", "ucep", "sessionValidator".
+     * @param  name Key under `.contracts` — e.g. "factoryProxy", "urp", "sessionValidator".
      * @return The address. Never zero.
      */
     function ours(string memory name) internal view returns (address) {
@@ -80,11 +100,12 @@ library AddressBook {
 
     /**
      * @dev Nested record: the address sits at `.contracts.<name>.address`, beside metadata.
-     * @param file Filename under the address-book directory.
+     *      Reads from `OURS_DIR` — our own deployment is the only thing the v2 cut moved.
+     * @param file Filename under the v2 address-book directory.
      * @param name Key under `.contracts`.
      */
     function _nested(string memory file, string memory name) private view returns (address) {
-        string memory json = vm.readFile(string.concat(DIR, file));
+        string memory json = vm.readFile(string.concat(OURS_DIR, file));
         return _require(json, string.concat(".contracts.", name, ".address"), file, name);
     }
 

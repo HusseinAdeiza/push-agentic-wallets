@@ -4,12 +4,13 @@ pragma solidity 0.8.26;
 import { Vm } from "forge-std/Vm.sol";
 
 import { BaseTest } from "../Base.t.sol";
+import { MandateType } from "../../src/libraries/PushWalletTypes.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
 import { ModeLib, ModeCode } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib, Execution } from "../../src/libraries/ExecutionLib.sol";
-import { IUCEP } from "../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../src/interfaces/IURP.sol";
 import { UniversalOutboundTxRequest, Multicall, MULTICALL_SELECTOR } from "../../src/libraries/PushWalletTypes.sol";
 import { Session, PermissionId, ConfigId, SmartSessionMode } from "smartsessions/DataTypes.sol";
 import { ISmartSession } from "smartsessions/ISmartSession.sol";
@@ -21,7 +22,7 @@ import { PackedUserOperation } from "account-abstraction/interfaces/PackedUserOp
 /**
  * @notice PushAgentWallet — Phase 3c: the agent door.
  *
- * @dev    Every test here drives the REAL path: real engine, real UCEP, real validator, real
+ * @dev    Every test here drives the REAL path: real engine, real URP, real validator, real
  *         signatures. Nothing is mocked except where a test needs a specific failure the real
  *         components cannot produce (a verdict-returning validator for W-07, a reverting target for
  *         W-18) — and those are OBSERVERS of the wallet's reaction, never oracles for the
@@ -41,7 +42,7 @@ import { PackedUserOperation } from "account-abstraction/interfaces/PackedUserOp
  *           · `InvalidPermissionId(pid)`     — the engine does not know that mandate (revoked, or
  *             never granted on this wallet).
  *           · `NoPoliciesSet(pid)`           — the engine's minimum-one-policy floor.
- *           · `expectUcepGate(...)`          — a UCEP gate, seen through the engine's 32-byte
+ *           · `expectUrpGate(...)`          — a URP gate, seen through the engine's 32-byte
  *             rewrap as `PolicyCheckReverted`. Names WHICH gate fired.
  */
 contract PushAgentWalletAgentDoorTest is BaseTest {
@@ -79,17 +80,17 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
 
     // ─────────────────────────────── fixtures ───────────────────────────────
 
-    function _ucepInitData() internal view returns (bytes memory) {
-        IUCEP.AllowedCall[] memory rules = new IUCEP.AllowedCall[](1);
-        rules[0] = IUCEP.AllowedCall({
+    function _urpInitData() internal view returns (bytes memory) {
+        IURP.AllowedCall[] memory rules = new IURP.AllowedCall[](1);
+        rules[0] = IURP.AllowedCall({
             target: PROTOCOL,
             selector: SWAP_SELECTOR,
             beneficiaryOffset: BENEFICIARY_OFFSET,
             hasBeneficiary: true,
             maxValue: 1 ether
         });
-        return abi.encode(
-            IUCEP.Config({
+        return universalInitData(
+            IURP.Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 365 days),
                 destChainHash: keccak256("eip155:11155111"),
@@ -106,7 +107,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
 
     function _grant() internal returns (bytes32) {
         vm.prank(WALLET_OWNER);
-        return wallet.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _ucepInitData()));
+        return wallet.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _urpInitData()), MandateType.UNIVERSAL);
     }
 
     function _calls() internal view returns (Multicall[] memory c) {
@@ -115,7 +116,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
     }
 
     /// @dev The wallet-level executionCalldata: a SINGLE call to the gateway carrying a valid
-    ///      outbound request. This is the exact shape UCEP's gauntlet is built to police.
+    ///      outbound request. This is the exact shape URP's gauntlet is built to police.
     function _executionCalldata(uint256 amount, uint256 pcValue) internal view returns (bytes memory) {
         return ExecutionLib.encodeSingle(
             GATEWAY, pcValue, outboundRequest(ASSET, amount, 1 ether, address(wallet), _calls())
@@ -194,7 +195,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
     }
 
     function _spent() internal view returns (uint256) {
-        return ucep.getConfig(_configId(), address(wallet)).spent;
+        return urp.getConfig(_configId(), address(wallet)).spent;
     }
 
     // ═══════════════════════════ the happy path ═══════════════════════════
@@ -205,7 +206,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
 
         assertEq(callsRecorded(GATEWAY), 1, "the gateway was called exactly once");
         assertEq(wallet.getNonce(0), 1, "the lane advanced");
-        assertEq(_spent(), 1 ether, "UCEP metered the bridged amount");
+        assertEq(_spent(), 1 ether, "URP metered the bridged amount");
     }
 
     // ═══════════════════════════════════ W-19 ═══════════════════════════════════
@@ -256,7 +257,8 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         // the owner revokes and regrants IDENTICAL terms
         vm.startPrank(WALLET_OWNER);
         wallet.stopMandate(permissionId);
-        bytes32 newPid = wallet.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _ucepInitData()));
+        bytes32 newPid =
+            wallet.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _urpInitData()), MandateType.UNIVERSAL);
         vm.stopPrank();
 
         assertTrue(newPid != permissionId, "the regranted mandate has a NEW id");
@@ -284,7 +286,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         bytes32 actionId = keccak256(abi.encodePacked(GATEWAY, SEND_OUTBOUND_SELECTOR));
         ConfigId newCfg =
             ConfigId.wrap(keccak256(abi.encodePacked(address(wallet), keccak256(abi.encodePacked(newPid, actionId)))));
-        assertEq(ucep.getConfig(newCfg, address(wallet)).spent, 0, "the new mandate's budget is untouched");
+        assertEq(urp.getConfig(newCfg, address(wallet)).spent, 0, "the new mandate's budget is untouched");
     }
 
     // ═══════════════════════════════════ W-03 ═══════════════════════════════════
@@ -333,7 +335,8 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
     function test_W03_OpHash_Field5_PermissionId() public {
         // grant a second mandate, so a real second id exists
         vm.prank(WALLET_OWNER);
-        bytes32 otherPid = wallet.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _ucepInitData()));
+        bytes32 otherPid =
+            wallet.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _urpInitData()), MandateType.UNIVERSAL);
 
         Req memory r = _defaultReq();
         bytes32 h = _opHash(r); // hash commits to permissionId A
@@ -627,7 +630,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
 
     function test_W06_RequestExpiry_Semantics() public {
         // (a) 0 => NEVER expires by time. Warp far forward — but stay INSIDE the mandate's own
-        // validUntil (365 days), because UCEP gate 2 would otherwise kill the request first and
+        // validUntil (365 days), because URP gate 2 would otherwise kill the request first and
         // this test would pass for the wrong reason.
         vm.warp(block.timestamp + 300 days);
         Req memory never = _defaultReq();
@@ -671,7 +674,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
     // ═══════════════════════════════════ W-07 ═══════════════════════════════════
 
     /**
-     * W-07 — the verdict is enforced. Skipping this makes UCEP's expiry gate DECORATIVE: the engine
+     * W-07 — the verdict is enforced. Skipping this makes URP's expiry gate DECORATIVE: the engine
      * returns the window in `vd` and only the wallet enforces it.
      *
      * A mock validator is used because the real engine cannot be made to return an arbitrary
@@ -745,7 +748,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
      *
      * When it equals IERC7579Account.execute.selector the engine decodes the mode and calls the
      * action policy through checkSingle7579Exec, forwarding THE REAL DECODED VALUE — which is what
-     * UCEP's gas-value gate compares against. Every other selector falls through to the generic
+     * URP's gas-value gate compares against. Every other selector falls through to the generic
      * branch, which calls the policy with target = account and a HARDCODED value = 0.
      */
     function test_W26_EngineBranch_SingleExecOnly() public {
@@ -788,7 +791,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
 
     /**
      * W-09 — the agent door is SINGLE-call-type only. Batching lives two layers deeper, inside the
-     * multicall payload, bounded by UCEP's ten.
+     * multicall payload, bounded by URP's ten.
      *
      * THE GATE IS INDEPENDENTLY REACHABLE, and this test is what proves it. An earlier version
      * paired batch MODE with single-ENCODED executionCalldata; the engine's batch decoder then
@@ -796,7 +799,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
      * exposed it: deleting `callType != CALLTYPE_SINGLE` left the suite green.
      *
      * The engine ACCEPTS batch mode — `SmartSession.sol:280-288` routes CALLTYPE_BATCH to
-     * `checkBatch7579Exec`, which runs UCEP per entry, so a well-formed batch of one valid
+     * `checkBatch7579Exec`, which runs URP per entry, so a well-formed batch of one valid
      * (gateway, sendOutbound) entry passes engine validation cleanly. The ONLY thing standing
      * between it and dispatch is the wallet's step-9 gate, and it must name its own error.
      */
@@ -906,7 +909,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
     // ═══════════════════════════════════ W-18 ═══════════════════════════════════
 
     /**
-     * W-18 — an execution revert unwinds EVERYTHING: the nonce, UCEP's spent counter, and the
+     * W-18 — an execution revert unwinds EVERYTHING: the nonce, URP's spent counter, and the
      * metering event. This is the atomicity the whole failure model rests on, and it is why
      * dispatch is NEVER wrapped in try/catch (§11 item 3).
      */
@@ -930,7 +933,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, sig, 0, 1, 0);
 
         assertEq(wallet.getNonce(0), nonceAfter, "the NONCE unwound");
-        assertEq(_spent(), spentAfter, "UCEP's SPENT counter unwound");
+        assertEq(_spent(), spentAfter, "URP's SPENT counter unwound");
 
         // The EVENTS are unwound with the frame too. Asserted through STATE rather than through
         // vm.getRecordedLogs: forge records logs emitted inside a frame that later reverts, so a
@@ -982,10 +985,10 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
      * WHICH LAYER FIRES DEPENDS ON HOW FAR THE REQUEST GETS, and the ordering was read from traces,
      * not assumed:
      *   (a) a 7579-level dispatch target of the wallet never matches the mandate's one configured
-     *       action, so it dies at the engine's minimum-one-policy FLOOR before UCEP runs;
+     *       action, so it dies at the engine's minimum-one-policy FLOOR before URP runs;
      *   (b) a request that DOES match the action (target = gateway) but names the wallet as an
-     *       INNER multicall target reaches UCEP gate 14, which forbids it;
-     *   (c) with UCEP bypassed entirely via a non-canonical policy, the engine still refuses an
+     *       INNER multicall target reaches URP gate 14, which forbids it;
+     *   (c) with URP bypassed entirely via a non-canonical policy, the engine still refuses an
      *       execute-selector self-target with its own InvalidSelfCall.
      */
     function test_W29_AgentDoor_CannotSelfCall() public {
@@ -1000,7 +1003,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         vm.expectRevert(abi.encodeWithSelector(ISmartSession.NoPoliciesSet.selector, PermissionId.wrap(a.pid)));
         wallet.executeWithSession(a.validator, a.mode, a.executionCalldata, aSig, 0, 0, 0);
 
-        // ── (b) UCEP gate 14: the wallet is a forbidden INNER target ──
+        // ── (b) URP gate 14: the wallet is a forbidden INNER target ──
         // This request DOES match the configured action, so the gauntlet runs. The multicall names
         // the wallet, which gate 14 refuses before the allow-list is even consulted.
         Multicall[] memory selfCalls = new Multicall[](1);
@@ -1013,11 +1016,11 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         bytes memory bSig = _signed(b);
 
         vm.prank(RELAYER);
-        expectUcepGate(abi.encodeWithSelector(IUCEP.ForbiddenInnerTarget.selector, address(wallet)));
+        expectUrpGate(abi.encodeWithSelector(IURP.ForbiddenInnerTarget.selector, address(wallet)));
         wallet.executeWithSession(b.validator, b.mode, b.executionCalldata, bSig, 0, 0, 0);
 
-        // ── (c) with UCEP BYPASSED, the engine's own InvalidSelfCall ──
-        // sessionWithPolicy grants a mandate whose action policy is NOT UCEP — a shape grantMandate
+        // ── (c) with URP BYPASSED, the engine's own InvalidSelfCall ──
+        // sessionWithPolicy grants a mandate whose action policy is NOT URP — a shape grantMandate
         // would refuse — so the gauntlet never runs. The engine still refuses an execute-selector
         // self-target (PolicyLib.sol:196).
         PermissivePolicy permissive = new PermissivePolicy();
@@ -1073,13 +1076,13 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
 
     // ═══════════════════════ U-12 / U-18, the deferred halves ═══════════════════════
 
-    /// U-12's wallet half: a successful positive-amount request advances UCEP's counter AND emits
+    /// U-12's wallet half: a successful positive-amount request advances URP's counter AND emits
     /// OutboundMetered, through the real engine path.
     function test_U12_MeteringThroughTheRealPath() public {
         etchCallRecorder(GATEWAY);
 
-        vm.expectEmit(true, true, true, true, address(ucep));
-        emit IUCEP.OutboundMetered(_configId(), address(engine), address(wallet), 3 ether);
+        vm.expectEmit(true, true, true, true, address(urp));
+        emit IURP.OutboundMetered(_configId(), address(engine), address(wallet), 3 ether);
 
         Req memory r = _defaultReq();
         r.executionCalldata = _executionCalldata(3 ether, 0);
@@ -1101,7 +1104,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
     }
 
     /// The PC-value path: value decoded from the VALIDATED calldata leaves the wallet's own
-    /// balance, bounded by UCEP gate 8. The relayer cannot attach value — this door is not payable.
+    /// balance, bounded by URP gate 8. The relayer cannot attach value — this door is not payable.
     function test_AgentRequestMovesPCFromTheWalletsOwnBalance() public {
         etchCallRecorder(GATEWAY);
         uint256 before = address(wallet).balance;
@@ -1114,7 +1117,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         assertEq(GATEWAY.balance, 2 ether, "and reached the gateway");
     }
 
-    /// Above UCEP gate 8's ceiling, the request dies and no PC moves.
+    /// Above URP gate 8's ceiling, the request dies and no PC moves.
     function test_PCValueAboveGate8IsRefused() public {
         etchCallRecorder(GATEWAY);
         uint256 before = address(wallet).balance;
@@ -1124,8 +1127,8 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         bytes memory sig = _signed(r);
 
         vm.prank(RELAYER);
-        // UCEP gate 8 fired, named through the engine's 32-byte rewrap.
-        expectUcepGate(abi.encodeWithSelector(IUCEP.PCValueExceedsCap.selector, uint256(6 ether), uint256(5 ether)));
+        // URP gate 8 fired, named through the engine's 32-byte rewrap.
+        expectUrpGate(abi.encodeWithSelector(IURP.PCValueExceedsCap.selector, uint256(6 ether), uint256(5 ether)));
         wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, sig, 0, 0, 0);
 
         assertEq(address(wallet).balance, before, "no PC moved");
@@ -1291,7 +1294,7 @@ contract RevertingGateway {
     }
 }
 
-/// @dev An action policy that permits everything. Used ONLY to BYPASS UCEP in W-29(b), so the
+/// @dev An action policy that permits everything. Used ONLY to BYPASS URP in W-29(b), so the
 ///      engine's own InvalidSelfCall is reachable and provable on its own. It is never used to
 ///      establish that something is allowed.
 contract PermissivePolicy {
@@ -1311,7 +1314,7 @@ contract PermissivePolicy {
     }
 
     /// @dev VALIDATION_SUCCESS for anything. This exists ONLY so W-29(c) can reach the engine's own
-    ///      InvalidSelfCall with UCEP out of the way. It never establishes that something is allowed.
+    ///      InvalidSelfCall with URP out of the way. It never establishes that something is allowed.
     function checkAction(ConfigId, address, address, uint256, bytes calldata) external pure returns (uint256) {
         return 0;
     }

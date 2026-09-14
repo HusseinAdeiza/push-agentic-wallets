@@ -11,7 +11,7 @@ import { SafeERC20 } from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.s
  *         block on a live network. It exists to be the far-chain target of a demo mandate.
  *
  * @dev    ITS SHAPE IS CHOSEN, NOT INCIDENTAL. `stakeFor(address,uint256)` takes a beneficiary as
- *         its FIRST argument specifically so that UCEP's `AllowedCall` can pin that argument and
+ *         its FIRST argument specifically so that URP's `AllowedCall` can pin that argument and
  *         assert it equals the wallet's own destination account. With a plain `stake(uint256)` the
  *         beneficiary gate never fires and the demo skips the most product-defining check in the
  *         system. The beneficiary therefore sits at calldata offset 4 — the first argument word,

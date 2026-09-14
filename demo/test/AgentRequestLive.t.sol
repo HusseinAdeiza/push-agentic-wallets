@@ -4,12 +4,12 @@ pragma solidity 0.8.26;
 import { BaseTest } from "../../test/Base.t.sol";
 import { Vm } from "forge-std/Vm.sol";
 import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-import { IUCEP } from "../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../src/interfaces/IURP.sol";
 import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { AgentSigning } from "../lib/AgentSigning.sol";
 import { Requests } from "../lib/Requests.sol";
-import { Multicall } from "../../src/libraries/PushWalletTypes.sol";
+import { Multicall, MandateType } from "../../src/libraries/PushWalletTypes.sol";
 import { MockUniversalGateway } from "../../test/mocks/MockUniversalGateway.sol";
 
 contract MockPRC20b is ERC20 {
@@ -37,7 +37,7 @@ contract MockPRC20b is ERC20 {
  *         non-indexed fields in `data`. Decoding a lone `bytes32` reads `nonceSeq`. An earlier
  *         version of `20_Stake` did exactly that; this test is what would have caught it.
  *
- *         Everything here runs against the real engine, validator, UCEP and wallet from `BaseTest`.
+ *         Everything here runs against the real engine, validator, URP and wallet from `BaseTest`.
  */
 contract AgentRequestLiveTest is BaseTest {
     MockPRC20b internal pUSDC;
@@ -69,13 +69,13 @@ contract AgentRequestLiveTest is BaseTest {
     }
 
     function _config() internal view returns (bytes memory) {
-        IUCEP.AllowedCall[] memory rules = new IUCEP.AllowedCall[](1);
-        rules[0] = IUCEP.AllowedCall({
+        IURP.AllowedCall[] memory rules = new IURP.AllowedCall[](1);
+        rules[0] = IURP.AllowedCall({
             target: FAR_TARGET, selector: STAKE_FOR, beneficiaryOffset: 4, hasBeneficiary: true, maxValue: 0
         });
 
-        return abi.encode(
-            IUCEP.Config({
+        return universalInitData(
+            IURP.Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 7 days),
                 destChainHash: keccak256(abi.encode("eip155", "11155111")),
@@ -104,7 +104,7 @@ contract AgentRequestLiveTest is BaseTest {
      */
     function test_opHashIsRecoverableFromTheEvent() public {
         vm.prank(owner);
-        bytes32 pid = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()));
+        bytes32 pid = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()), MandateType.UNIVERSAL);
 
         bytes memory ecd = _exec();
         bytes32 mode = Requests.singleMode();
@@ -137,7 +137,7 @@ contract AgentRequestLiveTest is BaseTest {
     /// @dev The indexed fields live in topics, not data — which is why `data` holds only two words.
     function test_indexedFieldsAreInTopics() public {
         vm.prank(owner);
-        bytes32 pid = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()));
+        bytes32 pid = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()), MandateType.UNIVERSAL);
 
         bytes memory ecd = _exec();
         bytes32 mode = Requests.singleMode();
@@ -161,12 +161,12 @@ contract AgentRequestLiveTest is BaseTest {
         revert("event not found");
     }
 
-    /// @dev `Requests.outbound` must produce bytes UCEP accepts. If the struct mirror or the
+    /// @dev `Requests.outbound` must produce bytes URP accepts. If the struct mirror or the
     ///      multicall prefix were wrong, the request would die at a gate rather than execute — so a
     ///      successful run is itself the assertion that the encoding is right.
     function test_requestsLibraryProducesAnAcceptedOutbound() public {
         vm.prank(owner);
-        bytes32 pid = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()));
+        bytes32 pid = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()), MandateType.UNIVERSAL);
 
         bytes memory ecd = _exec();
         bytes32 mode = Requests.singleMode();

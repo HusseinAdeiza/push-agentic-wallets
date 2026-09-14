@@ -21,7 +21,7 @@ import { Multicall } from "../../../src/libraries/PushWalletTypes.sol";
  * @dev    Act 4b showed the agent refused for naming the CEA as an inner target. This makes the
  *         identical call and succeeds — because **the owner door consults no policy at all**.
  *         `execute` reads exactly two things: the immutable-args owner, and calldata. Gate 14 never
- *         runs because UCEP never runs.
+ *         runs because URP never runs.
  *
  *         ── THE SELF-CALL, VERIFIED AGAINST DEPLOYED SOURCE ──
  *

@@ -6,7 +6,7 @@ import { AddressBook } from "./AddressBook.sol";
 import { DemoLog } from "./DemoLog.sol";
 import { Ledger } from "./Ledger.sol";
 import { AgentRequest } from "./AgentRequest.sol";
-import { IUCEP } from "../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../src/interfaces/IURP.sol";
 import { ConfigId } from "smartsessions/DataTypes.sol";
 import { IActionPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { SEND_OUTBOUND_SELECTOR } from "../../src/libraries/PushWalletTypes.sol";
@@ -18,7 +18,7 @@ import { SEND_OUTBOUND_SELECTOR } from "../../src/libraries/PushWalletTypes.sol"
  * @dev    ── WHY ONE LAYER IS NOT ENOUGH, AND THE ACCEPTANCE CRITERION HAD TO CHANGE ──
  *
  *         The engine truncates a policy's revert data to 32 bytes (`PolicyLib.sol`, `_maxCopy: 32`)
- *         and rewraps it as `PolicyCheckReverted(bytes32)`. Those 32 bytes are UCEP's 4-byte
+ *         and rewraps it as `PolicyCheckReverted(bytes32)`. Those 32 bytes are URP's 4-byte
  *         selector followed by the first 28 bytes of its first argument — and that prefix is
  *         worthless: for a `uint256` like `60e6` it is the all-zero high bytes; for an `address` it
  *         is 12 bytes of zero padding plus 16 of the 20 address bytes.
@@ -30,16 +30,16 @@ import { SEND_OUTBOUND_SELECTOR } from "../../src/libraries/PushWalletTypes.sol"
  *         ── LAYER 1: THE HONEST PATH ──
  *
  *         Submit exactly as a relayer would. Assert the outer error is `PolicyCheckReverted` AND
- *         that the top 4 bytes of the embedded word are the expected UCEP selector. This is what
+ *         that the top 4 bytes of the embedded word are the expected URP selector. This is what
  *         production actually looks like.
  *
  *         ── LAYER 2: THE ARGUMENT PROOF ──
  *
- *         Call `UCEP.checkAction` directly, pranked as the engine, against live forked state. The
+ *         Call `URP.checkAction` directly, pranked as the engine, against live forked state. The
  *         error arrives unwrapped, with every argument intact.
  *
  *         THE PRANK IS MANDATORY, NOT STYLISTIC. `checkAction` reads
- *         `$configs[id][msg.sender][account]` (`UCEP.sol:203`), so an unpranked call reads an empty
+ *         `$configs[id][msg.sender][account]` (`URP.sol:203`), so an unpranked call reads an empty
  *         slot and dies at gate 1 with `NotInitialized` — the wrong error, and a test that looks
  *         like it passed for the wrong reason.
  *
@@ -62,7 +62,7 @@ library Gauntlet {
      * @notice Run one gauntlet case: submit, assert the refusal, and narrate it.
      *
      * @param title     What the agent attempted, in plain language.
-     * @param expected  The UCEP error selector this attempt must produce.
+     * @param expected  The URP error selector this attempt must produce.
      * @param lesson    One sentence on what would have happened without the gate.
      * @param req       The mutated request.
      */
@@ -121,7 +121,7 @@ library Gauntlet {
     // ─────────────────────────────────── layer 2 ───────────────────────────────────
 
     /**
-     * @dev The same request, straight to `UCEP.checkAction`, pranked as the engine, on a Donut fork.
+     * @dev The same request, straight to `URP.checkAction`, pranked as the engine, on a Donut fork.
      *      The error arrives whole. Nothing is broadcast: this runs against forked state.
      */
     function _layer2(AgentRequest.Built memory req) private {
@@ -130,9 +130,9 @@ library Gauntlet {
         (address target, uint256 value, bytes memory data) = _decodeSingle(req.executionCalldata);
 
         vm.prank(req.engine); // MANDATORY — see the contract docs.
-        (bool ok, bytes memory ret) = AddressBook.ours("ucep")
+        (bool ok, bytes memory ret) = AddressBook.ours("urp")
             .call(
-                // `checkAction` is inherited from IActionPolicy, not redeclared on IUCEP — the v3
+                // `checkAction` is inherited from IActionPolicy, not redeclared on IURP — the v3
                 // interface deliberately never repeats an upstream signature.
                 abi.encodeCall(IActionPolicy.checkAction, (_configId(req.wallet), req.wallet, target, value, data))
             );
@@ -141,7 +141,7 @@ library Gauntlet {
             DemoLog.note("    layer 2: checkAction accepted it - the refusal came from elsewhere");
             return;
         }
-        DemoLog.ok("layer 2", "UCEP refused it directly, with arguments intact");
+        DemoLog.ok("layer 2", "URP refused it directly, with arguments intact");
         _printArguments(ret);
     }
 
@@ -152,21 +152,21 @@ library Gauntlet {
         bytes4 sel = bytes4(ret);
         bytes memory body = _slice(ret, 4);
 
-        if (sel == IUCEP.CallNotAllowed.selector && body.length >= 64) {
+        if (sel == IURP.CallNotAllowed.selector && body.length >= 64) {
             (address t, bytes4 s) = abi.decode(body, (address, bytes4));
             DemoLog.kv("  target", vm.toString(t));
             DemoLog.kv("  selector", vm.toString(abi.encodePacked(s)));
-        } else if (sel == IUCEP.ForbiddenInnerTarget.selector && body.length >= 32) {
+        } else if (sel == IURP.ForbiddenInnerTarget.selector && body.length >= 32) {
             DemoLog.kv("  forbidden", vm.toString(abi.decode(body, (address))));
-        } else if (sel == IUCEP.BeneficiaryMismatch.selector && body.length >= 64) {
+        } else if (sel == IURP.BeneficiaryMismatch.selector && body.length >= 64) {
             (address want, address got) = abi.decode(body, (address, address));
             DemoLog.kv("  expected", vm.toString(want));
             DemoLog.kv("  got", vm.toString(got));
-        } else if (sel == IUCEP.AmountExceedsCap.selector && body.length >= 64) {
+        } else if (sel == IURP.AmountExceedsCap.selector && body.length >= 64) {
             (uint256 amt, uint256 cap) = abi.decode(body, (uint256, uint256));
             DemoLog.kv("  requested", DemoLog.formatAmount(amt, 6, "USDC"));
             DemoLog.kv("  cap", DemoLog.formatAmount(cap, 6, "USDC"));
-        } else if (sel == IUCEP.TotalSpendCapExceeded.selector && body.length >= 64) {
+        } else if (sel == IURP.TotalSpendCapExceeded.selector && body.length >= 64) {
             (uint256 total, uint256 cap) = abi.decode(body, (uint256, uint256));
             DemoLog.kv("  would total", DemoLog.formatAmount(total, 6, "USDC"));
             DemoLog.kv("  lifetime cap", DemoLog.formatAmount(cap, 6, "USDC"));
@@ -190,7 +190,7 @@ library Gauntlet {
     }
 
     /// @dev `ExecutionLib.encodeSingle` is `abi.encodePacked(target, value, callData)` — 20 bytes,
-    ///      then 32, then the remainder. Unpacked here so layer 2 can hand UCEP the same arguments
+    ///      then 32, then the remainder. Unpacked here so layer 2 can hand URP the same arguments
     ///      the wallet would have.
     function _decodeSingle(bytes memory ecd) private pure returns (address target, uint256 value, bytes memory data) {
         assembly {
@@ -209,11 +209,11 @@ library Gauntlet {
     }
 
     function _errorName(bytes4 sel) private pure returns (string memory) {
-        if (sel == IUCEP.CallNotAllowed.selector) return "CallNotAllowed";
-        if (sel == IUCEP.ForbiddenInnerTarget.selector) return "ForbiddenInnerTarget";
-        if (sel == IUCEP.BeneficiaryMismatch.selector) return "BeneficiaryMismatch";
-        if (sel == IUCEP.AmountExceedsCap.selector) return "AmountExceedsCap";
-        if (sel == IUCEP.TotalSpendCapExceeded.selector) return "TotalSpendCapExceeded";
+        if (sel == IURP.CallNotAllowed.selector) return "CallNotAllowed";
+        if (sel == IURP.ForbiddenInnerTarget.selector) return "ForbiddenInnerTarget";
+        if (sel == IURP.BeneficiaryMismatch.selector) return "BeneficiaryMismatch";
+        if (sel == IURP.AmountExceedsCap.selector) return "AmountExceedsCap";
+        if (sel == IURP.TotalSpendCapExceeded.selector) return "TotalSpendCapExceeded";
         return "refused";
     }
 

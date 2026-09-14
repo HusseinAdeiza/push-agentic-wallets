@@ -29,7 +29,7 @@ contract BaseSmokeTest is BaseTest {
 
     /// U-21 pulled forward: the constant is declared here, so it is pinned here.
     /// THIS TEST EXISTS TO FAIL. If a field is added to UniversalOutboundTxRequest it breaks
-    /// immediately, instead of silently loosening UCEP's gate 4c into a check that passes everything.
+    /// immediately, instead of silently loosening URP's gate 4c into a check that passes everything.
     function test_minBodyLenMatchesStruct() public pure {
         assertEq(abi.encode(emptyOutboundRequest()).length, MIN_OUTBOUND_BODY_LEN, "352 pin");
     }

@@ -8,7 +8,7 @@ import { Ledger } from "../../lib/Ledger.sol";
 import { Gauntlet } from "../../lib/Gauntlet.sol";
 import { AgentRequest } from "../../lib/AgentRequest.sol";
 import { ICEA } from "../../lib/PushCore.sol";
-import { IUCEP } from "../../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../../src/interfaces/IURP.sol";
 
 /**
  * @title  G2 — the agent reaches for the account that holds everything
@@ -43,7 +43,7 @@ contract G2_ForbiddenCEA is Script {
 
         Gauntlet.refuse(
             "call sendUniversalTxToUEA on its own CEA",
-            IUCEP.ForbiddenInnerTarget.selector,
+            IURP.ForbiddenInnerTarget.selector,
             "The CEA holds the working capital. This call is legitimate for the OWNER (Act 4c) and never for the agent.",
             req
         );

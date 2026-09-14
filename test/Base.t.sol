@@ -9,24 +9,40 @@ import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.so
 
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+import { TransparentUpgradeableProxy } from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 
 import { PushSessionValidator } from "../src/validators/PushSessionValidator.sol";
-import { UCEP } from "../src/policies/UCEP.sol";
+import { URP } from "../src/policies/URP.sol";
 import { PushAgentWallet } from "../src/PushAgentWallet.sol";
 import { AGWFactory } from "../src/AGWFactory.sol";
-import { UniversalOutboundTxRequest, Multicall, MULTICALL_SELECTOR } from "../src/libraries/PushWalletTypes.sol";
+import {
+    UniversalOutboundTxRequest,
+    Multicall,
+    MandateType,
+    MULTICALL_SELECTOR
+} from "../src/libraries/PushWalletTypes.sol";
+import { IURP } from "../src/interfaces/IURP.sol";
 
 /**
  * @title  BaseTest — the shared harness every v3 suite extends.
  * @notice Deploys only what exists today: the permission engine and the session validator.
- *         UCEP, the wallet and the factory are added to this harness by their own phases.
+ *         URP, the wallet and the factory are added to this harness by their own phases.
  */
 abstract contract BaseTest is Test {
     // ───────────────────────────── deployments ─────────────────────────────
 
     SmartSession internal engine;
     PushSessionValidator internal validator;
-    UCEP internal ucep;
+
+    /// @dev THE REAL URP — a TransparentUpgradeableProxy in front of `urpImplementation`. Every
+    ///      suite drives this, so every test runs against the deployed shape.
+    URP internal urp;
+
+    /// @dev The URP IMPLEMENTATION. Holds no config of its own; its initialiser is disabled.
+    URP internal urpImplementation;
+
+    /// @dev The proxy itself, typed. Needed to reach the admin, which TUP creates internally.
+    TransparentUpgradeableProxy internal urpProxy;
 
     /// @dev The wallet IMPLEMENTATION. Clones delegatecall into it; it is never driven directly.
     PushAgentWallet internal walletImpl;
@@ -41,6 +57,9 @@ abstract contract BaseTest is Test {
     address internal FACTORY;
 
     address internal FACTORY_ADMIN;
+
+    /// @dev Owner of URP's ProxyAdmin — the only account that can upgrade the policy.
+    address internal URP_ADMIN_OWNER;
 
     // ─────────────────────────── named addresses ───────────────────────────
 
@@ -58,10 +77,10 @@ abstract contract BaseTest is Test {
     /// @dev Asserted against IUniversalGatewayPC.sendUniversalTxOutbound.selector in the smoke test.
     ///
     ///      DELIBERATELY HAND-TYPED, not imported from PushWalletTypes.sol. The production constant
-    ///      lives there and both the wallet and UCEP read it from that one place; this copy is the
+    ///      lives there and both the wallet and URP read it from that one place; this copy is the
     ///      INDEPENDENT WITNESS that the shared constant is the value the gateway actually exposes.
     ///      Importing it here would make the test agree with the source by construction and assert
-    ///      nothing — a mock supplying the behaviour under test. UCEP's smoke test pins the two
+    ///      nothing — a mock supplying the behaviour under test. URP's smoke test pins the two
     ///      against each other, so an edit to either side fails the build rather than passing quietly.
     bytes4 internal constant SEND_OUTBOUND_SELECTOR =
         bytes4(keccak256("sendUniversalTxOutbound((bytes,address,uint256,uint256,uint256,uint256,bytes,address))"));
@@ -71,14 +90,14 @@ abstract contract BaseTest is Test {
     ///      so abi.encode prefixes a pointer) + 256 (eight head words) + 32 + 32 (length words for
     ///      the two empty dynamic `bytes` fields, `recipient` and `payload`) = 352.
     ///      DO NOT hand-maintain this number: it is pinned against abi.encode of an empty request,
-    ///      so a field added to the struct fails the build instead of silently loosening UCEP's
+    ///      so a field added to the struct fails the build instead of silently loosening URP's
     ///      gate 4c into a check that passes everything.
     uint256 internal constant MIN_OUTBOUND_BODY_LEN = 352;
 
     // ─────────────────────────────── setUp ───────────────────────────────
 
     function setUp() public virtual {
-        // Named addresses first — UCEP's constructor consumes two of them.
+        // Named addresses first — URP's constructor consumes two of them.
         GATEWAY = makeAddr("universalGatewayPC");
         EXECUTOR_MODULE = makeAddr("universalExecutorModule");
         RELAYER = makeAddr("relayer");
@@ -89,8 +108,21 @@ abstract contract BaseTest is Test {
 
         engine = new SmartSession();
         validator = new PushSessionValidator();
-        ucep = new UCEP(GATEWAY, EXECUTOR_MODULE, address(engine));
-        walletImpl = new PushAgentWallet(address(engine), address(ucep), address(validator), GATEWAY);
+
+        // URP BEHIND ITS REAL PROXY, not a bare instance. Every suite therefore exercises the
+        // deployed shape: storage in the proxy, logic reached by delegatecall. A harness that
+        // deployed URP directly would test a contract that does not exist in production, and
+        // would silently miss anything that only breaks through a delegatecall.
+        URP_ADMIN_OWNER = makeAddr("urpAdminOwner");
+        urpImplementation = new URP();
+        urpProxy = new TransparentUpgradeableProxy(
+            address(urpImplementation),
+            URP_ADMIN_OWNER,
+            abi.encodeCall(URP.initialize, (GATEWAY, EXECUTOR_MODULE, address(engine)))
+        );
+        urp = URP(address(urpProxy));
+
+        walletImpl = new PushAgentWallet(address(engine), address(urp), address(validator), GATEWAY);
 
         // ERC-1967 proxy -> factory logic, initialised in the SAME transaction, so no
         // initialisation front-run window exists (factory PRD §8 step 3).
@@ -106,7 +138,7 @@ abstract contract BaseTest is Test {
 
         vm.label(address(engine), "SmartSession");
         vm.label(address(validator), "PushSessionValidator");
-        vm.label(address(ucep), "UCEP");
+        vm.label(address(urp), "URP");
         vm.label(address(walletImpl), "PushAgentWallet(impl)");
         vm.label(address(factory), "AGWFactory(proxy)");
         vm.label(address(factoryLogic), "AGWFactory(logic)");
@@ -126,15 +158,15 @@ abstract contract BaseTest is Test {
         return PushAgentWallet(payable(factory.deployWallet("")));
     }
 
-    // ─────────────────── UCEP gates seen through the engine ───────────────────
+    // ─────────────────── URP gates seen through the engine ───────────────────
 
     /**
-     * @notice Expect a UCEP gate to fire, as it surfaces THROUGH the engine.
-     * @dev    SHARED HELPER — use this in every suite that drives UCEP through SmartSession, and in
+     * @notice Expect a URP gate to fire, as it surfaces THROUGH the engine.
+     * @dev    SHARED HELPER — use this in every suite that drives URP through SmartSession, and in
      *         Phase 5. Do not hand-encode this at call sites.
      *
      *         The engine truncates policy revert data to 32 bytes and rewraps it
-     *         (`PolicyLib.sol:139-152`, `_maxCopy: 32`), so a UCEP error does NOT arrive as itself:
+     *         (`PolicyLib.sol:139-152`, `_maxCopy: 32`), so a URP error does NOT arrive as itself:
      *         it arrives as `PolicyCheckReverted(bytes32)` carrying the policy's first word — the
      *         4-byte selector LEFT-ALIGNED, the remaining 28 bytes zero. Naming the gate this way
      *         is what makes a negative test say WHICH gate fired instead of "something reverted".
@@ -147,17 +179,17 @@ abstract contract BaseTest is Test {
      *         (0x53444835ec580000). So the caller must pass the full ABI-encoded revert data, and
      *         this helper truncates it exactly as the engine does.
      */
-    function expectUcepGate(bytes memory ucepRevertData) internal {
+    function expectUrpGate(bytes memory urpRevertData) internal {
         bytes32 firstWord;
         // Mirror `_maxCopy: 32`: take the first word of the policy's revert data verbatim.
         assembly {
-            firstWord := mload(add(ucepRevertData, 0x20))
+            firstWord := mload(add(urpRevertData, 0x20))
         }
         vm.expectRevert(abi.encodeWithSelector(bytes4(0xf4270752), firstWord));
     }
 
     /// @dev Convenience for the no-argument case, where the word is just the left-aligned selector.
-    function expectUcepGate(bytes4 gateSelector) internal {
+    function expectUrpGate(bytes4 gateSelector) internal {
         vm.expectRevert(abi.encodeWithSelector(bytes4(0xf4270752), bytes32(gateSelector)));
     }
 
@@ -285,7 +317,7 @@ abstract contract BaseTest is Test {
      *         MECHANISM, and it is fussier than it looks — three forms were probed before this one.
      *         `vm.parseJson` ABI-encodes the JSON array it finds. An EMPTY array encodes to exactly
      *         64 bytes: an offset word plus a zero length word. Any declared variable makes it
-     *         longer (UCEP's two produce 1,120). So the length of the raw encoding is itself the
+     *         longer (URP's two produce 1,120). So the length of the raw encoding is itself the
      *         discriminator, and no decode is needed.
      *
      *         The two forms that do NOT work, recorded so they are not retried:
@@ -312,19 +344,66 @@ abstract contract BaseTest is Test {
         );
     }
 
+    /**
+     * @notice Assert a contract's storage layout is EXACTLY these labels, in this slot order.
+     *
+     * @dev    THE GUARD THAT MAKES "APPEND ONLY" ENFORCEABLE. Behind a proxy, storage belongs to
+     *         the proxy and outlives every implementation, so reordering or retyping a variable
+     *         does not fail the build — it silently reinterprets live state. For URP that means
+     *         live mandates: a shifted slot could move `spent`, and an agent's budget would read as
+     *         unspent. Nothing in Solidity catches that, so it is asserted against solc's own
+     *         `storageLayout` output here, exactly as `assertEmptyStorageLayout` does.
+     *
+     *         A future version may APPEND labels (and decrement `__gap`); this assertion should be
+     *         extended, never loosened. If it fails, do not "fix" it by editing the expected list
+     *         until you are certain the change is an append and not a reorder.
+     *
+     * @param contractName   Artifact name, e.g. "URP".
+     * @param expectedLabels Variable names in declaration order.
+     */
+    function assertStorageLayout(string memory contractName, string[] memory expectedLabels) internal view {
+        string memory path = string.concat("out/", contractName, ".sol/", contractName, ".json");
+        string memory artifact = vm.readFile(path);
+
+        require(vm.keyExistsJson(artifact, ".storageLayout.storage"), "no storageLayout in artifact");
+
+        for (uint256 i; i < expectedLabels.length; ++i) {
+            string memory base = string.concat(".storageLayout.storage[", vm.toString(i), "]");
+            assertEq(
+                vm.parseJsonString(artifact, string.concat(base, ".label")),
+                expectedLabels[i],
+                string.concat(contractName, " slot ", vm.toString(i), " label moved")
+            );
+            assertEq(
+                vm.parseJsonString(artifact, string.concat(base, ".slot")),
+                vm.toString(i),
+                string.concat(contractName, " ", expectedLabels[i], " is not at slot ", vm.toString(i))
+            );
+        }
+
+        // And nothing beyond the expected list — an unexpected trailing variable is a layout change
+        // too, and would otherwise pass silently.
+        assertFalse(
+            vm.keyExistsJson(
+                artifact, string.concat(".storageLayout.storage[", vm.toString(expectedLabels.length), "]")
+            ),
+            string.concat(contractName, " declares more storage than expected")
+        );
+    }
+
     // ────────────────────────── canonical session ──────────────────────────
 
     /**
-     * @notice The ONLY session shape v3 permits (deployment spec §4) — the deployed UCEP as the
+     * @notice The ONLY session shape v3 permits (deployment spec §4) — the deployed URP as the
      *         single action policy. POSITIVE tests use this.
      * @dev    `salt` is zero here; the wallet overwrites it with its monotonic grantNonce in Phase 3.
      */
-    function canonicalSession(bytes memory validatorInitData, bytes memory ucepInitData)
+    function canonicalSession(bytes memory validatorInitData, bytes memory urpInitData)
         internal
         view
         returns (Session memory)
     {
-        return sessionWithPolicy(address(ucep), validatorInitData, ucepInitData);
+        return sessionWithPolicy(address(urp), validatorInitData, urpInitData);
     }
 
     /**
@@ -358,9 +437,36 @@ abstract contract BaseTest is Test {
         });
     }
 
+    // ─────────────────────── the initData mode wrapper ───────────────────────
+
+    /**
+     * @notice Wrap an encoded config in URP's `(uint8 mode, bytes body)` envelope.
+     * @dev    SHARED HELPER — use this everywhere a policy `initData` is built. Since native mode
+     *         landed, `initializeWithMultiplexer` decodes the wrapper first and branches on the
+     *         mode, so a bare `abi.encode(Config)` is no longer a valid `initData` and reverts.
+     *
+     *         The mode travels as a `uint8`, not as the enum, deliberately — see URP's decoder
+     *         NatSpec. Tests that want to prove an OUT-OF-RANGE mode is rejected must hand-encode
+     *         `abi.encode(uint8(2), body)` rather than reach for this helper, which cannot express
+     *         an invalid mode.
+     */
+    function urpInitData(MandateType mode, bytes memory body) internal pure returns (bytes memory) {
+        return abi.encode(uint8(mode), body);
+    }
+
+    /// @dev The universal case, which is most of them.
+    function universalInitData(IURP.Config memory cfg) internal pure returns (bytes memory) {
+        return urpInitData(MandateType.UNIVERSAL, abi.encode(cfg));
+    }
+
+    /// @dev The native case.
+    function nativeInitData(IURP.NativeConfig memory cfg) internal pure returns (bytes memory) {
+        return urpInitData(MandateType.NATIVE, abi.encode(cfg));
+    }
+
     // ─────────────────────────── outbound request ───────────────────────────
 
-    /// @dev `recipient` is always empty — UCEP gate 11 requires it.
+    /// @dev `recipient` is always empty — URP gate 11 requires it.
     function outboundRequest(
         address token,
         uint256 amount,

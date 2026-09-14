@@ -20,7 +20,7 @@ import { Multicall } from "../../../src/libraries/PushWalletTypes.sol";
  *         agent.
  *
  *         WHY `approve` IS DELIBERATELY ABSENT FROM THE AGENT'S ALLOW-LIST. Put this in the runbook
- *         and say it out loud. UCEP's `AllowedCall` pins a target, a selector, and optionally ONE
+ *         and say it out loud. URP's `AllowedCall` pins a target, a selector, and optionally ONE
  *         argument that must equal `expectedCEA`. `USDC.approve(spender, amount)` has a spender
  *         that must equal StakeDummy — not the CEA — so the struct cannot express it. Allow-listing
  *         `approve` would therefore let the agent approve ANY address for ANY amount. That is a

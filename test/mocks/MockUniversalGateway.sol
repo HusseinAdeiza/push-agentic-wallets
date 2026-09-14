@@ -9,7 +9,7 @@ import { UniversalOutboundTxRequest } from "../../src/libraries/PushWalletTypes.
  *
  * @dev    It supplies NO behaviour the code under test depends on: it does not validate the
  *         request, does not decide whether a request is legal, and returns nothing. Every judgement
- *         about whether a request should have been sent belongs to UCEP and the wallet, upstream.
+ *         about whether a request should have been sent belongs to URP and the wallet, upstream.
  *         That separation is the point — this repo's one shipped critical bug survived review
  *         because a mock supplied the behaviour under test.
  *

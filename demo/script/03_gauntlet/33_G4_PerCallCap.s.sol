@@ -9,7 +9,7 @@ import { Ledger } from "../../lib/Ledger.sol";
 import { Amounts } from "../../lib/Amounts.sol";
 import { Gauntlet } from "../../lib/Gauntlet.sol";
 import { AgentRequest } from "../../lib/AgentRequest.sol";
-import { IUCEP } from "../../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../../src/interfaces/IURP.sol";
 import { StakeDummy } from "../../contracts/StakeDummy.sol";
 
 /**
@@ -45,7 +45,7 @@ contract G4_PerCallCap is Script {
 
         Gauntlet.refuse(
             "stake more than one action permits",
-            IUCEP.AmountExceedsCap.selector,
+            IURP.AmountExceedsCap.selector,
             "A per-action ceiling turns a compromised agent key into a bounded loss.",
             req
         );

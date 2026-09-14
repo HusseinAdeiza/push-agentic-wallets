@@ -28,7 +28,7 @@ interface IWalletNonce {
  *         would be as good as holding the key.
  *
  *         IT IS REFUSED DIFFERENTLY FROM G1-G5, AND THAT IS WORTH SAYING. The other five die inside
- *         UCEP, so the engine wraps them as `PolicyCheckReverted`. This one never reaches a policy
+ *         URP, so the engine wraps them as `PolicyCheckReverted`. This one never reaches a policy
  *         at all: the WALLET rejects it at the nonce check, before the signature is even recovered.
  *         Cheapest possible refusal, earliest possible point.
  *

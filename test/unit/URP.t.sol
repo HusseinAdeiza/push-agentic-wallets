@@ -2,18 +2,31 @@
 pragma solidity 0.8.26;
 
 import { BaseTest } from "../Base.t.sol";
-import { UCEP } from "../../src/policies/UCEP.sol";
-import { IUCEP } from "../../src/interfaces/IUCEP.sol";
+import { URP } from "../../src/policies/URP.sol";
+import { IURP } from "../../src/interfaces/IURP.sol";
 import { ConfigId } from "smartsessions/DataTypes.sol";
 import { IActionPolicy, IPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { IERC165 } from "forge-std/interfaces/IERC165.sol";
-import { Multicall, MULTICALL_SELECTOR, UniversalOutboundTxRequest } from "../../src/libraries/PushWalletTypes.sol";
+import {
+    Multicall,
+    MandateType,
+    MULTICALL_SELECTOR,
+    VALUE_SELECTOR,
+    UniversalOutboundTxRequest
+} from "../../src/libraries/PushWalletTypes.sol";
+import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
+import { ProxyAdmin } from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+import {
+    ITransparentUpgradeableProxy,
+    TransparentUpgradeableProxy
+} from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
+import { ERC1967Utils } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils.sol";
 
 /**
- * @notice UCEP acceptance suite — U-01 … U-22 (U-19 deferred to Phase 3b: it needs removeSession
+ * @notice URP acceptance suite — U-01 … U-22 (U-19 deferred to Phase 3b: it needs removeSession
  *         on a real wallet).
  *
- * @dev    HOW UCEP IS DRIVEN HERE. The engine does not call it yet, so the harness sets
+ * @dev    HOW URP IS DRIVEN HERE. The engine does not call it yet, so the harness sets
  *         SESSION_ENGINE to address(engine) and drives both engine-facing entry points with
  *         `vm.prank(address(engine))`. The engine is NOT mocked — we simply call from its address,
  *         which is what the multiplexer key means.
@@ -25,7 +38,7 @@ import { Multicall, MULTICALL_SELECTOR, UniversalOutboundTxRequest } from "../..
  *           2. gate 12 — a multicall body that is empty or structurally malformed.
  *         Every other negative test names its expected error.
  */
-contract UCEPTest is BaseTest {
+contract URPTest is BaseTest {
     // The far-chain protocol the allow-list points at. Never called — only named.
     address internal PROTOCOL;
     address internal CEA;
@@ -65,9 +78,9 @@ contract UCEPTest is BaseTest {
     // ───────────────────────────── config builders ─────────────────────────────
 
     /// @dev One allow-list entry: PROTOCOL.swap, with a beneficiary pin and a native cap.
-    function _oneRule() internal view returns (IUCEP.AllowedCall[] memory rules) {
-        rules = new IUCEP.AllowedCall[](1);
-        rules[0] = IUCEP.AllowedCall({
+    function _oneRule() internal view returns (IURP.AllowedCall[] memory rules) {
+        rules = new IURP.AllowedCall[](1);
+        rules[0] = IURP.AllowedCall({
             target: PROTOCOL,
             selector: SWAP_SELECTOR,
             beneficiaryOffset: BENEFICIARY_OFFSET,
@@ -76,8 +89,8 @@ contract UCEPTest is BaseTest {
         });
     }
 
-    function _config(IUCEP.AllowedCall[] memory rules) internal view returns (IUCEP.Config memory cfg) {
-        cfg = IUCEP.Config({
+    function _config(IURP.AllowedCall[] memory rules) internal view returns (IURP.Config memory cfg) {
+        cfg = IURP.Config({
             initialized: false,
             validUntil: VALID_UNTIL,
             destChainHash: keccak256("eip155:11155111"),
@@ -91,14 +104,14 @@ contract UCEPTest is BaseTest {
         });
     }
 
-    function _defaultConfig() internal view returns (IUCEP.Config memory) {
+    function _defaultConfig() internal view returns (IURP.Config memory) {
         return _config(_oneRule());
     }
 
     /// @dev Initialise as the engine — the only multiplexer the non-engine paths read.
-    function _init(IUCEP.Config memory cfg) internal {
+    function _init(IURP.Config memory cfg) internal {
         vm.prank(address(engine));
-        ucep.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(cfg));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(cfg));
     }
 
     function _initDefault() internal {
@@ -143,48 +156,311 @@ contract UCEPTest is BaseTest {
     /// @dev Drive the gauntlet as the engine would.
     function _check(uint256 value, bytes memory data) internal returns (uint256) {
         vm.prank(address(engine));
-        return ucep.checkAction(CID, ACCOUNT, GATEWAY, value, data);
+        return urp.checkAction(CID, ACCOUNT, GATEWAY, value, data);
     }
 
     function _spent() internal view returns (uint256) {
-        return ucep.getConfig(CID, ACCOUNT).spent;
+        return urp.getConfig(CID, ACCOUNT).spent;
     }
 
     // ═══════════════════════════ construction & init ═══════════════════════════
 
+    /// @dev The zero-address guard moved from the constructor to `initialize` when URP went behind
+    ///      a proxy. The NAME is kept: it is the same guard, on the same three arguments, and the
+    ///      test ids in the PRD refer to it. Driven through a fresh proxy each time, because that
+    ///      is the only context in which `initialize` is reachable.
     function test_constructor_rejectsZeroAddresses() public {
-        vm.expectRevert(IUCEP.ZeroAddress.selector);
-        new UCEP(address(0), EXECUTOR_MODULE, address(engine));
+        URP impl = new URP();
 
-        vm.expectRevert(IUCEP.ZeroAddress.selector);
-        new UCEP(GATEWAY, address(0), address(engine));
+        vm.expectRevert(IURP.ZeroAddress.selector);
+        new TransparentUpgradeableProxy(
+            address(impl),
+            URP_ADMIN_OWNER,
+            abi.encodeCall(URP.initialize, (address(0), EXECUTOR_MODULE, address(engine)))
+        );
 
-        vm.expectRevert(IUCEP.ZeroAddress.selector);
-        new UCEP(GATEWAY, EXECUTOR_MODULE, address(0));
+        vm.expectRevert(IURP.ZeroAddress.selector);
+        new TransparentUpgradeableProxy(
+            address(impl), URP_ADMIN_OWNER, abi.encodeCall(URP.initialize, (GATEWAY, address(0), address(engine)))
+        );
+
+        vm.expectRevert(IURP.ZeroAddress.selector);
+        new TransparentUpgradeableProxy(
+            address(impl), URP_ADMIN_OWNER, abi.encodeCall(URP.initialize, (GATEWAY, EXECUTOR_MODULE, address(0)))
+        );
     }
 
+    /// @dev Formerly "setsImmutables". The three anchors are storage now, but the property under
+    ///      test is unchanged: they are readable, correct, and there is no setter for any of them.
     function test_constructor_setsImmutables() public view {
-        assertEq(ucep.UNIVERSAL_GATEWAY_PC(), GATEWAY, "gateway immutable");
-        assertEq(ucep.UNIVERSAL_EXECUTOR_MODULE(), EXECUTOR_MODULE, "executor module immutable");
-        assertEq(ucep.SESSION_ENGINE(), address(engine), "session engine immutable");
+        assertEq(urp.UNIVERSAL_GATEWAY_PC(), GATEWAY, "gateway anchor");
+        assertEq(urp.UNIVERSAL_EXECUTOR_MODULE(), EXECUTOR_MODULE, "executor module anchor");
+        assertEq(urp.SESSION_ENGINE(), address(engine), "session engine anchor");
+    }
+
+    // ═══════════════════════════ upgradeability ═══════════════════════════
+
+    /// @dev An implementation left initialisable is a live contract holding a config the proxy
+    ///      knows nothing about. Its constructor must lock it.
+    function test_upgradeable_implementationCannotBeInitialised() public {
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        urpImplementation.initialize(GATEWAY, EXECUTOR_MODULE, address(engine));
+    }
+
+    /// @dev The proxy is initialised exactly once, in its constructor. A second call must fail, or
+    ///      anyone could re-point the engine this policy trusts.
+    function test_upgradeable_proxyCannotBeReinitialised() public {
+        vm.expectRevert(Initializable.InvalidInitialization.selector);
+        urp.initialize(GATEWAY, EXECUTOR_MODULE, address(engine));
+    }
+
+    /// @dev The anchors live in the PROXY's storage, not the implementation's. The implementation
+    ///      read directly must therefore answer zero — proof the values were never in bytecode.
+    function test_upgradeable_anchorsLiveInProxyStorage() public view {
+        assertEq(urpImplementation.UNIVERSAL_GATEWAY_PC(), address(0), "implementation holds no gateway");
+        assertEq(urpImplementation.SESSION_ENGINE(), address(0), "implementation holds no engine");
+        assertEq(urp.UNIVERSAL_GATEWAY_PC(), GATEWAY, "the proxy holds it");
+    }
+
+    /// @dev Only the ProxyAdmin's owner may upgrade. This is the whole security model now, so it
+    ///      gets a test that fails loudly if the admin is ever widened.
+    function test_upgradeable_onlyAdminOwnerCanUpgrade() public {
+        URP next = new URP();
+        ProxyAdmin admin = ProxyAdmin(_urpAdmin());
+
+        vm.prank(makeAddr("stranger"));
+        vm.expectRevert(abi.encodeWithSignature("OwnableUnauthorizedAccount(address)", makeAddr("stranger")));
+        admin.upgradeAndCall(ITransparentUpgradeableProxy(address(urp)), address(next), "");
+    }
+
+    /**
+     * @dev THE ONE THAT MATTERS. A mandate's spend counter is live money: it is what stops an agent
+     *      re-spending a budget. If an upgrade silently reinterpreted storage, `spent` would move
+     *      or reset and every existing mandate would be wrong in the attacker's favour.
+     *
+     *      Meters a real amount, upgrades, then asserts the counter and every anchor survived.
+     */
+    function test_upgradeable_storageSurvivesUpgrade() public {
+        _initDefault();
+        vm.prank(address(engine));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
+
+        uint256 spentBefore = _spent();
+        assertGt(spentBefore, 0, "the counter must have moved, or this test proves nothing");
+
+        URP next = new URP();
+        vm.prank(URP_ADMIN_OWNER);
+        ProxyAdmin(_urpAdmin()).upgradeAndCall(ITransparentUpgradeableProxy(address(urp)), address(next), "");
+
+        assertEq(_spent(), spentBefore, "spend counter survived the upgrade");
+        assertEq(urp.UNIVERSAL_GATEWAY_PC(), GATEWAY, "gateway anchor survived");
+        assertEq(urp.UNIVERSAL_EXECUTOR_MODULE(), EXECUTOR_MODULE, "executor anchor survived");
+        assertEq(urp.SESSION_ENGINE(), address(engine), "engine anchor survived");
+    }
+
+    /**
+     * @dev ⚠️ NEVER-DELETE. The storage layout is frozen for the life of the proxy; a reorder does
+     *      not fail the build, it reinterprets live mandates. If this test fails, the change is
+     *      almost certainly wrong — extend the list only for a genuine append.
+     */
+    function test_upgradeable_storageLayoutIsFrozen() public view {
+        // APPENDED 2026-09-09 for native mode: `$mode` and `$native` after `$credited`, `__gap`
+        // shrunk 45 -> 43 in the same commit so it still ends at slot 49. Slots 0-4 are unchanged
+        // from the deployed layout — that is what makes this an APPEND and not a reinterpretation.
+        // The rejected alternative (renaming `$configs` to `$universal`) would have failed here,
+        // which is the whole point of the assertion.
+        string[] memory expected = new string[](8);
+        expected[0] = "UNIVERSAL_GATEWAY_PC";
+        expected[1] = "UNIVERSAL_EXECUTOR_MODULE";
+        expected[2] = "SESSION_ENGINE";
+        expected[3] = "$configs";
+        expected[4] = "$credited";
+        expected[5] = "$mode";
+        expected[6] = "$native";
+        expected[7] = "__gap";
+
+        assertStorageLayout("URP", expected);
+    }
+
+    /// @dev TUP stores its admin in the ERC-1967 admin slot; it is created by the proxy's own
+    ///      constructor and is not returned anywhere, so it must be read from that slot.
+    function _urpAdmin() internal view returns (address) {
+        return address(uint160(uint256(vm.load(address(urp), ERC1967Utils.ADMIN_SLOT))));
+    }
+
+    /**
+     * @dev ⚠️ NEVER-DELETE (the seventeenth). URP's EXACT external selector set.
+     *
+     *      URP is the security boundary AND it is upgradeable, so an external function appearing on
+     *      it that nobody intended is exactly the thing worth pinning. An EXACT set, not a denylist:
+     *      a negative assertion cannot fail against a MISNAMED addition, which is the defect class
+     *      this form exists to catch.
+     *
+     *      Extend this list ONLY for a deliberate addition, in the same commit that adds it.
+     */
+    function test_URP_exactSelectorSet() public view {
+        bytes4[] memory expected = new bytes4[](16);
+        uint256 i;
+
+        // Wiring anchors and the public constant. Addressed by SIGNATURE, not `.selector`: solc
+        // does not expose a `.selector` member on a public state variable's or constant's
+        // auto-generated getter.
+        expected[i++] = bytes4(keccak256("SEND_OUTBOUND_SELECTOR()"));
+        expected[i++] = bytes4(keccak256("SESSION_ENGINE()"));
+        expected[i++] = bytes4(keccak256("UNIVERSAL_EXECUTOR_MODULE()"));
+        expected[i++] = bytes4(keccak256("UNIVERSAL_GATEWAY_PC()"));
+        expected[i++] = bytes4(keccak256("version()"));
+
+        // initialisation
+        expected[i++] = URP.initialize.selector;
+        expected[i++] = URP.initializeWithMultiplexer.selector;
+
+        // the engine-facing check
+        expected[i++] = URP.checkAction.selector;
+
+        // assertions — BOTH overloads, addressed by signature because `.selector` is ambiguous
+        expected[i++] = bytes4(keccak256("assertSpent(bytes32,address,uint256)"));
+        expected[i++] = bytes4(keccak256("assertSpent(bytes32,address,uint256,uint256,uint32)"));
+
+        // the refund path
+        expected[i++] = URP.creditRevert.selector;
+        expected[i++] = URP.isCredited.selector;
+
+        // views
+        expected[i++] = URP.getConfig.selector;
+        expected[i++] = URP.getNativeConfig.selector;
+        expected[i++] = URP.getMode.selector;
+
+        expected[i++] = URP.supportsInterface.selector;
+
+        assertEq(i, 16, "the hard-coded list must be complete");
+        assertSelectorSet("URP", expected);
+    }
+
+    /**
+     * @dev DECISION 47 — pre-upgrade universal mandates keep working with NO migration.
+     *
+     *      This is the property the whole append-only storage design exists to deliver, and it is
+     *      the one that would fail silently if the layout had been reordered. A config written
+     *      BEFORE native mode existed has an EMPTY `$mode` slot; `checkAction`'s routing sends an
+     *      empty slot to `_checkUniversal`, which is exactly right.
+     *
+     *      SIMULATING A PRE-UPGRADE CONFIG HONESTLY. The current code writes `$mode` on every init,
+     *      so a config created here is NOT pre-upgrade-shaped. The distinguishing feature of a real
+     *      one is precisely that `$mode` was never written — the slot did not exist when the config
+     *      was created. So the mode slot is zeroed with `vm.store` after init, reproducing the exact
+     *      storage state the deployed contract holds today: `$configs` populated, `$mode` empty.
+     *
+     *      That is a state manipulation, not a mock: nothing supplies behaviour to the code under
+     *      test. It only removes a write that the pre-upgrade implementation never made.
+     *
+     *      ⚠️ AMENDED 2026-09-09 (Phase 3b, review §2.1/§4.1). This test previously asserted that
+     *      `getMode` REPORTS a legacy config as uninitialised. That was the symptom of a real bug
+     *      dressed as a property: because the re-init guard read the same empty slot, a pre-upgrade
+     *      config was RE-INITIALISABLE — its `spent` could be reset to zero, or its mode flipped to
+     *      NATIVE, through the owner door. `_modeOf` is now legacy-aware, so the truthful statement
+     *      is TWO separate facts, asserted separately:
+     *        1. the RAW SLOT is still empty — nothing moved, which is the storage claim;
+     *        2. the DERIVED view reports `(true, UNIVERSAL)` — which is what the config actually is.
+     */
+    function test_upgradeable_preUpgradeUniversalConfigStillValidates() public {
+        _initDefault();
+        vm.prank(address(engine));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
+        uint256 spentBefore = _spent();
+
+        bytes32 modeSlot = _modeSlotOf(CID, ACCOUNT);
+        vm.store(address(urp), modeSlot, bytes32(0));
+
+        // 1. the raw slot is empty — the pre-upgrade storage state, unmoved
+        assertEq(vm.load(address(urp), modeSlot), bytes32(0), "the raw $mode slot is empty");
+        // 2. and the derived view tells the truth about what the config IS
+        assertTrue(urp.getMode(CID, ACCOUNT).initialized, "a legacy config reports as initialised");
+        assertEq(uint8(urp.getMode(CID, ACCOUNT).mode), uint8(MandateType.UNIVERSAL), "and reports as UNIVERSAL");
+
+        URP next = new URP();
+        vm.prank(URP_ADMIN_OWNER);
+        ProxyAdmin(_urpAdmin()).upgradeAndCall(ITransparentUpgradeableProxy(address(urp)), address(next), "");
+
+        // Still routes to the universal gauntlet and still meters, with no migration of any kind.
+        vm.prank(address(engine));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
+
+        assertEq(_spent(), spentBefore + 1 ether, "the pre-upgrade config still meters through gates 1-16");
+        assertEq(vm.load(address(urp), modeSlot), bytes32(0), "and its raw $mode slot is STILL empty");
+        assertTrue(urp.getMode(CID, ACCOUNT).initialized, "and it still reports as initialised");
+    }
+
+    /**
+     * @dev ⚠️ NEVER-DELETE — the EIGHTEENTH. Added 2026-09-09 (Phase 3b, review §2.1).
+     *
+     *      THE TEST THAT WOULD HAVE CAUGHT THE BUG. A pre-upgrade universal config has an empty
+     *      `$mode` slot, and the first native-mode implementation keyed its re-initialisation guard
+     *      on that slot alone. So every config that exists on Donut today was re-initialisable
+     *      through the owner door: re-init UNIVERSAL reset `spent` to zero; re-init NATIVE flipped
+     *      the mode under live universal data.
+     *
+     *      Reach was owner-door only — `grantMandate` always mints a fresh permission id, and the
+     *      agent door cannot target the engine — so it was owner self-harm rather than an agent
+     *      escalation. It is fixed anyway: it silently removed a documented invariant from exactly
+     *      the state an upgrade must not weaken.
+     *
+     *      If this test starts passing for the wrong reason, check that `_modeOf` still consults
+     *      `$configs[..].initialized` and not just `$mode`.
+     */
+    function test_upgradeable_preUpgradeConfigRefusesReinit() public {
+        _initDefault();
+        vm.prank(address(engine));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
+        uint256 spentBefore = _spent();
+        assertGt(spentBefore, 0, "the counter must have moved, or this test proves nothing");
+
+        // The legacy shape: $configs live, $mode never written.
+        vm.store(address(urp), _modeSlotOf(CID, ACCOUNT), bytes32(0));
+
+        // (a) re-init as UNIVERSAL would have RESET `spent`.
+        vm.prank(address(engine));
+        vm.expectRevert(abi.encodeWithSelector(IURP.AlreadyInitialized.selector, CID));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(_defaultConfig()));
+
+        // (b) re-init as NATIVE would have FLIPPED the mode under live universal data.
+        IURP.NativeConfig memory native;
+        native.validUntil = VALID_UNTIL;
+        native.target = PROTOCOL;
+        native.selector = SWAP_SELECTOR;
+        vm.prank(address(engine));
+        vm.expectRevert(abi.encodeWithSelector(IURP.AlreadyInitialized.selector, CID));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, nativeInitData(native));
+
+        // Neither attempt touched anything.
+        assertEq(_spent(), spentBefore, "spend counter untouched by the refused re-inits");
+        assertEq(urp.getConfig(CID, ACCOUNT).asset, ASSET, "and the live config is still readable");
+    }
+
+    /// @dev `$mode` is slot 5: keccak(account . keccak(multiplexer . keccak(configId . 5))).
+    function _modeSlotOf(ConfigId id, address account) internal view returns (bytes32) {
+        return
+            keccak256(
+                abi.encode(account, keccak256(abi.encode(address(engine), keccak256(abi.encode(id, uint256(5))))))
+            );
     }
 
     /// The hand-hashed constant must equal the interface's own selector.
     function test_sendOutboundSelector_matchesHarness() public view {
-        assertEq(ucep.SEND_OUTBOUND_SELECTOR(), SEND_OUTBOUND_SELECTOR, "UCEP constant == harness constant");
+        assertEq(urp.SEND_OUTBOUND_SELECTOR(), SEND_OUTBOUND_SELECTOR, "URP constant == harness constant");
     }
 
     function test_supportsInterface() public view {
-        assertTrue(ucep.supportsInterface(type(IActionPolicy).interfaceId), "IActionPolicy");
-        assertTrue(ucep.supportsInterface(type(IPolicy).interfaceId), "IPolicy");
-        assertTrue(ucep.supportsInterface(type(IERC165).interfaceId), "IERC165");
-        assertFalse(ucep.supportsInterface(0xdeadbeef), "unknown id");
+        assertTrue(urp.supportsInterface(type(IActionPolicy).interfaceId), "IActionPolicy");
+        assertTrue(urp.supportsInterface(type(IPolicy).interfaceId), "IPolicy");
+        assertTrue(urp.supportsInterface(type(IERC165).interfaceId), "IERC165");
+        assertFalse(urp.supportsInterface(0xdeadbeef), "unknown id");
     }
 
     /// getConfig round-trips every field, including the deep-copied allow-list.
     function test_getConfig_roundTripsIncludingAllowList() public {
         _initDefault();
-        IUCEP.Config memory got = ucep.getConfig(CID, ACCOUNT);
+        IURP.Config memory got = urp.getConfig(CID, ACCOUNT);
 
         assertTrue(got.initialized, "initialized set by init, not by _store");
         assertEq(got.validUntil, VALID_UNTIL, "validUntil");
@@ -205,65 +481,65 @@ contract UCEPTest is BaseTest {
 
     /// `spent` supplied in initData is ignored — _store forces it to zero.
     function test_init_ignoresSuppliedSpent() public {
-        IUCEP.Config memory cfg = _defaultConfig();
+        IURP.Config memory cfg = _defaultConfig();
         cfg.spent = 500 ether;
         _init(cfg);
         assertEq(_spent(), 0, "supplied spent ignored");
     }
 
     function test_init_emitsBothPolicySetEvents() public {
-        vm.expectEmit(true, true, true, true, address(ucep));
-        emit IUCEP.UCEPPolicySet(CID, address(engine), ACCOUNT);
-        vm.expectEmit(true, true, true, true, address(ucep));
+        vm.expectEmit(true, true, true, true, address(urp));
+        emit IURP.URPPolicySet(CID, address(engine), ACCOUNT, MandateType.UNIVERSAL);
+        vm.expectEmit(true, true, true, true, address(urp));
         emit IPolicy.PolicySet(CID, address(engine), ACCOUNT);
         _initDefault();
     }
 
     function test_init_rejectsZeroAssetAndZeroCEA() public {
-        IUCEP.Config memory noAsset = _defaultConfig();
+        IURP.Config memory noAsset = _defaultConfig();
         noAsset.asset = address(0);
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.InvalidConfigField.selector);
-        ucep.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(noAsset));
+        vm.expectRevert(IURP.InvalidConfigField.selector);
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(noAsset));
 
-        IUCEP.Config memory noCEA = _defaultConfig();
+        IURP.Config memory noCEA = _defaultConfig();
         noCEA.expectedCEA = address(0);
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.InvalidConfigField.selector);
-        ucep.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(noCEA));
+        vm.expectRevert(IURP.InvalidConfigField.selector);
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(noCEA));
     }
 
     /// §6.1: a per-call cap of zero is a LEGAL redeploy-only mandate. Do not reject it at init.
     function test_init_acceptsZeroPerCallCap() public {
-        IUCEP.Config memory cfg = _defaultConfig();
+        IURP.Config memory cfg = _defaultConfig();
         cfg.maxAmountPerCall = 0;
         _init(cfg);
-        assertEq(ucep.getConfig(CID, ACCOUNT).maxAmountPerCall, 0, "zero per-call cap accepted");
+        assertEq(urp.getConfig(CID, ACCOUNT).maxAmountPerCall, 0, "zero per-call cap accepted");
     }
 
     // ═════════════════════════════════ U-08 ═════════════════════════════════
 
     function test_U08_Expiry_Semantics() public {
         // init with validUntil == 0
-        IUCEP.Config memory zero = _defaultConfig();
+        IURP.Config memory zero = _defaultConfig();
         zero.validUntil = 0;
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.InvalidExpiry.selector, uint48(0)));
-        ucep.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(zero));
+        vm.expectRevert(abi.encodeWithSelector(IURP.InvalidExpiry.selector, uint48(0)));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(zero));
 
         // init with validUntil in the past
-        IUCEP.Config memory past = _defaultConfig();
+        IURP.Config memory past = _defaultConfig();
         past.validUntil = uint48(block.timestamp - 1);
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.InvalidExpiry.selector, past.validUntil));
-        ucep.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(past));
+        vm.expectRevert(abi.encodeWithSelector(IURP.InvalidExpiry.selector, past.validUntil));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(past));
 
         // init with validUntil exactly now — also refused: "in the future" is strict
-        IUCEP.Config memory now_ = _defaultConfig();
+        IURP.Config memory now_ = _defaultConfig();
         now_.validUntil = uint48(block.timestamp);
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.InvalidExpiry.selector, now_.validUntil));
-        ucep.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(now_));
+        vm.expectRevert(abi.encodeWithSelector(IURP.InvalidExpiry.selector, now_.validUntil));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(now_));
 
         // a live config validates; once expired it rejects everything
         _initDefault();
@@ -271,8 +547,8 @@ contract UCEPTest is BaseTest {
 
         vm.warp(uint256(VALID_UNTIL) + 1);
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.MandateExpired.selector, VALID_UNTIL));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
+        vm.expectRevert(abi.encodeWithSelector(IURP.MandateExpired.selector, VALID_UNTIL));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
 
         // the boundary itself passes: gate 2 is `block.timestamp > validUntil`
         vm.warp(uint256(VALID_UNTIL));
@@ -281,7 +557,7 @@ contract UCEPTest is BaseTest {
 
     /// type(uint48).max is "never" written explicitly — there is no silent-forever config.
     function test_U08_NeverExpires_IsExplicit() public {
-        IUCEP.Config memory cfg = _defaultConfig();
+        IURP.Config memory cfg = _defaultConfig();
         cfg.validUntil = type(uint48).max;
         _init(cfg);
 
@@ -291,10 +567,10 @@ contract UCEPTest is BaseTest {
 
     // ═════════════════════════════════ U-20 ═════════════════════════════════
 
-    function _nRules(uint256 n) internal pure returns (IUCEP.AllowedCall[] memory rules) {
-        rules = new IUCEP.AllowedCall[](n);
+    function _nRules(uint256 n) internal pure returns (IURP.AllowedCall[] memory rules) {
+        rules = new IURP.AllowedCall[](n);
         for (uint256 i; i < n; ++i) {
-            rules[i] = IUCEP.AllowedCall({
+            rules[i] = IURP.AllowedCall({
                 target: address(uint160(uint256(keccak256(abi.encode("protocol", i))))),
                 selector: bytes4(keccak256(abi.encode("fn", i))),
                 beneficiaryOffset: BENEFICIARY_OFFSET,
@@ -306,37 +582,37 @@ contract UCEPTest is BaseTest {
 
     function test_U20_AllowList_Bounds() public {
         // zero entries
-        IUCEP.Config memory empty = _config(new IUCEP.AllowedCall[](0));
+        IURP.Config memory empty = _config(new IURP.AllowedCall[](0));
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.AllowListOutOfRange.selector, uint256(0)));
-        ucep.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(empty));
+        vm.expectRevert(abi.encodeWithSelector(IURP.AllowListOutOfRange.selector, uint256(0)));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(empty));
 
         // 33 entries
-        IUCEP.Config memory tooMany = _config(_nRules(33));
+        IURP.Config memory tooMany = _config(_nRules(33));
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.AllowListOutOfRange.selector, uint256(33)));
-        ucep.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(tooMany));
+        vm.expectRevert(abi.encodeWithSelector(IURP.AllowListOutOfRange.selector, uint256(33)));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(tooMany));
 
         // 1 entry initialises
         _initDefault();
-        assertEq(ucep.getConfig(CID, ACCOUNT).allowedCalls.length, 1, "1 entry accepted");
+        assertEq(urp.getConfig(CID, ACCOUNT).allowedCalls.length, 1, "1 entry accepted");
 
         // 32 entries initialise, under a different config id
         ConfigId other = ConfigId.wrap(bytes32(uint256(0xBEEF)));
         vm.prank(address(engine));
-        ucep.initializeWithMultiplexer(ACCOUNT, other, abi.encode(_config(_nRules(32))));
-        assertEq(ucep.getConfig(other, ACCOUNT).allowedCalls.length, 32, "32 entries accepted");
+        urp.initializeWithMultiplexer(ACCOUNT, other, universalInitData(_config(_nRules(32))));
+        assertEq(urp.getConfig(other, ACCOUNT).allowedCalls.length, 32, "32 entries accepted");
     }
 
     /// The worst case the bound permits: a 32-entry allow-list validating a 10-entry payload.
     /// The number is asserted because "a sane gas budget" is unassertable — a test that cannot
     /// fail is worse than no test.
     function test_U20_WorstCaseGas() public {
-        IUCEP.AllowedCall[] memory rules = _nRules(32);
+        IURP.AllowedCall[] memory rules = _nRules(32);
         _init(_config(rules));
 
         // Every entry targets the LAST rule, so each lookup walks the full 32-entry scan.
-        IUCEP.AllowedCall memory last = rules[31];
+        IURP.AllowedCall memory last = rules[31];
         Multicall[] memory calls = new Multicall[](10);
         for (uint256 i; i < 10; ++i) {
             calls[i] =
@@ -347,7 +623,7 @@ contract UCEPTest is BaseTest {
 
         vm.prank(address(engine));
         uint256 before = gasleft();
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
         uint256 gasUsed = before - gasleft();
 
         emit log_named_uint("U-20 worst-case checkAction gas", gasUsed);
@@ -365,23 +641,23 @@ contract UCEPTest is BaseTest {
         // (a) re-initialisation is refused, even from the real engine. This is what turns the
         //     engine's owner-only in-place counter-reset lever into a wall.
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.AlreadyInitialized.selector, CID));
-        ucep.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(_defaultConfig()));
+        vm.expectRevert(abi.encodeWithSelector(IURP.AlreadyInitialized.selector, CID));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(_defaultConfig()));
         assertEq(_spent(), 10 ether, "spent survives the refused re-init");
 
         // (b) creditRevert from any non-module caller reverts — the agent cannot fabricate a
         //     failure to refill its own budget.
         vm.prank(AGENT);
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.NotExecutorModule.selector, AGENT));
-        ucep.creditRevert(CID, ACCOUNT, keccak256("tx"), 10 ether);
+        vm.expectRevert(abi.encodeWithSelector(IURP.NotExecutorModule.selector, AGENT));
+        urp.creditRevert(CID, ACCOUNT, keccak256("tx"), 10 ether);
 
         vm.prank(ACCOUNT);
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.NotExecutorModule.selector, ACCOUNT));
-        ucep.creditRevert(CID, ACCOUNT, keccak256("tx"), 10 ether);
+        vm.expectRevert(abi.encodeWithSelector(IURP.NotExecutorModule.selector, ACCOUNT));
+        urp.creditRevert(CID, ACCOUNT, keccak256("tx"), 10 ether);
 
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.NotExecutorModule.selector, address(engine)));
-        ucep.creditRevert(CID, ACCOUNT, keccak256("tx"), 10 ether);
+        vm.expectRevert(abi.encodeWithSelector(IURP.NotExecutorModule.selector, address(engine)));
+        urp.creditRevert(CID, ACCOUNT, keccak256("tx"), 10 ether);
 
         assertEq(_spent(), 10 ether, "spent never reduced by an agent-reachable path");
     }
@@ -391,16 +667,16 @@ contract UCEPTest is BaseTest {
 
     function test_U03_gate1_NotInitialized() public {
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.NotInitialized.selector, CID, ACCOUNT));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
+        vm.expectRevert(abi.encodeWithSelector(IURP.NotInitialized.selector, CID, ACCOUNT));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
     }
 
     function test_U03_gate2_MandateExpired() public {
         _initDefault();
         vm.warp(uint256(VALID_UNTIL) + 1);
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.MandateExpired.selector, VALID_UNTIL));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
+        vm.expectRevert(abi.encodeWithSelector(IURP.MandateExpired.selector, VALID_UNTIL));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -408,8 +684,8 @@ contract UCEPTest is BaseTest {
         _initDefault();
         address notGateway = makeAddr("someOtherPushContract");
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.InvalidTarget.selector, notGateway));
-        ucep.checkAction(CID, ACCOUNT, notGateway, 0, _goodRequest(1 ether));
+        vm.expectRevert(abi.encodeWithSelector(IURP.InvalidTarget.selector, notGateway));
+        urp.checkAction(CID, ACCOUNT, notGateway, 0, _goodRequest(1 ether));
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -418,8 +694,8 @@ contract UCEPTest is BaseTest {
         _initDefault();
         bytes memory tooShort = hex"112233";
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.CalldataTooShort.selector, uint256(3)));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, tooShort);
+        vm.expectRevert(abi.encodeWithSelector(IURP.CalldataTooShort.selector, uint256(3)));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, tooShort);
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -428,8 +704,8 @@ contract UCEPTest is BaseTest {
     function test_U03_gate4a_ZeroSelectorIsNotConflated() public {
         _initDefault();
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.InvalidSelector.selector, bytes4(0)));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, hex"00000000");
+        vm.expectRevert(abi.encodeWithSelector(IURP.InvalidSelector.selector, bytes4(0)));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, hex"00000000");
     }
 
     function test_U03_gate4b_InvalidSelector() public {
@@ -437,8 +713,8 @@ contract UCEPTest is BaseTest {
         bytes4 wrong = bytes4(keccak256("someOtherGatewayFunction()"));
         bytes memory data = abi.encodePacked(wrong, new bytes(MIN_OUTBOUND_BODY_LEN));
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.InvalidSelector.selector, wrong));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
+        vm.expectRevert(abi.encodeWithSelector(IURP.InvalidSelector.selector, wrong));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -447,8 +723,8 @@ contract UCEPTest is BaseTest {
         _initDefault();
         bytes memory data = abi.encodePacked(SEND_OUTBOUND_SELECTOR, new bytes(MIN_OUTBOUND_BODY_LEN - 1));
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.MalformedOutboundRequest.selector, data.length));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
+        vm.expectRevert(abi.encodeWithSelector(IURP.MalformedOutboundRequest.selector, data.length));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -474,7 +750,7 @@ contract UCEPTest is BaseTest {
 
         vm.prank(address(engine));
         vm.expectRevert();
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -483,21 +759,21 @@ contract UCEPTest is BaseTest {
         address wrongToken = makeAddr("someOtherPRC20");
         bytes memory data = outboundRequest(wrongToken, 1 ether, 1 ether, ACCOUNT, _goodCalls());
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.AssetMismatch.selector, ASSET, wrongToken));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
+        vm.expectRevert(abi.encodeWithSelector(IURP.AssetMismatch.selector, ASSET, wrongToken));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
         assertEq(_spent(), 0, "nothing spent");
     }
 
     function test_U03_gate6_AmountExceedsCap() public {
         _initDefault();
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.AmountExceedsCap.selector, uint256(101 ether), uint256(100 ether)));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(101 ether));
+        vm.expectRevert(abi.encodeWithSelector(IURP.AmountExceedsCap.selector, uint256(101 ether), uint256(100 ether)));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(101 ether));
         assertEq(_spent(), 0, "nothing spent");
     }
 
     function test_U03_gate7_TotalSpendCapExceeded() public {
-        IUCEP.Config memory cfg = _defaultConfig();
+        IURP.Config memory cfg = _defaultConfig();
         cfg.maxAmountTotal = 150 ether;
         _init(cfg);
 
@@ -506,17 +782,17 @@ contract UCEPTest is BaseTest {
 
         vm.prank(address(engine));
         vm.expectRevert(
-            abi.encodeWithSelector(IUCEP.TotalSpendCapExceeded.selector, uint256(200 ether), uint256(150 ether))
+            abi.encodeWithSelector(IURP.TotalSpendCapExceeded.selector, uint256(200 ether), uint256(150 ether))
         );
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(100 ether));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(100 ether));
         assertEq(_spent(), 100 ether, "spent unchanged by the failed request");
     }
 
     function test_U03_gate8_PCValueExceedsCap() public {
         _initDefault();
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.PCValueExceedsCap.selector, uint256(6 ether), uint256(5 ether)));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 6 ether, _goodRequest(1 ether));
+        vm.expectRevert(abi.encodeWithSelector(IURP.PCValueExceedsCap.selector, uint256(6 ether), uint256(5 ether)));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 6 ether, _goodRequest(1 ether));
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -524,8 +800,8 @@ contract UCEPTest is BaseTest {
         _initDefault();
         bytes memory data = outboundRequest(ASSET, 1 ether, 0, ACCOUNT, _goodCalls());
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.UncappedGasSwapRejected.selector);
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
+        vm.expectRevert(IURP.UncappedGasSwapRejected.selector);
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -533,8 +809,8 @@ contract UCEPTest is BaseTest {
         _initDefault();
         bytes memory data = outboundRequest(ASSET, 1 ether, 1 ether, AGENT, _goodCalls());
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.InvalidRevertRecipient.selector, ACCOUNT, AGENT));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
+        vm.expectRevert(abi.encodeWithSelector(IURP.InvalidRevertRecipient.selector, ACCOUNT, AGENT));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -554,8 +830,8 @@ contract UCEPTest is BaseTest {
             })
         );
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.RecipientMustBeEmpty.selector);
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
+        vm.expectRevert(IURP.RecipientMustBeEmpty.selector);
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -577,8 +853,8 @@ contract UCEPTest is BaseTest {
 
         // (a) an unrelated magic prefix — the CEA's single-call fall-through branch
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.PayloadNotMulticall.selector);
-        ucep.checkAction(
+        vm.expectRevert(IURP.PayloadNotMulticall.selector);
+        urp.checkAction(
             CID,
             ACCOUNT,
             GATEWAY,
@@ -588,25 +864,23 @@ contract UCEPTest is BaseTest {
 
         // (b) the CEA's MIGRATION branch — explicitly excluded, not merely unmatched
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.PayloadNotMulticall.selector);
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestWithPayload(abi.encodePacked(MIGRATION_SELECTOR)));
+        vm.expectRevert(IURP.PayloadNotMulticall.selector);
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestWithPayload(abi.encodePacked(MIGRATION_SELECTOR)));
 
         // (c) a migration prefix carrying a body, so the rejection is not an artefact of length
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.PayloadNotMulticall.selector);
-        ucep.checkAction(
-            CID, ACCOUNT, GATEWAY, 0, _requestWithPayload(abi.encodePacked(MIGRATION_SELECTOR, uint256(1)))
-        );
+        vm.expectRevert(IURP.PayloadNotMulticall.selector);
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestWithPayload(abi.encodePacked(MIGRATION_SELECTOR, uint256(1))));
 
         // (d) an empty payload — the CEA's single-call branch with a raw empty body
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.PayloadNotMulticall.selector);
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestWithPayload(""));
+        vm.expectRevert(IURP.PayloadNotMulticall.selector);
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestWithPayload(""));
 
         // (e) too short to even carry a prefix
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.PayloadNotMulticall.selector);
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestWithPayload(hex"2cc2"));
+        vm.expectRevert(IURP.PayloadNotMulticall.selector);
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestWithPayload(hex"2cc2"));
 
         assertEq(_spent(), 0, "nothing spent");
     }
@@ -631,7 +905,7 @@ contract UCEPTest is BaseTest {
      * its own it could not distinguish the decoder residual from some later gate firing — a
      * mutation probe confirmed that replacing the decode with a stub still leaves a
      * bare-expectRevert-only version of this test green. Asserting that the returndata is EMPTY
-     * pins the actual mechanism: a UCEP error would be four bytes or more, so empty returndata is
+     * pins the actual mechanism: a URP error would be four bytes or more, so empty returndata is
      * positive evidence that the revert came from inside the ABI decoder and not from a named gate.
      */
     function test_U03_gate12_MalformedMulticallBodyRevertsUnnamed() public {
@@ -650,14 +924,14 @@ contract UCEPTest is BaseTest {
             // The selector-less assertion the residual requires...
             vm.prank(address(engine));
             vm.expectRevert();
-            ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
+            urp.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
 
             // ...plus positive evidence of WHICH revert it was.
             vm.prank(address(engine));
             (bool ok, bytes memory ret) =
-                address(ucep).call(abi.encodeWithSelector(ucep.checkAction.selector, CID, ACCOUNT, GATEWAY, 0, data));
+                address(urp).call(abi.encodeWithSelector(urp.checkAction.selector, CID, ACCOUNT, GATEWAY, 0, data));
             assertFalse(ok, "reverted");
-            assertEq(ret.length, 0, "bare decoder revert, not a named UCEP error");
+            assertEq(ret.length, 0, "bare decoder revert, not a named URP error");
         }
 
         assertEq(_spent(), 0, "nothing spent");
@@ -666,8 +940,8 @@ contract UCEPTest is BaseTest {
     function test_U03_gate13_BatchSizeOutOfRange() public {
         _initDefault();
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.BatchSizeOutOfRange.selector, uint256(0)));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, new Multicall[](0)));
+        vm.expectRevert(abi.encodeWithSelector(IURP.BatchSizeOutOfRange.selector, uint256(0)));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, new Multicall[](0)));
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -676,8 +950,8 @@ contract UCEPTest is BaseTest {
         Multicall[] memory calls = _goodCalls();
         calls[0].to = GATEWAY;
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.ForbiddenInnerTarget.selector, GATEWAY));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, calls));
+        vm.expectRevert(abi.encodeWithSelector(IURP.ForbiddenInnerTarget.selector, GATEWAY));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, calls));
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -687,8 +961,8 @@ contract UCEPTest is BaseTest {
         Multicall[] memory calls = _goodCalls();
         calls[0].data = hex"1122";
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.MalformedInnerCalldata.selector);
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, calls));
+        vm.expectRevert(IURP.MalformedInnerCalldata.selector);
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, calls));
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -700,15 +974,15 @@ contract UCEPTest is BaseTest {
         address stranger = makeAddr("unlistedProtocol");
         wrongTarget[0].to = stranger;
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.CallNotAllowed.selector, stranger, SWAP_SELECTOR));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, wrongTarget));
+        vm.expectRevert(abi.encodeWithSelector(IURP.CallNotAllowed.selector, stranger, SWAP_SELECTOR));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, wrongTarget));
 
         // listed target, unlisted selector
         Multicall[] memory wrongSelector = _goodCalls();
         wrongSelector[0].data = abi.encodeWithSelector(POKE_SELECTOR, uint256(1), CEA);
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.CallNotAllowed.selector, PROTOCOL, POKE_SELECTOR));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, wrongSelector));
+        vm.expectRevert(abi.encodeWithSelector(IURP.CallNotAllowed.selector, PROTOCOL, POKE_SELECTOR));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, wrongSelector));
 
         assertEq(_spent(), 0, "nothing spent");
     }
@@ -720,10 +994,10 @@ contract UCEPTest is BaseTest {
         vm.prank(address(engine));
         vm.expectRevert(
             abi.encodeWithSelector(
-                IUCEP.InnerValueExceedsAllowance.selector, uint256(0), uint256(1 ether + 1), uint256(1 ether)
+                IURP.InnerValueExceedsAllowance.selector, uint256(0), uint256(1 ether + 1), uint256(1 ether)
             )
         );
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, calls));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, calls));
         assertEq(_spent(), 0, "nothing spent");
     }
 
@@ -734,15 +1008,15 @@ contract UCEPTest is BaseTest {
     /// cannot hand the agent direct control of everything it holds.
     function test_U01_ForbiddenCEA_BeatsAllowlist() public {
         // The allow-list explicitly contains the destination account.
-        IUCEP.AllowedCall[] memory rules = new IUCEP.AllowedCall[](2);
-        rules[0] = IUCEP.AllowedCall({
+        IURP.AllowedCall[] memory rules = new IURP.AllowedCall[](2);
+        rules[0] = IURP.AllowedCall({
             target: PROTOCOL,
             selector: SWAP_SELECTOR,
             beneficiaryOffset: BENEFICIARY_OFFSET,
             hasBeneficiary: true,
             maxValue: 1 ether
         });
-        rules[1] = IUCEP.AllowedCall({
+        rules[1] = IURP.AllowedCall({
             target: CEA, // the owner listed their own destination account
             selector: POKE_SELECTOR,
             beneficiaryOffset: 0,
@@ -752,7 +1026,7 @@ contract UCEPTest is BaseTest {
         _init(_config(rules));
 
         // Sanity: that rule really is in the list, so the test proves ordering, not absence.
-        IUCEP.Config memory stored = ucep.getConfig(CID, ACCOUNT);
+        IURP.Config memory stored = urp.getConfig(CID, ACCOUNT);
         assertEq(stored.allowedCalls.length, 2, "two rules stored");
         assertEq(stored.allowedCalls[1].target, CEA, "the CEA rule IS allow-listed");
 
@@ -760,22 +1034,22 @@ contract UCEPTest is BaseTest {
         calls[0] = Multicall({ to: CEA, value: 0, data: abi.encodeWithSelector(POKE_SELECTOR) });
 
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.ForbiddenInnerTarget.selector, CEA));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, calls));
+        vm.expectRevert(abi.encodeWithSelector(IURP.ForbiddenInnerTarget.selector, CEA));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, calls));
         assertEq(_spent(), 0, "nothing spent");
     }
 
     /// The other three forbidden destinations, each individually.
-    function test_U01_ForbiddenInnerTargets_walletUcepGateway() public {
+    function test_U01_ForbiddenInnerTargets_walletUrpGateway() public {
         _initDefault();
 
-        address[3] memory forbidden = [ACCOUNT, address(ucep), GATEWAY];
+        address[3] memory forbidden = [ACCOUNT, address(urp), GATEWAY];
         for (uint256 i; i < forbidden.length; ++i) {
             Multicall[] memory calls = _goodCalls();
             calls[0].to = forbidden[i];
             vm.prank(address(engine));
-            vm.expectRevert(abi.encodeWithSelector(IUCEP.ForbiddenInnerTarget.selector, forbidden[i]));
-            ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, calls));
+            vm.expectRevert(abi.encodeWithSelector(IURP.ForbiddenInnerTarget.selector, forbidden[i]));
+            urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, calls));
         }
         assertEq(_spent(), 0, "nothing spent");
     }
@@ -799,8 +1073,8 @@ contract UCEPTest is BaseTest {
         Multicall[] memory calls = _goodCalls();
         calls[0].to = makeAddr("unlistedProtocol");
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.CallNotAllowed.selector, calls[0].to, SWAP_SELECTOR));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(0, calls));
+        vm.expectRevert(abi.encodeWithSelector(IURP.CallNotAllowed.selector, calls[0].to, SWAP_SELECTOR));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(0, calls));
     }
 
     // ═════════════════════════════════ U-05 ═════════════════════════════════
@@ -818,8 +1092,8 @@ contract UCEPTest is BaseTest {
         calls[9] = Multicall({ to: PROTOCOL, value: 0, data: abi.encodeWithSelector(SWAP_SELECTOR, uint256(9), AGENT) });
 
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.BeneficiaryMismatch.selector, CEA, AGENT));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(5 ether, calls));
+        vm.expectRevert(abi.encodeWithSelector(IURP.BeneficiaryMismatch.selector, CEA, AGENT));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(5 ether, calls));
         assertEq(_spent(), 0, "nothing spent - one bad entry kills the batch");
     }
 
@@ -837,12 +1111,12 @@ contract UCEPTest is BaseTest {
         _initDefault();
 
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.BatchSizeOutOfRange.selector, uint256(0)));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, _nGoodCalls(0)));
+        vm.expectRevert(abi.encodeWithSelector(IURP.BatchSizeOutOfRange.selector, uint256(0)));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, _nGoodCalls(0)));
 
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.BatchSizeOutOfRange.selector, uint256(11)));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, _nGoodCalls(11)));
+        vm.expectRevert(abi.encodeWithSelector(IURP.BatchSizeOutOfRange.selector, uint256(11)));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, _nGoodCalls(11)));
 
         assertEq(_check(0, _requestData(1 ether, _nGoodCalls(1))), 0, "1 entry validates");
         assertEq(_check(0, _requestData(1 ether, _nGoodCalls(10))), 0, "10 entries validate");
@@ -851,7 +1125,7 @@ contract UCEPTest is BaseTest {
     // ═════════════════════════════════ U-07 ═════════════════════════════════
 
     function test_U07_LifetimeCap_AtTheCrossing() public {
-        IUCEP.Config memory cfg = _defaultConfig();
+        IURP.Config memory cfg = _defaultConfig();
         cfg.maxAmountTotal = 100 ether;
         _init(cfg);
 
@@ -865,16 +1139,16 @@ contract UCEPTest is BaseTest {
         // one wei past reverts
         vm.prank(address(engine));
         vm.expectRevert(
-            abi.encodeWithSelector(IUCEP.TotalSpendCapExceeded.selector, uint256(100 ether + 1), uint256(100 ether))
+            abi.encodeWithSelector(IURP.TotalSpendCapExceeded.selector, uint256(100 ether + 1), uint256(100 ether))
         );
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1));
         assertEq(_spent(), 100 ether, "unchanged");
     }
 
     /// §10 item 8: unlimited is type(uint256).max with NO special branch — the comparison
     /// simply never trips.
     function test_U07_UnlimitedNeverTrips() public {
-        IUCEP.Config memory cfg = _defaultConfig();
+        IURP.Config memory cfg = _defaultConfig();
         cfg.maxAmountPerCall = type(uint256).max;
         cfg.maxAmountTotal = type(uint256).max;
         _init(cfg);
@@ -885,15 +1159,15 @@ contract UCEPTest is BaseTest {
 
     /// A per-call cap of zero bridges nothing but redeploys freely.
     function test_U07_ZeroPerCallCap_RedeploysOnly() public {
-        IUCEP.Config memory cfg = _defaultConfig();
+        IURP.Config memory cfg = _defaultConfig();
         cfg.maxAmountPerCall = 0;
         _init(cfg);
 
         assertEq(_check(0, _goodRequest(0)), 0, "zero-amount redeploy allowed");
 
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.AmountExceedsCap.selector, uint256(1), uint256(0)));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1));
+        vm.expectRevert(abi.encodeWithSelector(IURP.AmountExceedsCap.selector, uint256(1), uint256(0)));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1));
         assertEq(_spent(), 0, "never bridges");
     }
 
@@ -918,13 +1192,13 @@ contract UCEPTest is BaseTest {
             })
         );
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.RecipientMustBeEmpty.selector);
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, withRecipient);
+        vm.expectRevert(IURP.RecipientMustBeEmpty.selector);
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, withRecipient);
 
         // (b) a refund that lands anywhere but the wallet — failure as an exfiltration route
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.InvalidRevertRecipient.selector, ACCOUNT, AGENT));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, outboundRequest(ASSET, 1 ether, 1 ether, AGENT, _goodCalls()));
+        vm.expectRevert(abi.encodeWithSelector(IURP.InvalidRevertRecipient.selector, ACCOUNT, AGENT));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, outboundRequest(ASSET, 1 ether, 1 ether, AGENT, _goodCalls()));
 
         assertEq(_spent(), 0, "nothing spent");
     }
@@ -935,8 +1209,8 @@ contract UCEPTest is BaseTest {
         _initDefault();
 
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.UncappedGasSwapRejected.selector);
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, outboundRequest(ASSET, 1 ether, 0, ACCOUNT, _goodCalls()));
+        vm.expectRevert(IURP.UncappedGasSwapRejected.selector);
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, outboundRequest(ASSET, 1 ether, 0, ACCOUNT, _goodCalls()));
 
         // non-zero, with a Push-side value inside the cap, passes
         assertEq(
@@ -955,24 +1229,24 @@ contract UCEPTest is BaseTest {
         Multicall[] memory wrong = _goodCalls();
         wrong[0].data = abi.encodeWithSelector(SWAP_SELECTOR, uint256(1), AGENT);
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.BeneficiaryMismatch.selector, CEA, AGENT));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, wrong));
+        vm.expectRevert(abi.encodeWithSelector(IURP.BeneficiaryMismatch.selector, CEA, AGENT));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, wrong));
 
         // (b) calldata too short to hold the word at BENEFICIARY_OFFSET. Without the bounds check
         //     this would read adjacent memory, which could be manipulated to pass.
         Multicall[] memory short = _goodCalls();
         short[0].data = abi.encodePacked(SWAP_SELECTOR, uint256(1)); // 36 bytes: offset+32 > length
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.MalformedInnerCalldata.selector);
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, short));
+        vm.expectRevert(IURP.MalformedInnerCalldata.selector);
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, short));
 
         assertEq(_spent(), 0, "nothing spent");
     }
 
     /// A rule with hasBeneficiary == false skips the check entirely — and its offset is ignored.
     function test_U11_NoBeneficiaryRuleSkipsTheCheck() public {
-        IUCEP.AllowedCall[] memory rules = new IUCEP.AllowedCall[](1);
-        rules[0] = IUCEP.AllowedCall({
+        IURP.AllowedCall[] memory rules = new IURP.AllowedCall[](1);
+        rules[0] = IURP.AllowedCall({
             target: PROTOCOL,
             selector: POKE_SELECTOR,
             beneficiaryOffset: 65_535, // a dead offset — never read, because hasBeneficiary is false
@@ -994,15 +1268,15 @@ contract UCEPTest is BaseTest {
      * on-chain. NOT a security test; it pins the documented behaviour.
      */
     function test_DeadOffset_FailsClosed() public {
-        IUCEP.AllowedCall[] memory rules = new IUCEP.AllowedCall[](1);
-        rules[0] = IUCEP.AllowedCall({
+        IURP.AllowedCall[] memory rules = new IURP.AllowedCall[](1);
+        rules[0] = IURP.AllowedCall({
             target: PROTOCOL, selector: SWAP_SELECTOR, beneficiaryOffset: 65_535, hasBeneficiary: true, maxValue: 0
         });
         _init(_config(rules));
 
         vm.prank(address(engine));
-        vm.expectRevert(IUCEP.MalformedInnerCalldata.selector);
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, _goodCalls()));
+        vm.expectRevert(IURP.MalformedInnerCalldata.selector);
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _requestData(1 ether, _goodCalls()));
     }
 
     // ═════════════════════════════════ U-12 ═════════════════════════════════
@@ -1010,8 +1284,8 @@ contract UCEPTest is BaseTest {
     function test_U12_EffectsLast_MeteringEvent() public {
         _initDefault();
 
-        vm.expectEmit(true, true, true, true, address(ucep));
-        emit IUCEP.OutboundMetered(CID, address(engine), ACCOUNT, 7 ether);
+        vm.expectEmit(true, true, true, true, address(urp));
+        emit IURP.OutboundMetered(CID, address(engine), ACCOUNT, 7 ether);
 
         assertEq(_check(0, _goodRequest(7 ether)), 0, "validates");
         assertEq(_spent(), 7 ether, "spent advanced by exactly the bridged amount");
@@ -1034,13 +1308,13 @@ contract UCEPTest is BaseTest {
         address[3] memory strangers = [AGENT, ACCOUNT, address(engine)];
         for (uint256 i; i < strangers.length; ++i) {
             vm.prank(strangers[i]);
-            vm.expectRevert(abi.encodeWithSelector(IUCEP.NotExecutorModule.selector, strangers[i]));
-            ucep.creditRevert(CID, ACCOUNT, keccak256("tx"), 1 ether);
+            vm.expectRevert(abi.encodeWithSelector(IURP.NotExecutorModule.selector, strangers[i]));
+            urp.creditRevert(CID, ACCOUNT, keccak256("tx"), 1 ether);
         }
 
         // the module itself succeeds
         vm.prank(EXECUTOR_MODULE);
-        ucep.creditRevert(CID, ACCOUNT, keccak256("tx"), 1 ether);
+        urp.creditRevert(CID, ACCOUNT, keccak256("tx"), 1 ether);
         assertEq(_spent(), 9 ether, "module credit applied");
     }
 
@@ -1051,21 +1325,21 @@ contract UCEPTest is BaseTest {
         _check(0, _goodRequest(10 ether));
 
         bytes32 txId = keccak256("outbound-1");
-        assertFalse(ucep.isCredited(txId), "not credited yet");
+        assertFalse(urp.isCredited(txId), "not credited yet");
 
         vm.prank(EXECUTOR_MODULE);
-        ucep.creditRevert(CID, ACCOUNT, txId, 2 ether);
-        assertTrue(ucep.isCredited(txId), "recorded");
+        urp.creditRevert(CID, ACCOUNT, txId, 2 ether);
+        assertTrue(urp.isCredited(txId), "recorded");
         assertEq(_spent(), 8 ether, "applied once");
 
         vm.prank(EXECUTOR_MODULE);
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.AlreadyCredited.selector, txId));
-        ucep.creditRevert(CID, ACCOUNT, txId, 2 ether);
+        vm.expectRevert(abi.encodeWithSelector(IURP.AlreadyCredited.selector, txId));
+        urp.creditRevert(CID, ACCOUNT, txId, 2 ether);
         assertEq(_spent(), 8 ether, "second credit changed nothing");
 
         // a different id still works
         vm.prank(EXECUTOR_MODULE);
-        ucep.creditRevert(CID, ACCOUNT, keccak256("outbound-2"), 3 ether);
+        urp.creditRevert(CID, ACCOUNT, keccak256("outbound-2"), 3 ether);
         assertEq(_spent(), 5 ether, "distinct ids credit independently");
     }
 
@@ -1093,16 +1367,16 @@ contract UCEPTest is BaseTest {
 
         // arrives before the config exists (or against the wrong id)
         vm.prank(EXECUTOR_MODULE);
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.NotInitialized.selector, ghost, ACCOUNT));
-        ucep.creditRevert(ghost, ACCOUNT, txId, 1 ether);
+        vm.expectRevert(abi.encodeWithSelector(IURP.NotInitialized.selector, ghost, ACCOUNT));
+        urp.creditRevert(ghost, ACCOUNT, txId, 1 ether);
 
-        assertFalse(ucep.isCredited(txId), "the id is still uncredited after the failed call");
+        assertFalse(urp.isCredited(txId), "the id is still uncredited after the failed call");
 
         // and the retry against the right config succeeds
         _initDefault();
         _check(0, _goodRequest(10 ether));
         vm.prank(EXECUTOR_MODULE);
-        ucep.creditRevert(CID, ACCOUNT, txId, 1 ether);
+        urp.creditRevert(CID, ACCOUNT, txId, 1 ether);
         assertEq(_spent(), 9 ether, "retry applied");
     }
 
@@ -1113,11 +1387,11 @@ contract UCEPTest is BaseTest {
         _check(0, _goodRequest(5 ether));
 
         // credit far more than was ever spent
-        vm.expectEmit(true, true, true, true, address(ucep));
-        emit IUCEP.RevertCredited(keccak256("big"), CID, ACCOUNT, 5 ether); // the APPLIED amount
+        vm.expectEmit(true, true, true, true, address(urp));
+        emit IURP.RevertCredited(keccak256("big"), CID, ACCOUNT, 5 ether); // the APPLIED amount
 
         vm.prank(EXECUTOR_MODULE);
-        ucep.creditRevert(CID, ACCOUNT, keccak256("big"), 1000 ether);
+        urp.creditRevert(CID, ACCOUNT, keccak256("big"), 1000 ether);
 
         assertEq(_spent(), 0, "saturated at zero, no underflow");
     }
@@ -1131,13 +1405,13 @@ contract UCEPTest is BaseTest {
         vm.warp(uint256(VALID_UNTIL) + 1); // the mandate can no longer validate anything
 
         vm.prank(EXECUTOR_MODULE);
-        ucep.creditRevert(CID, ACCOUNT, keccak256("late"), 4 ether);
+        urp.creditRevert(CID, ACCOUNT, keccak256("late"), 4 ether);
         assertEq(_spent(), 6 ether, "credit still applies to the orphan config");
 
         // but nothing can be spent through it again
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.MandateExpired.selector, VALID_UNTIL));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
+        vm.expectRevert(abi.encodeWithSelector(IURP.MandateExpired.selector, VALID_UNTIL));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
     }
 
     // ═════════════════════════════════ U-16 ═════════════════════════════════
@@ -1147,22 +1421,22 @@ contract UCEPTest is BaseTest {
         _check(0, _goodRequest(10 ether));
 
         // equality passes
-        ucep.assertSpent(CID, ACCOUNT, 10 ether);
+        urp.assertSpent(CID, ACCOUNT, 10 ether);
 
         // mismatch in BOTH directions reverts — stale beliefs never silently become new budgets
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.SpentMismatch.selector, uint256(9 ether), uint256(10 ether)));
-        ucep.assertSpent(CID, ACCOUNT, 9 ether);
+        vm.expectRevert(abi.encodeWithSelector(IURP.SpentMismatch.selector, uint256(9 ether), uint256(10 ether)));
+        urp.assertSpent(CID, ACCOUNT, 9 ether);
 
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.SpentMismatch.selector, uint256(11 ether), uint256(10 ether)));
-        ucep.assertSpent(CID, ACCOUNT, 11 ether);
+        vm.expectRevert(abi.encodeWithSelector(IURP.SpentMismatch.selector, uint256(11 ether), uint256(10 ether)));
+        urp.assertSpent(CID, ACCOUNT, 11 ether);
     }
 
     /// The ruled revision: without the initialized check, a wrong config reads spent == 0 and an
     /// assertion of zero PASSES, letting a change batch proceed on a belief about a ghost.
     function test_U16_AssertSpent_GhostConfigHasNoSilentPass() public {
         ConfigId ghost = ConfigId.wrap(bytes32(uint256(0xABCD)));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.NotInitialized.selector, ghost, ACCOUNT));
-        ucep.assertSpent(ghost, ACCOUNT, 0);
+        vm.expectRevert(abi.encodeWithSelector(IURP.NotInitialized.selector, ghost, ACCOUNT));
+        urp.assertSpent(ghost, ACCOUNT, 0);
     }
 
     /// A credit landing between the owner's read and their submit forces recomposition.
@@ -1171,15 +1445,15 @@ contract UCEPTest is BaseTest {
         _check(0, _goodRequest(10 ether));
 
         // the owner reads 10 and composes their batch...
-        ucep.assertSpent(CID, ACCOUNT, 10 ether);
+        urp.assertSpent(CID, ACCOUNT, 10 ether);
 
         // ...a credit lands first...
         vm.prank(EXECUTOR_MODULE);
-        ucep.creditRevert(CID, ACCOUNT, keccak256("race"), 4 ether);
+        urp.creditRevert(CID, ACCOUNT, keccak256("race"), 4 ether);
 
         // ...so the batch's first entry now fails, and the whole change reverts.
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.SpentMismatch.selector, uint256(10 ether), uint256(6 ether)));
-        ucep.assertSpent(CID, ACCOUNT, 10 ether);
+        vm.expectRevert(abi.encodeWithSelector(IURP.SpentMismatch.selector, uint256(10 ether), uint256(6 ether)));
+        urp.assertSpent(CID, ACCOUNT, 10 ether);
     }
 
     // ═════════════════════════════════ U-17 ═════════════════════════════════
@@ -1191,20 +1465,20 @@ contract UCEPTest is BaseTest {
         assertEq(_spent(), 10 ether, "engine-keyed config has real state");
 
         // A stranger initialises the SAME configId and account with a config of their choosing.
-        IUCEP.Config memory attackerCfg = _defaultConfig();
+        IURP.Config memory attackerCfg = _defaultConfig();
         attackerCfg.maxAmountTotal = type(uint256).max;
         vm.prank(AGENT);
-        ucep.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(attackerCfg));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(attackerCfg));
 
         // The engine-keyed config is untouched — including its spend counter.
-        IUCEP.Config memory real = ucep.getConfig(CID, ACCOUNT);
+        IURP.Config memory real = urp.getConfig(CID, ACCOUNT);
         assertEq(real.spent, 10 ether, "engine-keyed spent untouched");
         assertEq(real.maxAmountTotal, 1000 ether, "engine-keyed caps untouched");
 
         // And the stranger's write did NOT clear the engine's initialized flag: re-init still fails.
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IUCEP.AlreadyInitialized.selector, CID));
-        ucep.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(_defaultConfig()));
+        vm.expectRevert(abi.encodeWithSelector(IURP.AlreadyInitialized.selector, CID));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(_defaultConfig()));
     }
 
     /**
@@ -1217,27 +1491,27 @@ contract UCEPTest is BaseTest {
         _initDefault();
         _check(0, _goodRequest(10 ether));
 
-        IUCEP.Config memory strangerCfg = _defaultConfig();
+        IURP.Config memory strangerCfg = _defaultConfig();
         strangerCfg.spent = 999 ether; // ignored by _store anyway
         vm.prank(AGENT);
-        ucep.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(strangerCfg));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(strangerCfg));
 
         // getConfig reads the engine slice
-        assertEq(ucep.getConfig(CID, ACCOUNT).spent, 10 ether, "getConfig is engine-keyed");
+        assertEq(urp.getConfig(CID, ACCOUNT).spent, 10 ether, "getConfig is engine-keyed");
 
         // assertSpent reads the engine slice
-        ucep.assertSpent(CID, ACCOUNT, 10 ether);
+        urp.assertSpent(CID, ACCOUNT, 10 ether);
 
         // creditRevert writes the engine slice
         vm.prank(EXECUTOR_MODULE);
-        ucep.creditRevert(CID, ACCOUNT, keccak256("t"), 1 ether);
-        assertEq(ucep.getConfig(CID, ACCOUNT).spent, 9 ether, "creditRevert is engine-keyed");
+        urp.creditRevert(CID, ACCOUNT, keccak256("t"), 1 ether);
+        assertEq(urp.getConfig(CID, ACCOUNT).spent, 9 ether, "creditRevert is engine-keyed");
     }
 
     // ═════════════════════════════════ U-18 ═════════════════════════════════
 
     /**
-     * The UCEP half. `spent` is written during validation and survives only because validation and
+     * The URP half. `spent` is written during validation and survives only because validation and
      * dispatch share ONE transaction — so when the surrounding call frame reverts, the write is
      * unwound with it. Proven here by reverting the frame around a successful checkAction.
      *
@@ -1264,7 +1538,7 @@ contract UCEPTest is BaseTest {
     /// @dev External so the try/catch above gets its own frame. Validates, then reverts.
     function checkThenRevert() external {
         vm.prank(address(engine));
-        ucep.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(10 ether));
+        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(10 ether));
         assertEq(_spent(), 10 ether, "spent really was written inside the frame");
         revert("dispatch failed");
     }

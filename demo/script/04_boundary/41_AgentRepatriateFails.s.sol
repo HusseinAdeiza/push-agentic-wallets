@@ -10,7 +10,7 @@ import { Ledger } from "../../lib/Ledger.sol";
 import { Gauntlet } from "../../lib/Gauntlet.sol";
 import { AgentRequest } from "../../lib/AgentRequest.sol";
 import { ICEA } from "../../lib/PushCore.sol";
-import { IUCEP } from "../../../src/interfaces/IUCEP.sol";
+import { IURP } from "../../../src/interfaces/IURP.sol";
 
 /**
  * @title  AgentRepatriateFails
@@ -53,7 +53,7 @@ contract AgentRepatriateFails is Script {
 
         Gauntlet.refuse(
             "send the proceeds back to the wallet that owns it",
-            IUCEP.ForbiddenInnerTarget.selector,
+            IURP.ForbiddenInnerTarget.selector,
             "A live mandate, an authorised key, a well-formed request - and the one target it may never name.",
             req
         );
