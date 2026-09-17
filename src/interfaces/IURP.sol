@@ -51,11 +51,34 @@ interface IURP is IActionPolicy {
         uint256 maxValue;
     }
 
+    /**
+     * @notice WIRE TYPE — what a UNIVERSAL envelope's body encodes. Not a storage type.
+     *
+     * @dev    ABSENT BY DESIGN, and each absence is the point: `initialized` (URP sets it), `spent`
+     *         (URP owns it), and the chain (the envelope carries it, exactly once). The SDK used to
+     *         type all three and URP overwrote them — a field whose only legal value is a
+     *         placeholder is a field the caller fills in believing it matters.
+     *
+     *         Mapped field-by-field onto the storage `Config` by `_store`. The storage struct's
+     *         layout never moves; this one is free to change with the wire format.
+     */
+    struct UniversalTerms {
+        uint48 validUntil;
+        address expectedCEA;
+        address asset;
+        uint256 maxAmountPerCall;
+        uint256 maxAmountTotal;
+        uint256 maxPCPerCall;
+        AllowedCall[] allowedCalls;
+    }
+
     /// @param initialized      set once, at initialisation; re-initialisation is refused
     /// @param validUntil       non-zero always (enforced at init); "never" = type(uint48).max, explicit
-    /// @param destChainHash    stored, NOT enforced. The destination chain is already pinned
-    ///                         transitively by the asset, so this field exists for SDK assertions
-    ///                         and indexing only — never as a gate.
+    /// @param destChainHash    v2 RELIC — slot 1, kept so the struct's layout never moves. Written by
+    ///                         pre-envelope grants from the SDK's value; NEVER WRITTEN SINCE. The
+    ///                         chain of every mandate, in both modes, is
+    ///                         `getMode(id, account).chainHash`. Do not read this field; do not
+    ///                         resurrect it as an input.
     /// @param expectedCEA      the wallet's destination account, committed at grant
     /// @param asset            the one permitted PRC20
     /// @param maxAmountTotal   type(uint256).max = unlimited
@@ -87,6 +110,11 @@ interface IURP is IActionPolicy {
     struct ModeSlot {
         bool initialized;
         MandateType mode;
+        /// @dev keccak256(bytes(chain)) as declared in the policy envelope. THE single chain record
+        ///      for BOTH modes — universal stores the destination chain, native stores this chain's
+        ///      own hash. Zero on entries written before the envelope carried a chain; treat that as
+        ///      "unverified", not as "no chain".
+        bytes32 chainHash;
     }
 
     /**
@@ -153,9 +181,35 @@ interface IURP is IActionPolicy {
         ArgPin[] pins;
     }
 
+    /**
+     * @notice WIRE TYPE — what a NATIVE envelope's body encodes. Not a storage type.
+     *
+     * @dev    ABSENT BY DESIGN: `initialized`, `valueSpent`, `amountSpent` and `callsUsed` are all
+     *         URP's own counters, zeroed at init. The SDK had to type four zeroes it did not own.
+     *
+     *         SPLIT EVEN THOUGH ONLY THE UNIVERSAL SIDE FORCES IT. The SDK builds both; one struct
+     *         with dead input fields sitting beside one without is precisely the inconsistency that
+     *         let `destChainHash` acquire four different conventions in one repository.
+     */
+    struct NativeTerms {
+        uint48 validUntil;
+        address target;
+        bytes4 selector;
+        uint256 maxValuePerCall;
+        uint256 maxValueTotal;
+        AmountRule amount;
+        uint32 maxCalls;
+        ArgPin[] pins;
+    }
+
     // ──────────────────────────────── events ────────────────────────────────
 
-    event URPPolicySet(ConfigId indexed id, address indexed multiplexer, address indexed account, MandateType mode);
+    /// @dev `mode` and `chainHash` are both DERIVED from the envelope's chain string, not declared.
+    ///      For a universal config `chainHash` has additionally been verified against the asset's own
+    ///      `SOURCE_CHAIN_NAMESPACE()`.
+    event URPPolicySet(
+        ConfigId indexed id, address indexed multiplexer, address indexed account, MandateType mode, bytes32 chainHash
+    );
     /// @dev Emitted on every successful native check. Mirrors the effects: `value` and `amount` may
     ///      both be zero, and the event still fires, because `callsUsed` still moved.
     event NativeCallMetered(
@@ -212,10 +266,31 @@ interface IURP is IActionPolicy {
     // This ordering applies to URP errors only — wallet errors are never truncated.
 
     // init
-    /// @dev The `initData` wrapper's mode word is not a valid `MandateType`. Decoded as `uint8` and
-    ///      range-checked precisely so this can be NAMED — decoding straight to the enum reverts
-    ///      with an unnamed compiler panic instead.
-    error InvalidPolicyMode(uint8 mode);
+    //
+    // NOT TRUNCATED. The 28-byte rule above applies to `checkAction`, which the engine wraps in
+    // `PolicyCheckReverted`. `initializeWithMultiplexer` is a plain high-level call from
+    // `ConfigLib.sol:98-101` inside `enableSessions`, so init reverts BUBBLE WITH FULL DATA. Tests
+    // assert these with a plain `vm.expectRevert(abi.encodeWithSelector(...))` carrying every
+    // argument — never `expectUrpGate`.
+
+    /// @dev init: the envelope's `chain` string is empty. The only validation URP performs on the
+    ///      string itself; a malformed non-empty string derives UNIVERSAL and is caught by the
+    ///      asset check instead.
+    error EmptyChain();
+
+    /// @dev init, universal: the asset reports a different source chain than the envelope declares.
+    ///      `declared` first because it is the value the owner can act on.
+    error ChainMismatch(bytes32 declared, bytes32 assetChain);
+
+    /// @dev init, universal: the asset has no code, is an EOA, or REVERTED when asked for
+    ///      `SOURCE_CHAIN_NAMESPACE()`.
+    ///
+    ///      AN ASSET THAT *ANSWERS* WITH A NON-STRING, OR WITH NOTHING, REVERTS UNNAMED INSTEAD —
+    ///      the returndata fails ABI decoding in URP's own frame, which `catch` does not see. The
+    ///      no-code and EOA cases are named only because an explicit `code.length` guard runs first;
+    ///      since solc 0.8.10 the compiler omits the `extcodesize` check when return data is
+    ///      expected, so `try/catch` alone would let both through as unnamed reverts. Measured.
+    error InvalidAsset(address asset);
     /// @dev init: native config with a zero target.
     error NativeTargetZero();
     /// @dev init AND gate N3. A native config may never name the gateway, and a native config may
@@ -275,8 +350,16 @@ interface IURP is IActionPolicy {
 
     /// @notice The mode record. NEVER REVERTS — the documented first call for any integrator that
     ///         does not already know a mandate's mode. An empty slot returns
-    ///         `(initialized: false, mode: UNIVERSAL)`, where the mode value is meaningless.
+    ///         `(initialized: false, mode: UNIVERSAL, chainHash: 0)`, where the mode value is
+    ///         meaningless. A `chainHash` of zero on an INITIALISED entry means the config predates
+    ///         the envelope carrying a chain — unverified, not "no chain".
     function getMode(ConfigId id, address account) external view returns (ModeSlot memory);
+
+    /// @notice The hash this URP derives NATIVE from: `keccak256("eip155:" ‖ decimal(block.chainid))`.
+    /// @dev    Exposed so the deploy script asserts what URP will ACTUALLY derive rather than
+    ///         recomputing the formula and agreeing with itself, and so an SDK can confirm the exact
+    ///         native chain string it should emit. Computed, never stored.
+    function pushChainHash() external view returns (bytes32);
 
     /// @notice The native change-flow race guard: exact equality on all three counters.
     /// @dev    Reverts `WrongModeForCall(UNIVERSAL)` on a universal config and `NotInitialized` on a

@@ -54,16 +54,22 @@ library PushWalletErrors {
 
     error UnknownPermission(bytes32 permissionId);
     /// @dev Raised by grantMandate's canonical-shape check — the granted session deviates from the
-    ///      shape this system accepts for the declared `MandateType`. Stays for the rules COMMON to
+    ///      shape this system accepts for the DERIVED `MandateType`. Stays for the rules COMMON to
     ///      both types: user-op policies, ERC-7739, the paymaster permit, the session validator, and
-    ///      the action-policy count. A target that is wrong FOR THE DECLARED TYPE is
+    ///      the action-policy count. A target that is wrong FOR THE DERIVED TYPE is
     ///      `MandateTypeMismatch` instead — that distinction is the invariant, stated once.
     error MalformedSessionShape();
 
     // ──────────────────── native mandate shape (grantMandate) ────────────────────
 
-    /// @dev NATIVE action count outside 1..MAX_NATIVE_ACTIONS. Zero is refused too: a mandate that
+    /// @dev Action count outside 1..MAX_NATIVE_ACTIONS. Zero is refused too: a mandate that
     ///      authorises nothing is a misconfiguration, not a valid ascetic grant.
+    ///
+    ///      ZERO IS NOW CHECKED FOR BOTH MODES, BEFORE THE MODE IS KNOWN. The mode is derived from
+    ///      action 0's envelope, so action 0 must exist before anything can be derived — with no
+    ///      actions there is no envelope, no chain, and therefore no mode. A universal session with
+    ///      zero actions consequently reports `TooManyActions(0)` rather than
+    ///      `MalformedSessionShape`.
     error TooManyActions(uint256 count);
 
     /// @dev The same (target, selector) pair twice in one mandate. Both would hash to one actionId,
@@ -81,11 +87,31 @@ library PushWalletErrors {
     ///      (value-only) is permitted and is not one of these.
     error ForbiddenActionSelector(bytes4 selector);
 
-    /// @dev The declared type does not match the action set: a gateway target declared NATIVE, or a
-    ///      non-gateway target declared UNIVERSAL. Carries the offending action's index and target,
-    ///      which is why it is distinct from `MalformedSessionShape` — with up to eight actions,
-    ///      "something was wrong" is not a usable diagnostic.
-    error MandateTypeMismatch(MandateType declared, uint256 actionIndex, address target);
+    /// @dev The type DERIVED from the envelope's chain does not match the action set: a gateway
+    ///      target under the Push chain, or a non-gateway target under a foreign chain. Carries the
+    ///      offending action's index and target, which is why it is distinct from
+    ///      `MalformedSessionShape` — with up to eight actions, "something was wrong" is not a
+    ///      usable diagnostic.
+    ///
+    ///      IF YOU MEANT A NATIVE MANDATE AND SEE `UNIVERSAL` HERE, THE CHAIN STRING IS NOT
+    ///      BYTE-EXACT `eip155:<chainid>` OF THIS CHAIN. `"EIP155:42101"`, `"eip155:042101"` and a
+    ///      leading space all hash to not-Push and therefore derive UNIVERSAL. That is deliberate:
+    ///      the hash comparison is the whole rule, and a string parser would be a second rulebook
+    ///      and a heuristic. The SDK prechecks this so a user sees the real cause.
+    ///
+    ///      ORDER NOTE: under UNIVERSAL the `n != 1` shape rule runs BEFORE the target check, so a
+    ///      malformed chain string on a multi-action session reports `MalformedSessionShape`.
+    error MandateTypeMismatch(MandateType derived, uint256 actionIndex, address target);
+
+    /// @dev `grantMandate`: action 0's policy envelope declares an empty chain string. The wallet
+    ///      performs no other validation of it — a malformed non-empty string derives UNIVERSAL and
+    ///      is then refused against the targets, or against the asset by URP at init.
+    error EmptyChain();
+
+    /// @dev `grantMandate`: action `actionIndex` declares a different chain than action 0. A mandate
+    ///      is one thing, on one chain, in one mode — which is what makes mixed mandates impossible
+    ///      by construction rather than by a rule.
+    error InconsistentChain(uint256 actionIndex);
 
     // ──────────────────── the agent door, dispatch ────────────────────
 

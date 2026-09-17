@@ -13,6 +13,7 @@ import { IModule as IERC7579Module } from "erc7579/interfaces/IERC7579Module.sol
 import { IPushSessionValidator } from "./interfaces/IPushSessionValidator.sol";
 import { IPushAgentWallet } from "./interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "./libraries/PushWalletErrors.sol";
+import { PushChainLib } from "./libraries/PushChainLib.sol";
 import {
     SEND_OUTBOUND_SELECTOR,
     OP_HASH_DOMAIN,
@@ -316,14 +317,21 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
      *         - Carries no reentrancy guard: the guard would trip on the owner's own change batch,
      *           and the engine's enable path never calls back into the account.
      *
+     *         - TAKES NO MANDATE TYPE. The kind of a mandate is DERIVED, not declared: each action's
+     *           URP policy envelope is `abi.encode(string chain, bytes body)`, and the chain decides
+     *           the rulebook — this chain means a Push-side call (NATIVE), any other means a call
+     *           through the gateway (UNIVERSAL). The owner states a chain once, where they were
+     *           already stating the terms; nobody states a mode anywhere. Every action must name the
+     *           same chain, which is what makes a mixed mandate unrepresentable rather than merely
+     *           forbidden.
+     *         - The envelope is NOT REWRITTEN. The wallet reads one field and passes the caller's
+     *           bytes to the engine untouched, so what URP validates is exactly what the owner
+     *           reviewed.
+     *
      * @param  session       The session to enable. Its `salt` field is ignored and overwritten.
      * @return permissionId  The engine's id for the newly enabled mandate.
      */
-    function grantMandate(Session calldata session, MandateType mandateType)
-        external
-        onlyOwnerOrSelf
-        returns (bytes32 permissionId)
-    {
+    function grantMandate(Session calldata session) external onlyOwnerOrSelf returns (bytes32 permissionId) {
         // ─── rules COMMON to both types, first ───
 
         if (session.userOpPolicies.length != 0) revert PushWalletErrors.MalformedSessionShape();
@@ -335,28 +343,39 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
 
         if (session.permitERC4337Paymaster) revert PushWalletErrors.MalformedSessionShape();
 
-        // ─── the type branch ───
-        //
-        // THE INVARIANT, STATED ONCE: a wrong POLICY is always `MalformedSessionShape`; a target
-        // wrong FOR THE DECLARED TYPE is always `MandateTypeMismatch`. Between the two branches
-        // there is no shape in which a gateway call reaches a native config, and none in which a
-        // native call reaches a universal one — which, with URP's N3 and gate 3 at runtime, is the
-        // whole consistency argument.
-
         uint256 n = session.actions.length;
 
-        if (mandateType == MandateType.UNIVERSAL) {
+        // BEFORE THE DECODE, AND FOR BOTH MODES. The mode is derived from action 0's envelope, so
+        // action 0 must exist before anything can be derived: with no actions there is no envelope,
+        // no chain, and therefore no mode to report. A universal session with zero actions
+        // consequently reports `TooManyActions(0)`, not `MalformedSessionShape`.
+        if (n == 0) revert PushWalletErrors.TooManyActions(0);
+
+        // THE POLICY-SHAPE CHECK RUNS BEFORE THE DECODE, ALWAYS. Decoding first would read an
+        // arbitrary policy's `initData` as though it were URP's. This ordering is load-bearing.
+        _requirePolicyShape(session.actions[0]);
+        (string memory chain, bytes32 chainHash) = _chainOf(session.actions[0]);
+
+        // ─── THE ENTIRE MODE DECISION. Nobody declared it. ───
+        MandateType mode = PushChainLib.deriveMode(chainHash);
+
+        // THE INVARIANT, STATED ONCE: a wrong POLICY is always `MalformedSessionShape`; a target
+        // wrong FOR THE DERIVED TYPE is always `MandateTypeMismatch`. Between the two branches
+        // there is no shape in which a gateway call reaches a native config, and none in which a
+        // native call reaches a universal one — which, with URP's N3 and gate 3 at runtime, is the
+        // whole consistency argument. One chain per mandate makes mixed mandates unrepresentable.
+
+        if (mode == MandateType.UNIVERSAL) {
+            // `n != 1` BEFORE the target check, as before. A malformed chain string on a
+            // multi-action session therefore reports `MalformedSessionShape`, not a type mismatch.
             if (n != 1) revert PushWalletErrors.MalformedSessionShape();
 
             ActionData calldata a = session.actions[0];
             if (a.actionTarget != UNIVERSAL_GATEWAY_PC || a.actionTargetSelector != SEND_OUTBOUND_SELECTOR) {
-                revert PushWalletErrors.MandateTypeMismatch(mandateType, 0, a.actionTarget);
-            }
-            if (a.actionPolicies.length != 1 || a.actionPolicies[0].policy != CANONICAL_URP) {
-                revert PushWalletErrors.MalformedSessionShape();
+                revert PushWalletErrors.MandateTypeMismatch(mode, 0, a.actionTarget);
             }
         } else {
-            if (n == 0 || n > MAX_NATIVE_ACTIONS) revert PushWalletErrors.TooManyActions(n);
+            if (n > MAX_NATIVE_ACTIONS) revert PushWalletErrors.TooManyActions(n);
 
             // Hoisted: `_factory()` does an extcodecopy of the clone's own bytecode on every call.
             address factoryAddr = _factory();
@@ -367,8 +386,13 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
                 _requireGrantableTarget(a.actionTarget, factoryAddr, i);
                 _requireGrantableSelector(a.actionTargetSelector);
 
-                if (a.actionPolicies.length != 1 || a.actionPolicies[0].policy != CANONICAL_URP) {
-                    revert PushWalletErrors.MalformedSessionShape();
+                // Action 0's shape and chain were read above; re-reading would waste ~900 gas.
+                // EVERY action must name the same chain — that is what makes "one mandate, one
+                // mode" true by construction rather than by a rule.
+                if (i != 0) {
+                    _requirePolicyShape(a);
+                    (, bytes32 h) = _chainOf(a);
+                    if (h != chainHash) revert PushWalletErrors.InconsistentChain(i);
                 }
 
                 // O(n^2) by design: 28 comparisons at the n=8 ceiling, which beats a mapping and its
@@ -414,7 +438,48 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
         PermissionId[] memory ids = ISmartSession(DEFAULT_SESSION_ENGINE).enableSessions(sessions);
 
         permissionId = PermissionId.unwrap(ids[0]);
-        emit MandateGranted(permissionId, mandateType);
+        emit MandateGranted(permissionId, mode, chainHash, chain);
+    }
+
+    /**
+     * @dev The policy-shape rule, hoisted so it can run before each envelope decode.
+     *
+     *      A SHAPE rule, so it raises `MalformedSessionShape` like every other shape rule. It is
+     *      also the precondition for `_chainOf`: without it, the decode below would be reading an
+     *      arbitrary policy's `initData` as though URP had authored it.
+     *
+     * @param a  The action whose policy slot is vetted.
+     */
+    function _requirePolicyShape(ActionData calldata a) internal view {
+        if (a.actionPolicies.length != 1 || a.actionPolicies[0].policy != CANONICAL_URP) {
+            revert PushWalletErrors.MalformedSessionShape();
+        }
+    }
+
+    /**
+     * @dev Reads ONE field of the policy envelope — the bounded exception to "the skeleton, not the
+     *      organs".
+     *
+     *      WHAT THIS IS NOT: it is not term validation. The wallet does not check caps, expiry,
+     *      allow-list contents or anything else inside the body, and must never start. It reads the
+     *      label on the jar: the one field that decides WHICH RULEBOOK the action belongs to, which
+     *      is the wallet's own business because the wallet's target rules depend on it. URP
+     *      re-derives the same value from the same bytes and remains the sole judge of the terms.
+     *
+     *      CALLER MUST HAVE RUN `_requirePolicyShape` FIRST.
+     *
+     *      Same decoder as URP's, deliberately (`abi.decode(initData, (string, bytes))`): two
+     *      different readers of one security-relevant field is the drift this design exists to
+     *      prevent. A malformed envelope reverts here, unnamed, and fails closed.
+     *
+     * @param  a          The action to read.
+     * @return chain      The declared CAIP-2 string, e.g. `"eip155:11155111"`.
+     * @return chainHash  Its keccak256, the value everything downstream compares.
+     */
+    function _chainOf(ActionData calldata a) internal pure returns (string memory chain, bytes32 chainHash) {
+        (chain,) = abi.decode(a.actionPolicies[0].initData, (string, bytes));
+        if (bytes(chain).length == 0) revert PushWalletErrors.EmptyChain();
+        chainHash = keccak256(bytes(chain));
     }
 
     /**
@@ -422,8 +487,9 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
      *
      *      TWO RULES, TWO ERRORS, AND THE DISTINCTION IS THE POINT:
      *
-     *      - **The gateway → `MandateTypeMismatch`.** The session is well-formed; the owner declared
-     *        the wrong TYPE. A gateway target is perfectly grantable — as `UNIVERSAL`. Carries the
+     *      - **The gateway → `MandateTypeMismatch`.** The session is well-formed; the CHAIN the
+     *        envelope declares is this chain, and a gateway call is not a Push-side call. A gateway
+     *        target is perfectly grantable — under a foreign chain, as `UNIVERSAL`. Carries the
      *        action index, because with up to eight actions "something was wrong" is not a usable
      *        diagnostic. This is one half of the consistency lock; URP's N3 is the runtime mirror.
      *      - **The other seven → `ForbiddenActionTarget`.** Never grantable, under any type.

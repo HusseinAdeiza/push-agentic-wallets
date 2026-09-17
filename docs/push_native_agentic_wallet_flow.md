@@ -95,7 +95,7 @@
 | # | Call | Effect |
 | --- | --- | --- |
 | 1 | `AGWFactory.deployWallet("staking")` | **`0xbobagw` deployed** at the predicted address; owner = `0xbobuea`, baked into bytecode. **Inside the same call the factory invokes `initializeAccount()`, which installs SmartSession** — atomic, no uninitialised state |
-| 2 | `0xbobagw.grantMandate(session, NATIVE)` | 🔑 **MANDATE GRANTED** — see below |
+| 2 | `0xbobagw.grantMandate(session)` | 🔑 **MANDATE GRANTED** — see below |
 | 3 | `pUSDC.transfer(0xbobagw, 100e6)` | 💰 funds → the agent wallet |
 | 4 | `PC.transfer(0xbobagw, …)` | ⛽ PC for the two payable actions — the wallet's own value, capped per action by URP |
 | 5 | `0xbobagw.execute(pUSDC.approve(0xpushstake, 100e6))` | 🔓 **the owner approves the vault, through the owner door.** No policy in the path — the owner may do anything. The agent was never granted `approve` |
@@ -104,7 +104,11 @@
 
 ### 🔑 The mandate grant (step 2) in detail
 
-`grantMandate` does exactly three things: it **overwrites the salt** with the wallet's own monotonic `grantNonce`, it **enforces the canonical session shape** for the declared kind, and it **asserts the declared kind against every action** — under `NATIVE`, one to eight actions, none of them the gateway.
+`grantMandate` takes **one argument**. Nobody tells it what kind of mandate this is: it reads the **chain** each action's policy envelope declares, and derives the kind from that. These actions declare Push's own chain, so this is a `NATIVE` mandate — one that never leaves the chain.
+
+It then does exactly three things: it **overwrites the salt** with the wallet's own monotonic `grantNonce`, it **enforces the canonical session shape** for the derived kind, and it **asserts that kind against every action** — under `NATIVE`, one to eight actions, none of them the gateway.
+
+**Every action must name the same chain**, or the grant reverts `InconsistentChain(i)` naming the odd one out. That is what makes a mixed mandate *unrepresentable* rather than merely forbidden: one chain per mandate means one kind per mandate, so there is no shape in which a cross-chain action could hide among Push-side ones.
 
 ```
 sessionValidator         = PushSessionValidator
@@ -119,7 +123,7 @@ actions: [ ONE TO EIGHT — the NATIVE shape; five here ]
 
   [0]  actionTarget = 0xpushstake · actionTargetSelector = stakeFor.selector
        actionPolicies: [ URP AND ONLY URP ]
-         initData = (kind = NATIVE, body = ↓)        ← URP records the kind beside the config
+         initData = (chain = "eip155:42101", body = ↓)   ← THIS chain ⇒ NATIVE
            validUntil       = now + 7 days            ← THE EXPIRY LIVES INSIDE URP, per action
            target, selector = 0xpushstake, stakeFor   ← defensive copies, asserted again at N4/N5
            pins             = [ { offset 4, expected = 0xbobagw } ]     ← the beneficiary, FORCED
@@ -135,7 +139,7 @@ actions: [ ONE TO EIGHT — the NATIVE shape; five here ]
                      (a bare PC transfer; NOT the same as a function with no arguments)
 ```
 
-**What the wallet refuses before the engine ever sees the session.** Every native action's target is checked against seven addresses that would turn the agent into the owner — the zero address, the engine's wildcard marker `address(1)`, **the wallet itself**, **the engine**, URP, the validator, the factory — and any of them reverts `ForbiddenActionTarget`, naming it. The engine's two wildcard function markers revert `ForbiddenActionSelector`. The gateway reverts `MandateTypeMismatch(NATIVE, i, gateway)` — a gateway target is not *forbidden*, it is the wrong kind. The same `(contract, function)` twice reverts `DuplicateAction`. A wrong policy, an extra user-op policy, a wrong validator: `MalformedSessionShape`, exactly as under `UNIVERSAL`. Zero actions or nine: `TooManyActions(n)`.
+**What the wallet refuses before the engine ever sees the session.** Every native action's target is checked against seven addresses that would turn the agent into the owner — the zero address, the engine's wildcard marker `address(1)`, **the wallet itself**, **the engine**, URP, the validator, the factory — and any of them reverts `ForbiddenActionTarget`, naming it. The engine's two wildcard function markers revert `ForbiddenActionSelector`. The gateway reverts `MandateTypeMismatch(NATIVE, i, gateway)` — a gateway target is not *forbidden*, it is the wrong kind for the chain these actions declare. The same target under a foreign chain is perfectly grantable; it would simply be a `UNIVERSAL` mandate. The same `(contract, function)` twice reverts `DuplicateAction`. A wrong policy, an extra user-op policy, a wrong validator: `MalformedSessionShape`, exactly as under `UNIVERSAL`. Zero actions or nine: `TooManyActions(n)`.
 
 **Why URP is the *only* action policy — per action.** The engine requires at least one action policy per action. With URP as the only one on each of the five, **removing URP from any action leaves that action with zero policies and every request against it dies**. The property is per action; a mandate holding eight of them holds it eight times over.
 
@@ -287,7 +291,7 @@ msg.sender = 0xbobagw · beneficiary = 0xbobagw · stake credited → 0xbobagw
 
 - **Withdraw** — `execute([...])`. **There is no `withdraw()` function**; the owner path *is* withdrawal. `execute(0xpushstake.unstake())` then `execute(pUSDC.transfer(anywhere, …))`, with no destination restriction and no policy in the path. It must succeed in every degraded state — zero mandates, engine uninstalled, hostile validator installed.
 - **Revoke** — `stopMandate(pid)` (existence-checked, so a typo reverts loudly instead of silently "succeeding") or `stopAll()`. Immediate, unblockable, no callbacks on the path. Removing the permission removes all five action records' standing at once. **There is no in-flight window** — a native mandate has nothing in flight.
-- **Change a mandate** — **it cannot be edited.** A change is one owner transaction batching: `URP.assertSpent(id, wallet, valueSpent, amountSpent, calls)` → `stopMandate(old)` → `grantMandate(new, NATIVE)`. The native assertion names **all three counters** of the action being replaced and every one must match exactly; it refuses to run against a universal record or a ghost, so a stale belief can never pass by reading zeros from the wrong place. If the agent acted in the composition window, the assertion reverts the whole change. **Counters restart at zero on the new mandate**, and any request the agent signed against the old id is dead, because the op hash binds the permission id.
+- **Change a mandate** — **it cannot be edited.** A change is one owner transaction batching: `URP.assertSpent(id, wallet, valueSpent, amountSpent, calls)` → `stopMandate(old)` → `grantMandate(new)`. The native assertion names **all three counters** of the action being replaced and every one must match exactly; it refuses to run against a universal record or a ghost, so a stale belief can never pass by reading zeros from the wrong place. If the agent acted in the composition window, the assertion reverts the whole change. **Counters restart at zero on the new mandate**, and any request the agent signed against the old id is dead, because the op hash binds the permission id.
 
 ### STAGE 7b — the second action, and why it still counts
 
@@ -351,7 +355,8 @@ msg.sender = 0xbobagw · beneficiary = 0xbobagw · stake credited → 0xbobagw
                         │  ONE ATOMIC MULTICALL
                         ├──1─▶ AGWFactory.deployWallet  → 0xbobagw (owner baked in)
                         │        └─ factory calls initializeAccount() → SmartSession installed
-                        ├──2─▶ 🔑 grantMandate(session, NATIVE) — salt from grantNonce
+                        ├──2─▶ 🔑 grantMandate(session) — NATIVE derived from the chain,
+                        │                       salt from grantNonce
                         │        wallet: 5 actions · none the gateway · none the wallet/engine/URP/…
                         │        URP: 5 records — expiry · pins · caps · call limits · kind = NATIVE
                         ├──3─▶ 💰 100 pUSDC ──▶ 0xbobagw

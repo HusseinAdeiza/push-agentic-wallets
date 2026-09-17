@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import { BaseTest } from "../Base.t.sol";
+import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
 import { MandateType } from "../../src/libraries/PushWalletTypes.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
@@ -36,8 +37,13 @@ contract PushAgentWalletTest is BaseTest {
     PushAgentWallet internal wallet;
     address internal WALLET_OWNER;
 
+    /// @dev The mandate asset. A real PRC20 mock, not an EOA: URP interrogates the asset at
+    ///      universal init and an address with no code is refused `InvalidAsset` by design.
+    address internal PRC20;
+
     function setUp() public override {
         super.setUp();
+        PRC20 = address(new MockPRC20());
         WALLET_OWNER = makeAddr("walletOwner");
         wallet = newWallet(WALLET_OWNER);
         vm.deal(address(wallet), 100 ether);
@@ -74,7 +80,7 @@ contract PushAgentWalletTest is BaseTest {
     ///      engine because grantMandate was a placeholder; 3b switched it, per the instruction.)
     function _grant(PushAgentWallet w, address agentKey) internal returns (bytes32 pid) {
         vm.prank(WALLET_OWNER);
-        return w.grantMandate(canonicalSession(ecdsaConfig(agentKey), _urpInitData()), MandateType.UNIVERSAL);
+        return w.grantMandate(canonicalSession(ecdsaConfig(agentKey), _urpInitData()));
     }
 
     function _grant(PushAgentWallet w) internal returns (bytes32) {
@@ -97,7 +103,7 @@ contract PushAgentWalletTest is BaseTest {
                 validUntil: uint48(block.timestamp + 365 days),
                 destChainHash: keccak256("eip155:11155111"),
                 expectedCEA: _addr("cea"),
-                asset: _addr("prc20"),
+                asset: PRC20,
                 maxAmountPerCall: 100 ether,
                 maxAmountTotal: 1000 ether,
                 maxPCPerCall: 5 ether,

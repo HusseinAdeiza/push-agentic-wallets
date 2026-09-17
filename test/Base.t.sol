@@ -437,31 +437,81 @@ abstract contract BaseTest is Test {
         });
     }
 
-    // ─────────────────────── the initData mode wrapper ───────────────────────
+    // ─────────────────────────── the policy envelope ───────────────────────────
+
+    /// @dev Sepolia, the foreign chain every universal test uses. A string, never a hash — the SDK
+    ///      never computes a hash, and neither do these helpers' callers.
+    string internal constant CHAIN_SEPOLIA = "eip155:11155111";
 
     /**
-     * @notice Wrap an encoded config in URP's `(uint8 mode, bytes body)` envelope.
-     * @dev    SHARED HELPER — use this everywhere a policy `initData` is built. Since native mode
-     *         landed, `initializeWithMultiplexer` decodes the wrapper first and branches on the
-     *         mode, so a bare `abi.encode(Config)` is no longer a valid `initData` and reverts.
+     * @notice Wrap an encoded body in URP's `(string chain, bytes body)` envelope.
      *
-     *         The mode travels as a `uint8`, not as the enum, deliberately — see URP's decoder
-     *         NatSpec. Tests that want to prove an OUT-OF-RANGE mode is rejected must hand-encode
-     *         `abi.encode(uint8(2), body)` rather than reach for this helper, which cannot express
-     *         an invalid mode.
+     * @dev    SHARED HELPER — use this everywhere a policy `initData` is built. The envelope shape
+     *         is IDENTICAL for both modes; the chain string alone decides which rulebook applies,
+     *         and both the wallet and URP derive it independently from these same bytes.
+     *
+     *         THERE IS NO MODE ARGUMENT, and that is the point of the change: no caller — not the
+     *         SDK, not a test, not the wallet — ever states a mandate's kind. A test that wants a
+     *         NATIVE config passes this chain's own identifier; anything else is UNIVERSAL.
      */
-    function urpInitData(MandateType mode, bytes memory body) internal pure returns (bytes memory) {
-        return abi.encode(uint8(mode), body);
+    function envelope(string memory chain, bytes memory body) internal pure returns (bytes memory) {
+        return abi.encode(chain, body);
     }
 
-    /// @dev The universal case, which is most of them.
+    /**
+     * @dev This chain's CAIP-2 identifier, built from `block.chainid` and NEVER a literal.
+     *
+     *      ⚠️ Foundry's default chain id is 31337, where URP derives `eip155:31337`. A native helper
+     *      hard-coding `"eip155:42101"` would produce a UNIVERSAL mandate on the default chain and
+     *      every native test would fail for a reason that looks nothing like the cause. Tests that
+     *      want the Donut value pin it with `vm.chainId(42101)` and this follows automatically.
+     */
+    function nativeChain() internal view returns (string memory) {
+        return string.concat("eip155:", vm.toString(block.chainid));
+    }
+
+    /// @dev The universal case, which is most of them. Takes the storage-shaped `Config` the tests
+    ///      already build and narrows it to the wire type — the fields URP owns (`initialized`,
+    ///      `spent`, and the `destChainHash` relic) are dropped here rather than at every call site.
     function universalInitData(IURP.Config memory cfg) internal pure returns (bytes memory) {
-        return urpInitData(MandateType.UNIVERSAL, abi.encode(cfg));
+        return universalInitData(CHAIN_SEPOLIA, cfg);
     }
 
-    /// @dev The native case.
-    function nativeInitData(IURP.NativeConfig memory cfg) internal pure returns (bytes memory) {
-        return urpInitData(MandateType.NATIVE, abi.encode(cfg));
+    /// @dev The universal case on a named chain — for the chain-derivation and teeth suites.
+    function universalInitData(string memory chain, IURP.Config memory cfg) internal pure returns (bytes memory) {
+        return envelope(chain, abi.encode(_terms(cfg)));
+    }
+
+    /// @dev The native case. The chain is this chain, by definition of the mode.
+    function nativeInitData(IURP.NativeConfig memory cfg) internal view returns (bytes memory) {
+        return envelope(nativeChain(), abi.encode(_terms(cfg)));
+    }
+
+    /// @dev `Config` (storage shape, what tests build) → `UniversalTerms` (wire shape).
+    function _terms(IURP.Config memory cfg) internal pure returns (IURP.UniversalTerms memory) {
+        return IURP.UniversalTerms({
+            validUntil: cfg.validUntil,
+            expectedCEA: cfg.expectedCEA,
+            asset: cfg.asset,
+            maxAmountPerCall: cfg.maxAmountPerCall,
+            maxAmountTotal: cfg.maxAmountTotal,
+            maxPCPerCall: cfg.maxPCPerCall,
+            allowedCalls: cfg.allowedCalls
+        });
+    }
+
+    /// @dev `NativeConfig` (storage shape) → `NativeTerms` (wire shape).
+    function _terms(IURP.NativeConfig memory cfg) internal pure returns (IURP.NativeTerms memory) {
+        return IURP.NativeTerms({
+            validUntil: cfg.validUntil,
+            target: cfg.target,
+            selector: cfg.selector,
+            maxValuePerCall: cfg.maxValuePerCall,
+            maxValueTotal: cfg.maxValueTotal,
+            amount: cfg.amount,
+            maxCalls: cfg.maxCalls,
+            pins: cfg.pins
+        });
     }
 
     // ─────────────────────────── outbound request ───────────────────────────

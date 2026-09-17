@@ -6,9 +6,14 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 the reading plan it sets out, before writing any code. This file is conventions, commands and orientation;
 it does not restate the architecture.
 
-**Precedence, highest first:** `CORE_RULES_v3.md` → `v3-architecture.md` → `v3-decision-register.md` →
-the five PRDs in `v3-prds/` → the worked example (`docs-internal/prds/context/agentic_wallet_flow.md`).
+**Precedence, highest first:** `docs-internal/v3-architecture-docs/CORE_RULES_v3.md` →
+`docs/v3-architecture.md` → `docs-internal/v3-architecture-docs/v3-decision-register.md` →
+the five PRDs in `v3-prds/` → the worked examples in `docs/`
+(`agentic_wallet_flow.md` cross-chain, `push_native_agentic_wallet_flow.md` Push-side).
 Everything else in the repository is history. **The PRD is the specification; the existing code is not.**
+
+**The narrative docs live in `docs/`, not `docs-internal/`** — `v3-architecture.md` and the two flow
+walkthroughs. `docs-internal/` holds the build specifications, the decision register and the PRDs.
 
 ## Commands
 
@@ -68,7 +73,7 @@ about lives inside the payload, two decode levels down. **URP is the contract th
 |---|---|
 | `AGWFactory` (`src/`) | UUPS proxy. Deploys wallet clones at pre-computable addresses; the registry of record for "is this a real wallet, and who owns it?" The caller is always the owner — there is no owner parameter. |
 | `PushAgentWallet` (`src/`) | Holds funds. Minimal clone with 40 bytes of immutable args (owner 0–19, factory 20–39). Push Chain has no ERC-4337 EntryPoint, so the wallet does the EntryPoint's jobs itself. |
-| `URP` (`src/policies/`) | The only novel contract and the security boundary. Sixteen gates, in normative order, fail closed. |
+| `URP` (`src/policies/`) | The only novel contract and the security boundary. **Two rulebooks** — sixteen gates for a cross-chain mandate, nine for a Push-side one — in normative order, fail closed. Which one runs is decided by the mandate's chain, never by a flag anyone sets. Upgradeable behind a transparent proxy. |
 | `PushSessionValidator` (`src/validators/`) | Stateless signature check: secp256k1, or Ed25519 via a raw `staticcall` to the USV precompile. |
 | `SmartSession` (`lib/smartsessions/`) | Adopted unmodified. Stores mandates, runs policies, deletes on revoke. The wallet's only installed module. |
 
@@ -87,6 +92,15 @@ about lives inside the payload, two decode levels down. **URP is the contract th
 - **`grantMandate` enforces the canonical session shape and nothing else** — the skeleton, not the organs.
   Term validation is URP's own init guards. Its monotonic `_grantNonce` becomes the session salt, so every
   grant yields a distinct permission id that never recurs.
+  **One exception, bounded:** the wallet decodes the policy envelope's `chain` string from each action's
+  `initData` — *after* the policy-shape check has proven the policy is URP — solely to derive the
+  mandate's mode and assert targets against it. It validates nothing else in the envelope; URP re-derives
+  the same value from the same bytes and remains the sole judge of the terms.
+  **The order is load-bearing and is pinned by two tests: count → shape → decode → derive.** Decoding
+  before the shape check would read an arbitrary policy's data as though URP had authored it, and reading
+  action 0 before the count check would index an empty array. The per-action shape check inside the native
+  loop matters as much as the one before it — a mandate whose *third* action names a foreign policy would
+  otherwise be granted with no URP gate on that action at all.
 - **`stopMandate` / `stopAll` must have nothing on them that can fail.** No guard, no probe, no extra
   external call. Blockable revocation is the one regression these functions can develop.
 - **URP's `checkAction` makes no external calls.** It runs *before* the session signature is verified, on
@@ -115,6 +129,24 @@ about lives inside the payload, two decode levels down. **URP is the contract th
   immutable everywhere else.
 - The engine truncates policy revert data to 32 bytes and rewraps it as `PolicyCheckReverted(bytes32)`. Use
   `BaseTest.expectUrpGate(...)` so negative tests name *which* gate fired; never hand-encode this.
+  **This applies to `checkAction` only.** `initializeWithMultiplexer` is a plain call from `ConfigLib`, so
+  init reverts bubble with full data — assert `ChainMismatch`, `InvalidAsset` and `EmptyChain` with every
+  argument, never through `expectUrpGate`.
+- **Which rulebook a mandate uses is DERIVED, by both contracts, from one string.** Each action's URP
+  `initData` is `abi.encode(string chain, bytes body)` — the same shape in both modes, which is what lets
+  the leading field be read before the mode is known. The wallet hashes it and the engine hands URP the
+  identical bytes, so both call `PushChainLib.deriveMode` and reach the same answer with nothing between
+  them that can drift. There is no mode byte, no `MandateType` argument and no `PUSH_CHAIN_HASH` constant:
+  `PushChainLib` computes this chain's identity from `block.chainid`, so there is nothing to configure and
+  therefore nothing to configure wrongly. A near-miss string (`"EIP155:42101"`) derives the *other* mode
+  and is refused against the action targets — the hash comparison is the whole rule, and the wallet
+  deliberately does not parse, normalise or length-check the string.
+- **`Config` and `NativeConfig` are STORAGE types; `UniversalTerms` and `NativeTerms` are the wire types.**
+  The SDK encodes the latter. `Config.destChainHash` is a v2 relic that keeps slot 1 and is never written —
+  a mandate's chain lives on `ModeSlot.chainHash`, where it has been checked against the asset.
+  `test_upgradeable_configStructLayoutIsFrozen` pins every member's label, slot, offset and type, because a
+  struct inside a mapping never appears in the contract-level layout and can otherwise be reordered
+  silently.
 
 ## Standing build rules
 
@@ -137,13 +169,19 @@ about lives inside the payload, two decode levels down. **URP is the contract th
 
 1. **Every negative test names its expected error.** Three documented exceptions only: URP gate 4 case (d)
    (correct-length, malformed-offset body), validator P-05 — both assert "reverts" because both fail at
-   the same un-named `abi.decode` step — and, added 2026-09-09, the **legacy `initData` rejection test**: a
-   v2-style bare-struct `abi.encode(Config)` passed to URP's `(uint8 mode, bytes body)` decoder reverts
-   unnamed **on an UNINITIALISED config**. Naming it would require heuristic decoding, which is worse
-   than the unnamed revert; the important property, which the test does assert, is that it **reverts
-   rather than mis-decoding**. The exception is narrow, and narrower than it first shipped: on an
-   ALREADY-INITIALISED config the re-init guard now runs before the decode, so the same malformed
-   blob reverts with a named `AlreadyInitialized` instead.
+   the same un-named `abi.decode` step — and the **malformed-envelope rejection test**.
+
+   **The envelope exception, restated for `abi.encode(string chain, bytes body)`.** On an **uninitialised**
+   config, an envelope whose outer `(string, bytes)` decode fails — a `(uint8, bytes32, bytes)` header,
+   `(uint8 ≥ 2, bytes)`, or fewer than 64 bytes — reverts **unnamed**; so does a well-formed envelope
+   whose body is the wrong `Terms` type for the derived mode, **on the owner-door-direct path only**, and
+   so does an asset that *answers* `SOURCE_CHAIN_NAMESPACE()` with a non-string. A v2 `(uint8 0, bytes)`
+   envelope and any bare struct decode to an **empty chain** and revert **named `EmptyChain()`**; a v2
+   `(uint8 1, bytes)` envelope decodes to a garbage chain and is refused **named** at the wallet's target
+   check. On an **already-initialised** config every shape reverts `AlreadyInitialized` first, because the
+   re-init guard precedes the decode. Naming the remaining cases would require heuristic decoding, which
+   is worse than the unnamed revert; the property the tests do assert is that each **reverts rather than
+   mis-decoding**.
 
    **A bare `vm.expectRevert()` is permitted only where the revert genuinely carries no data, and
    only with an in-line justification saying so.** Before writing one, **grep the repo for the same

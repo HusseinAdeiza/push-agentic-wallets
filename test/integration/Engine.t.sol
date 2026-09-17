@@ -146,7 +146,7 @@ contract EngineTest is BaseTest {
 
     function _grant(address signer) internal returns (bytes32) {
         vm.prank(WALLET_OWNER);
-        return wallet.grantMandate(canonicalSession(ecdsaConfig(signer), _urpConfig()), MandateType.UNIVERSAL);
+        return wallet.grantMandate(canonicalSession(ecdsaConfig(signer), _urpConfig()));
     }
 
     // ═══════════════════════════════════ S-01 ═══════════════════════════════════
@@ -298,7 +298,7 @@ contract EngineTest is BaseTest {
     function _expectShape(Session memory s) internal {
         vm.prank(WALLET_OWNER);
         vm.expectRevert(PushWalletErrors.MalformedSessionShape.selector);
-        wallet.grantMandate(s, MandateType.UNIVERSAL);
+        wallet.grantMandate(s);
     }
 
     // ═══════════════════════════════════ S-03 ═══════════════════════════════════
