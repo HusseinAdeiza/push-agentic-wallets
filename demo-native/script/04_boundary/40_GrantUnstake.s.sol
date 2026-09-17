@@ -18,7 +18,7 @@ import { NativeIds } from "../../lib/NativeIds.sol";
 import { NativeMandate } from "../../lib/NativeMandate.sol";
 
 interface IWalletGrant {
-    function grantMandate(Session calldata session, MandateType mandateType) external returns (bytes32 permissionId);
+    function grantMandate(Session calldata session) external returns (bytes32 permissionId);
 }
 
 /**
@@ -75,7 +75,7 @@ contract GrantUnstake is Script {
 
         vm.recordLogs();
         vm.startBroadcast(bobPk);
-        IWalletGrant(agw).grantMandate(session, MandateType.NATIVE);
+        IWalletGrant(agw).grantMandate(session);
         vm.stopBroadcast();
 
         return _readPermissionId();

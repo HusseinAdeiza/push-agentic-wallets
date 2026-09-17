@@ -43,9 +43,14 @@ interface IPushAgentWallet {
 
     // ────────────────────────────── mandate lifecycle ──────────────────────────────
 
-    /// @dev Carries the declared `MandateType`, so an indexer can tell a native mandate from a
-    ///      universal one without re-deriving it from the session's actions.
-    event MandateGranted(bytes32 indexed permissionId, MandateType mandateType);
+    /// @dev `mandateType` and `chainHash` are DERIVED from the policy envelope's chain string, not
+    ///      declared by anyone — nobody in this system states a mandate's kind. The hash is INDEXED
+    ///      so an indexer can filter mandates by chain without decoding; the string is carried as
+    ///      data because the wallet already holds it in memory after the action-0 decode (~200 gas)
+    ///      and it makes every explorer record human-readable.
+    event MandateGranted(
+        bytes32 indexed permissionId, MandateType mandateType, bytes32 indexed chainHash, string chain
+    );
     event MandateRevoked(bytes32 indexed permissionId);
 
     /// @notice An agent request passed validation and was dispatched.

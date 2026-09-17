@@ -16,6 +16,7 @@ import {
 } from "../../src/libraries/PushWalletTypes.sol";
 import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 import { ProxyAdmin } from "@openzeppelin/contracts/proxy/transparent/ProxyAdmin.sol";
+import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
 import {
     ITransparentUpgradeableProxy,
     TransparentUpgradeableProxy
@@ -71,7 +72,7 @@ contract URPTest is BaseTest {
         PROTOCOL = makeAddr("farChainProtocol");
         CEA = makeAddr("destinationAccount");
         ACCOUNT = makeAddr("agentWallet");
-        ASSET = makeAddr("prc20");
+        ASSET = address(new MockPRC20()); // answers SOURCE_CHAIN_NAMESPACE, which URP checks at init
         vm.warp(1_000_000_000);
     }
 
@@ -282,6 +283,151 @@ contract URPTest is BaseTest {
         assertStorageLayout("URP", expected);
     }
 
+    /**
+     * ⚠️ NEVER-DELETE (the nineteenth, added 2026-09-17). `Config` AND `NativeConfig` MEMBER SLOTS
+     * ARE FROZEN.
+     *
+     * WHY THE TOP-LEVEL LAYOUT TEST ABOVE IS NOT ENOUGH: it pins the CONTRACT's variables, which is
+     * where an appended mapping would show up. A struct that is a mapping VALUE does not appear
+     * there at all — its members can be reordered, retyped or removed and
+     * `test_upgradeable_storageLayoutIsFrozen` stays green while every live config silently
+     * reinterprets.
+     *
+     * THIS TEST EXISTS BECAUSE A PROPOSAL WOULD HAVE DONE EXACTLY THAT. When the chain moved out of
+     * `Config` and into the envelope, the obvious tidy-up was to delete the now-unused
+     * `destChainHash` field. Measured consequence: `expectedCEA` packs into slot 0 beside
+     * `initialized` and `validUntil`, collapsing two slots, and **`spent` moves from slot 7 to slot
+     * 5** — so every existing config would read another field's value as its spend counter. The
+     * field stays, unwritten, as a permanent hole. `URP.sol:49`: the layout is load-bearing FOREVER.
+     *
+     * Read from solc's own `storageLayout` output rather than probed with `vm.load`, for the same
+     * reason `assertEmptyStorageLayout` is: there is no runtime way to ask a struct where its
+     * members live, and a probe would only catch what it happened to look at.
+     */
+    function test_upgradeable_configStructLayoutIsFrozen() public view {
+        // `destChainHash` at slot 1 is a HOLE, deliberately — see the NatSpec above.
+        string[10] memory universalLabels = [
+            "initialized",
+            "validUntil",
+            "destChainHash",
+            "expectedCEA",
+            "asset",
+            "maxAmountPerCall",
+            "maxAmountTotal",
+            "maxPCPerCall",
+            "spent",
+            "allowedCalls"
+        ];
+        uint256[10] memory universalSlots = [uint256(0), 0, 1, 2, 3, 4, 5, 6, 7, 8];
+
+        _assertStructLayout("Config", universalLabels.length, _toDyn(universalLabels), _toDyn(universalSlots));
+
+        string[12] memory nativeLabels = [
+            "initialized",
+            "validUntil",
+            "target",
+            "selector",
+            "maxValuePerCall",
+            "maxValueTotal",
+            "valueSpent",
+            "amount",
+            "amountSpent",
+            "maxCalls",
+            "callsUsed",
+            "pins"
+        ];
+        // `amount` is an `AmountRule` struct occupying slots 4-6 (bool+uint16 packed, then two
+        // uint256s), which is why `amountSpent` lands at 7 and `pins` at 9. Read from the artifact,
+        // not derived by hand — a first draft of this test guessed 6 and 8 and was wrong, which is
+        // itself the argument for pinning these against solc's output rather than arithmetic.
+        uint256[12] memory nativeSlots = [uint256(0), 0, 0, 0, 1, 2, 3, 4, 7, 8, 8, 9];
+
+        _assertStructLayout("NativeConfig", nativeLabels.length, _toDyn(nativeLabels), _toDyn(nativeSlots));
+    }
+
+    /// @dev Reads one struct's member slots out of URP's compiled artifact and compares them.
+    function _assertStructLayout(
+        string memory structName,
+        uint256 count,
+        string[] memory labels,
+        uint256[] memory slots
+    ) internal view {
+        string memory artifact = vm.readFile("out/URP.sol/URP.json");
+        string[] memory typeKeys = vm.parseJsonKeys(artifact, ".storageLayout.types");
+
+        string memory key;
+        string memory prefix = string.concat("t_struct(", structName, ")");
+        for (uint256 i; i < typeKeys.length; ++i) {
+            if (_startsWith(typeKeys[i], prefix)) {
+                key = typeKeys[i];
+                break;
+            }
+        }
+        require(bytes(key).length != 0, string.concat("no storageLayout entry for ", structName));
+
+        string memory base = string.concat(".storageLayout.types.['", key, "'].members");
+
+        // The COUNT is asserted as well as each member, so that ADDING a field fails here too — a
+        // per-member loop alone would happily ignore a tenth member appended after the ninth.
+        // Asserted by probing one past the end: the member at index `count` must not exist.
+        assertFalse(
+            vm.keyExistsJson(artifact, string.concat(base, "[", vm.toString(count), "].label")),
+            string.concat(structName, ": a member was ADDED beyond the frozen set")
+        );
+
+        for (uint256 i; i < count; ++i) {
+            string memory at = string.concat(base, "[", vm.toString(i), "]");
+            assertEq(
+                vm.parseJsonString(artifact, string.concat(at, ".label")),
+                labels[i],
+                string.concat(structName, ": member ", vm.toString(i), " changed name or position")
+            );
+            assertEq(
+                vm.parseJsonUint(artifact, string.concat(at, ".slot")),
+                slots[i],
+                string.concat(structName, ": ", labels[i], " moved slot - every live config would misread")
+            );
+        }
+    }
+
+    function _startsWith(string memory s, string memory prefix) internal pure returns (bool) {
+        bytes memory sb = bytes(s);
+        bytes memory pb = bytes(prefix);
+        if (sb.length < pb.length) return false;
+        for (uint256 i; i < pb.length; ++i) {
+            if (sb[i] != pb[i]) return false;
+        }
+        return true;
+    }
+
+    function _toDyn(string[10] memory a) internal pure returns (string[] memory out) {
+        out = new string[](10);
+        for (uint256 i; i < 10; ++i) {
+            out[i] = a[i];
+        }
+    }
+
+    function _toDyn(string[12] memory a) internal pure returns (string[] memory out) {
+        out = new string[](12);
+        for (uint256 i; i < 12; ++i) {
+            out[i] = a[i];
+        }
+    }
+
+    function _toDyn(uint256[10] memory a) internal pure returns (uint256[] memory out) {
+        out = new uint256[](10);
+        for (uint256 i; i < 10; ++i) {
+            out[i] = a[i];
+        }
+    }
+
+    function _toDyn(uint256[12] memory a) internal pure returns (uint256[] memory out) {
+        out = new uint256[](12);
+        for (uint256 i; i < 12; ++i) {
+            out[i] = a[i];
+        }
+    }
+
     /// @dev TUP stores its admin in the ERC-1967 admin slot; it is created by the proxy's own
     ///      constructor and is not returned anywhere, so it must be read from that slot.
     function _urpAdmin() internal view returns (address) {
@@ -299,7 +445,7 @@ contract URPTest is BaseTest {
      *      Extend this list ONLY for a deliberate addition, in the same commit that adds it.
      */
     function test_URP_exactSelectorSet() public view {
-        bytes4[] memory expected = new bytes4[](16);
+        bytes4[] memory expected = new bytes4[](17);
         uint256 i;
 
         // Wiring anchors and the public constant. Addressed by SIGNATURE, not `.selector`: solc
@@ -330,10 +476,14 @@ contract URPTest is BaseTest {
         expected[i++] = URP.getConfig.selector;
         expected[i++] = URP.getNativeConfig.selector;
         expected[i++] = URP.getMode.selector;
+        // Added 2026-09-17 with chain-derived mode. Exposes the hash URP derives NATIVE from, so the
+        // deploy script asserts what URP will ACTUALLY use rather than recomputing the formula and
+        // agreeing with itself. This test failing on the day the getter landed is the test working.
+        expected[i++] = URP.pushChainHash.selector;
 
         expected[i++] = URP.supportsInterface.selector;
 
-        assertEq(i, 16, "the hard-coded list must be complete");
+        assertEq(i, 17, "the hard-coded list must be complete");
         assertSelectorSet("URP", expected);
     }
 
@@ -457,14 +607,28 @@ contract URPTest is BaseTest {
         assertFalse(urp.supportsInterface(0xdeadbeef), "unknown id");
     }
 
-    /// getConfig round-trips every field, including the deep-copied allow-list.
+    /**
+     * getConfig round-trips every field, including the deep-copied allow-list.
+     *
+     * `destChainHash` IS DELIBERATELY NOT ASSERTED HERE ANY MORE. Since 2026-09-17 it is a v2 relic:
+     * the slot is kept so `Config`'s layout never moves, but nothing writes it, and the chain of a
+     * mandate lives on `getMode(...).chainHash` where it has been verified against the asset. The
+     * assertion moved rather than vanished — see the `chainHash` check below.
+     */
     function test_getConfig_roundTripsIncludingAllowList() public {
         _initDefault();
         IURP.Config memory got = urp.getConfig(CID, ACCOUNT);
 
+        // The chain, from its one home. Literal, not recomputed from the helper's own constant.
+        assertEq(
+            urp.getMode(CID, ACCOUNT).chainHash,
+            0xafa90c317deacd3d68f330a30f96e4fa7736e35e8d1426b2e1b2c04bce1c2fb7,
+            "chain recorded on the mode slot"
+        );
+        assertEq(got.destChainHash, bytes32(0), "the destChainHash relic is never written");
+
         assertTrue(got.initialized, "initialized set by init, not by _store");
         assertEq(got.validUntil, VALID_UNTIL, "validUntil");
-        assertEq(got.destChainHash, keccak256("eip155:11155111"), "destChainHash stored");
         assertEq(got.expectedCEA, CEA, "expectedCEA");
         assertEq(got.asset, ASSET, "asset");
         assertEq(got.maxAmountPerCall, 100 ether, "maxAmountPerCall");
@@ -487,9 +651,19 @@ contract URPTest is BaseTest {
         assertEq(_spent(), 0, "supplied spent ignored");
     }
 
+    /// @dev The chain hash is asserted as a LITERAL keccak of the helper's own chain string, not as
+    ///      `keccak256(bytes(CHAIN_SEPOLIA))` recomputed here — an assertion that recomputes the
+    ///      value under test agrees with itself by construction. This one fails if the envelope
+    ///      stops carrying the chain the config was granted for.
     function test_init_emitsBothPolicySetEvents() public {
         vm.expectEmit(true, true, true, true, address(urp));
-        emit IURP.URPPolicySet(CID, address(engine), ACCOUNT, MandateType.UNIVERSAL);
+        emit IURP.URPPolicySet(
+            CID,
+            address(engine),
+            ACCOUNT,
+            MandateType.UNIVERSAL,
+            0xafa90c317deacd3d68f330a30f96e4fa7736e35e8d1426b2e1b2c04bce1c2fb7
+        );
         vm.expectEmit(true, true, true, true, address(urp));
         emit IPolicy.PolicySet(CID, address(engine), ACCOUNT);
         _initDefault();

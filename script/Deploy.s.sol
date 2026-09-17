@@ -107,6 +107,16 @@ contract Deploy is Script {
         _urpImplementation = address(urpLogic);
         _urpProxyAdmin = address(uint160(uint256(vm.load(address(urpProxy), ERC1967Utils.ADMIN_SLOT))));
 
+        // 3b · THE CHAIN-IDENTITY ASSERTIONS. Run here — after URP exists, before the wallet and
+        //      factory do — so a disagreement aborts the broadcast with nothing user-facing deployed.
+        //
+        //      WHAT COULD GO WRONG WITHOUT THEM: the mandate mode is derived from a chain string,
+        //      and `PushChainLib` computes this chain's identity from `block.chainid`. If Push named
+        //      itself differently from that, every native mandate would derive UNIVERSAL and be
+        //      refused at grant — after deployment, on a user's first attempt, with a diagnostic
+        //      pointing at the action target rather than the cause.
+        _assertChainIdentity(urp);
+
         // 4 · The wallet implementation. Its constructor rejects any zero.
         PushAgentWallet walletImplementation =
             new PushAgentWallet(address(engine), address(urp), address(validator), gatewayPC);
@@ -197,4 +207,70 @@ contract Deploy is Script {
             return "unknown";
         }
     }
+
+    /**
+     * @dev THREE ASSERTIONS ON ONE FACT: what this chain calls itself.
+     *
+     *      The mandate mode is derived, not declared — `PushChainLib` hashes
+     *      `"eip155:" ‖ decimal(block.chainid)` and a mandate on that chain is NATIVE. Nothing is
+     *      configured, so there is no constant to set wrongly; what remains is the possibility that
+     *      Push's own contracts disagree with `block.chainid` about Push's identity. That is what
+     *      (3) checks, and it is the only one of the three that can fail on a correctly-built
+     *      deployment.
+     *
+     *      (1) URP derives what the formula says it should — catches an implementation that was
+     *          upgraded to a different derivation than this script was written against.
+     *      (2) On Donut specifically, that value equals the pin every test hard-codes. Independently
+     *          computed with `cast keccak "eip155:42101"`.
+     *      (3) Core agrees. `UEAFactory.getOriginForUEA` on a NON-UEA address returns the identity
+     *          core synthesises for Push-native accounts.
+     *
+     *      ⚠️ `pushChainId()` IS DELIBERATELY NOT CALLED. It exists in core's source but REVERTS on
+     *      the deployed implementation (`0xb6dc…5b2f`, read from the EIP-1967 slot) — a
+     *      source-versus-deployed drift measured on 2026-09-17. `getOriginForUEA` reads the same
+     *      admin-set string through a function that is actually live.
+     *
+     *      (3) is skipped rather than failed when `UEA_FACTORY` is unset or has no code, because a
+     *      local anvil run has no core deployment and must still be able to deploy.
+     */
+    function _assertChainIdentity(URP urp) internal view {
+        bytes32 expected = keccak256(bytes(string.concat("eip155:", vm.toString(block.chainid))));
+        require(urp.pushChainHash() == expected, "URP derives a different chain identity than this script");
+
+        if (block.chainid == 42_101) {
+            require(
+                urp.pushChainHash() == 0x3d6bc1f1d3fb03065860265a8e93840b586e57075d956cd41b4319d040be87f9,
+                "Donut chain hash does not match the pin"
+            );
+        }
+
+        address ueaFactory = vm.envOr("UEA_FACTORY", address(0));
+        if (ueaFactory == address(0) || ueaFactory.code.length == 0) return;
+
+        (UniversalAccountId memory origin, bool isUEA) = IUEAFactoryOrigin(ueaFactory).getOriginForUEA(address(0xdEaD));
+        require(!isUEA, "the probe address is a registered UEA - pick another");
+        require(keccak256(bytes(origin.chainNamespace)) == keccak256(bytes("eip155")), "core namespace disagrees");
+        require(
+            keccak256(bytes(origin.chainId)) == keccak256(bytes(vm.toString(block.chainid))),
+            "core and block.chainid disagree about this chain's id"
+        );
+    }
+}
+
+/**
+ * @dev Deploy-only mirror of push-chain-core's `Types.UniversalAccountId`. FIELD ORDER IS
+ *      ABI-LOAD-BEARING and is pinned by the live read documented in `_assertChainIdentity`.
+ *
+ *      Declared HERE rather than in `src/interfaces/` on purpose: it is used by one deploy-time
+ *      sanity check and nothing in production reads it, so it should not enter the production
+ *      interface surface that changes only by proposed diff.
+ */
+struct UniversalAccountId {
+    string chainNamespace;
+    string chainId;
+    bytes owner;
+}
+
+interface IUEAFactoryOrigin {
+    function getOriginForUEA(address addr) external view returns (UniversalAccountId memory, bool);
 }

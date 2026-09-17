@@ -87,6 +87,10 @@ about lives inside the payload, two decode levels down. **URP is the contract th
 - **`grantMandate` enforces the canonical session shape and nothing else** — the skeleton, not the organs.
   Term validation is URP's own init guards. Its monotonic `_grantNonce` becomes the session salt, so every
   grant yields a distinct permission id that never recurs.
+  **One exception, bounded:** the wallet decodes the policy envelope's `chain` string from each action's
+  `initData` — *after* the policy-shape check has proven the policy is URP — solely to derive the
+  mandate's mode and assert targets against it. It validates nothing else in the envelope; URP re-derives
+  the same value from the same bytes and remains the sole judge of the terms.
 - **`stopMandate` / `stopAll` must have nothing on them that can fail.** No guard, no probe, no extra
   external call. Blockable revocation is the one regression these functions can develop.
 - **URP's `checkAction` makes no external calls.** It runs *before* the session signature is verified, on
@@ -137,13 +141,19 @@ about lives inside the payload, two decode levels down. **URP is the contract th
 
 1. **Every negative test names its expected error.** Three documented exceptions only: URP gate 4 case (d)
    (correct-length, malformed-offset body), validator P-05 — both assert "reverts" because both fail at
-   the same un-named `abi.decode` step — and, added 2026-09-09, the **legacy `initData` rejection test**: a
-   v2-style bare-struct `abi.encode(Config)` passed to URP's `(uint8 mode, bytes body)` decoder reverts
-   unnamed **on an UNINITIALISED config**. Naming it would require heuristic decoding, which is worse
-   than the unnamed revert; the important property, which the test does assert, is that it **reverts
-   rather than mis-decoding**. The exception is narrow, and narrower than it first shipped: on an
-   ALREADY-INITIALISED config the re-init guard now runs before the decode, so the same malformed
-   blob reverts with a named `AlreadyInitialized` instead.
+   the same un-named `abi.decode` step — and the **malformed-envelope rejection test**.
+
+   **The envelope exception, restated for `abi.encode(string chain, bytes body)`.** On an **uninitialised**
+   config, an envelope whose outer `(string, bytes)` decode fails — a `(uint8, bytes32, bytes)` header,
+   `(uint8 ≥ 2, bytes)`, or fewer than 64 bytes — reverts **unnamed**; so does a well-formed envelope
+   whose body is the wrong `Terms` type for the derived mode, **on the owner-door-direct path only**, and
+   so does an asset that *answers* `SOURCE_CHAIN_NAMESPACE()` with a non-string. A v2 `(uint8 0, bytes)`
+   envelope and any bare struct decode to an **empty chain** and revert **named `EmptyChain()`**; a v2
+   `(uint8 1, bytes)` envelope decodes to a garbage chain and is refused **named** at the wallet's target
+   check. On an **already-initialised** config every shape reverts `AlreadyInitialized` first, because the
+   re-init guard precedes the decode. Naming the remaining cases would require heuristic decoding, which
+   is worse than the unnamed revert; the property the tests do assert is that each **reverts rather than
+   mis-decoding**.
 
    **A bare `vm.expectRevert()` is permitted only where the revert genuinely carries no data, and
    only with an in-line justification saying so.** Before writing one, **grep the repo for the same

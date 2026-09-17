@@ -23,7 +23,7 @@ import { NativeMandate } from "../../lib/NativeMandate.sol";
 ///      `PushAgentWallet.grantMandate` exactly; `Session` is the same `smartsessions` type the
 ///      wallet takes, so `abi.encodeCall` type-checks against the real ABI.
 interface IWalletGrant {
-    function grantMandate(Session calldata session, MandateType mandateType) external returns (bytes32 permissionId);
+    function grantMandate(Session calldata session) external returns (bytes32 permissionId);
 }
 
 /**
@@ -62,7 +62,7 @@ contract GrantMandate is Script {
 
         vm.recordLogs();
         vm.startBroadcast(bobPk);
-        IWalletGrant(agw).grantMandate(session, MandateType.NATIVE);
+        IWalletGrant(agw).grantMandate(session);
         vm.stopBroadcast();
 
         bytes32 permissionId = _readPermissionId();

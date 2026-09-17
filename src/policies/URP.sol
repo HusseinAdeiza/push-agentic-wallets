@@ -8,6 +8,8 @@ import { IERC165 } from "forge-std/interfaces/IERC165.sol";
 import { Initializable } from "@openzeppelin/contracts/proxy/utils/Initializable.sol";
 
 import { IURP, MAX_PINS } from "../interfaces/IURP.sol";
+import { IPRC20Source } from "../interfaces/IPRC20Source.sol";
+import { PushChainLib } from "../libraries/PushChainLib.sol";
 import {
     UniversalOutboundTxRequest,
     Multicall,
@@ -220,29 +222,32 @@ contract URP is IURP, Initializable {
      *           or already past, and a zero asset or expected destination account. An owner consent
      *           term has no meaningful silence, so "never expires" is written as the maximum value.
      *         - Deliberately does not validate cap values (zero and max are both legal, a zero
-     *           per-call cap being a valid redeploy-only mandate), `destChainHash`,
-     *           `beneficiaryOffset`, or allow-list contents. A wrong offset fails closed at
-     *           validation time; it cannot widen a mandate, only break it. Offsets must be generated
-     *           from each protocol's ABI by tooling rather than hand-typed, and each newly supported
-     *           protocol must ship a test rejecting a wrong beneficiary and an oversized amount.
+     *           per-call cap being a valid redeploy-only mandate), `beneficiaryOffset`, or
+     *           allow-list contents. A wrong offset fails closed at validation time; it cannot widen
+     *           a mandate, only break it. Offsets must be generated from each protocol's ABI by
+     *           tooling rather than hand-typed, and each newly supported protocol must ship a test
+     *           rejecting a wrong beneficiary and an oversized amount.
      *         - Anyone may call this with themselves as the multiplexer; that writes into their own
      *           keyed slice and the engine never reads it.
      *         - Writes the config, sets the initialised flag, and emits `URPPolicySet` and
      *           `PolicySet`.
      *
-     *         - THE MODE WRAPPER. `initData` is `abi.encode(uint8 mode, bytes body)`. The mode is
-     *           decoded as a `uint8` and range-checked by hand, NOT decoded straight into
-     *           `MandateType`: decoding an out-of-range value into the enum reverts with an unnamed
-     *           compiler panic, whereas this yields a named `InvalidPolicyMode`. A v2-style bare
-     *           `abi.encode(Config)` reverts here rather than mis-decoding — verified, and the one
-     *           unnamed revert this function has.
-     *         - Re-initialisation is refused ACROSS MODES: the `ModeSlot` is the single flag, so a
-     *           config initialised universal cannot be re-initialised native or vice versa.
+     *         - THE ENVELOPE. `initData` is `abi.encode(string chain, bytes body)` — IDENTICAL IN
+     *           SHAPE FOR BOTH MODES, which is what lets the leading field be read before the mode
+     *           is known. Nobody declares the mode: URP derives it from the chain with
+     *           `PushChainLib.deriveMode`, and the wallet derived the same value from the same bytes
+     *           at grant. There is no mode byte and therefore no `InvalidPolicyMode`.
+     *         - Re-initialisation is refused ACROSS MODES, and the guard runs BEFORE the decode, so
+     *           a malformed blob aimed at a live config still gets a named `AlreadyInitialized`.
+     *         - MALFORMED ENVELOPES FAIL CLOSED, several of them NAMED. A v2 `(uint8 0, bytes)`
+     *           wrapper and any bare struct decode to an EMPTY chain and revert `EmptyChain()`; a
+     *           `(uint8, bytes32, bytes)` header and `(uint8 >= 2, bytes)` revert unnamed. Nothing
+     *           mis-decodes into a live config — measured, one test per shape.
      *
      * @param  account   The wallet this config belongs to.
      * @param  configId  Engine-derived id binding the account and the permission.
-     * @param  initData  `abi.encode(uint8 mode, bytes body)`, body being `abi.encode(Config)` or
-     *                   `abi.encode(NativeConfig)` according to the mode.
+     * @param  initData  `abi.encode(string chain, bytes body)`, body being `abi.encode(UniversalTerms)`
+     *                   or `abi.encode(NativeTerms)` according to the DERIVED mode.
      */
     function initializeWithMultiplexer(address account, ConfigId configId, bytes calldata initData) external {
         ModeSlot storage slot = $mode[configId][msg.sender][account];
@@ -252,21 +257,32 @@ contract URP is IURP, Initializable {
         (bool already,) = _modeOf(configId, msg.sender, account);
         if (already) revert AlreadyInitialized(configId);
 
-        (uint8 modeRaw, bytes memory body) = abi.decode(initData, (uint8, bytes));
-        if (modeRaw > uint8(MandateType.NATIVE)) revert InvalidPolicyMode(modeRaw);
-        MandateType mode = MandateType(modeRaw);
+        // THE ENVELOPE, decoded exactly as the wallet decoded it at grant — same expression, same
+        // bytes. That identity is the whole consistency argument: there is no second author of the
+        // discriminator, so there is nothing for the two contracts to disagree about.
+        (string memory chain, bytes memory body) = abi.decode(initData, (string, bytes));
+        if (bytes(chain).length == 0) revert EmptyChain();
+
+        bytes32 chainHash = keccak256(bytes(chain));
+        MandateType mode = PushChainLib.deriveMode(chainHash);
 
         if (mode == MandateType.UNIVERSAL) {
-            _initUniversal($configs[configId][msg.sender][account], body);
+            _initUniversal($configs[configId][msg.sender][account], body, chainHash);
         } else {
             _initNative($native[configId][msg.sender][account], body);
         }
 
         slot.initialized = true;
         slot.mode = mode;
+        slot.chainHash = chainHash;
 
-        emit URPPolicySet(configId, msg.sender, account, mode);
+        emit URPPolicySet(configId, msg.sender, account, mode, chainHash);
         emit PolicySet(configId, msg.sender, account);
+    }
+
+    /// @inheritdoc IURP
+    function pushChainHash() external view returns (bytes32) {
+        return PushChainLib.selfChainHash();
     }
 
     /**
@@ -274,8 +290,8 @@ contract URP is IURP, Initializable {
      * @param cfg   Storage slot to write.
      * @param body  `abi.encode(Config)`.
      */
-    function _initUniversal(Config storage cfg, bytes memory body) internal {
-        Config memory incoming = abi.decode(body, (Config));
+    function _initUniversal(Config storage cfg, bytes memory body, bytes32 chainHash) internal {
+        UniversalTerms memory incoming = abi.decode(body, (UniversalTerms));
 
         uint256 listLength = incoming.allowedCalls.length;
         if (listLength == 0 || listLength > MAX_ALLOWED_CALLS) revert AllowListOutOfRange(listLength);
@@ -284,6 +300,42 @@ contract URP is IURP, Initializable {
             revert InvalidExpiry(incoming.validUntil);
         }
         if (incoming.asset == address(0) || incoming.expectedCEA == address(0)) revert InvalidConfigField();
+
+        // ─── THE TEETH ───
+        //
+        // After every decode and guard, before every write. Effects last, as everywhere else here.
+        //
+        // WHY THIS MAKES THE DECLARED CHAIN TRUE AT RUNTIME. `SOURCE_CHAIN_NAMESPACE()` is the exact
+        // view the gateway reads on every outbound, through `UniversalCore.getOutboundTxGasAndFees`,
+        // to decide where to route. Gate 5 pins `req.token == cfg.asset` on every request. So
+        // asserting it here binds the owner's declared chain to the chain the gateway will actually
+        // use — with no runtime change and no external call in `checkAction`.
+        //
+        // WHY AN EXTERNAL CALL IS SAFE HERE AND NOWHERE ELSE: this runs at INIT, inside the owner's
+        // own grant transaction, never in `checkAction` and never on a removal path. A failure
+        // blocks a grant; it can never block a revocation or an execution. The `try/catch` is
+        // permitted because the external call ALREADY EXISTS — do not extend that reasoning to
+        // `checkAction`'s decode, which has no external call to hide behind.
+        //
+        // A `view` call compiles to STATICCALL, so the callee cannot write state: reentrancy from a
+        // hostile asset is structurally impossible, not merely unreachable.
+        //
+        // ⚠️ THE `code.length` GUARD IS NOT REDUNDANT WITH THE `catch`. MEASURED:
+        //      callee reverts                 -> catch fires     -> named InvalidAsset
+        //      no code at the address, or EOA -> catch does NOT  -> UNNAMED, empty revert
+        //      answers with a non-string      -> catch does NOT  -> UNNAMED, empty revert
+        //    Since solc 0.8.10 the compiler omits the extcodesize check when return data is
+        //    expected; the call to a codeless address then SUCCEEDS with empty returndata and the
+        //    failure happens when THIS frame tries to ABI-decode it — outside the try/catch. Without
+        //    this line a typo'd asset address, the likeliest real mistake, reverts unnamed.
+        if (incoming.asset.code.length == 0) revert InvalidAsset(incoming.asset);
+
+        try IPRC20Source(incoming.asset).SOURCE_CHAIN_NAMESPACE() returns (string memory ns) {
+            bytes32 assetChain = keccak256(bytes(ns));
+            if (assetChain != chainHash) revert ChainMismatch(chainHash, assetChain);
+        } catch {
+            revert InvalidAsset(incoming.asset);
+        }
 
         _store(cfg, incoming);
         cfg.initialized = true;
@@ -304,11 +356,16 @@ contract URP is IURP, Initializable {
      *        against the engine's fallback flags: the wallet refuses those at grant, and a
      *        stranger-slice config the engine never reads is harmless.
      *
+     *      - MAKES NO EXTERNAL CALL. A native mandate has no asset, so there is nothing to verify the
+     *        chain against — and nothing to verify: the chain IS this chain, which is what made the
+     *        mode NATIVE in the first place. The universal branch's teeth have no native counterpart
+     *        and must not acquire one.
+     *
      * @param cfg   Storage slot to write.
-     * @param body  `abi.encode(NativeConfig)`.
+     * @param body  `abi.encode(NativeTerms)`.
      */
     function _initNative(NativeConfig storage cfg, bytes memory body) internal {
-        NativeConfig memory incoming = abi.decode(body, (NativeConfig));
+        NativeTerms memory incoming = abi.decode(body, (NativeTerms));
 
         if (incoming.validUntil == 0 || incoming.validUntil <= block.timestamp) {
             revert InvalidExpiry(incoming.validUntil);
@@ -758,18 +815,24 @@ contract URP is IURP, Initializable {
     }
 
     /**
-     * @notice Which rulebook a config uses. NEVER REVERTS.
+     * @notice Which rulebook a config uses, and which chain it was granted for. NEVER REVERTS.
      * @dev    The documented first call for any integrator that does not already know a mandate's
-     *         mode. An empty slot returns `(initialized: false, mode: UNIVERSAL)` — and the mode
-     *         value is MEANINGLESS when `initialized` is false, because `UNIVERSAL` is the enum's
-     *         zero value. Read `initialized` first, always.
+     *         mode. An empty slot returns `(initialized: false, mode: UNIVERSAL, chainHash: 0)` — and
+     *         the mode value is MEANINGLESS when `initialized` is false, because `UNIVERSAL` is the
+     *         enum's zero value. Read `initialized` first, always.
+     *
+     *         `chainHash` IS READ RAW, not through `_modeOf`. A pre-envelope config has a populated
+     *         `$configs` entry and an empty `$mode` slot: `_modeOf` correctly reports it as an
+     *         initialised UNIVERSAL mandate, but no chain was ever recorded for it, so the zero it
+     *         returns here is the honest answer — "unverified", not "chain zero". Deriving a chain
+     *         for such a config would be inventing one.
      * @param  id       Config id identifying the mandate.
      * @param  account  The wallet the mandate belongs to.
      * @return The stored mode record.
      */
     function getMode(ConfigId id, address account) external view returns (ModeSlot memory) {
         (bool init, MandateType mode) = _modeOf(id, SESSION_ENGINE, account);
-        return ModeSlot({ initialized: init, mode: mode });
+        return ModeSlot({ initialized: init, mode: mode, chainHash: $mode[id][SESSION_ENGINE][account].chainHash });
     }
 
     /**
@@ -873,18 +936,23 @@ contract URP is IURP, Initializable {
     }
 
     /**
-     * @dev Copies a decoded config into storage.
+     * @dev Copies decoded WIRE terms into the STORAGE config. The two are deliberately different
+     *      types: the wire shape is free to change, the storage layout is frozen forever
+     *      (see the layout note on `__gap`).
      *
-     *      - Forces `spent` to zero, ignoring any value supplied by the caller.
+     *      - Forces `spent` to zero. It is not a wire field at all — URP owns it.
+     *      - DOES NOT WRITE `destChainHash`. That slot is a v2 relic, kept only so the layout never
+     *        moves; the chain of every mandate now lives on `ModeSlot.chainHash`, where it has been
+     *        verified against the asset. Writing it here would recreate the second source of truth
+     *        this change exists to remove.
      *      - Clears and repopulates the allow-list.
      *      - Does not set `initialized`; the caller does, immediately after this returns.
      *
      * @param cfg       Storage slot to write into.
-     * @param incoming  Decoded config to copy from.
+     * @param incoming  Decoded wire terms to copy from.
      */
-    function _store(Config storage cfg, Config memory incoming) internal {
+    function _store(Config storage cfg, UniversalTerms memory incoming) internal {
         cfg.validUntil = incoming.validUntil;
-        cfg.destChainHash = incoming.destChainHash;
         cfg.expectedCEA = incoming.expectedCEA;
         cfg.asset = incoming.asset;
         cfg.maxAmountPerCall = incoming.maxAmountPerCall;
@@ -915,9 +983,9 @@ contract URP is IURP, Initializable {
      *      - Does not set `initialized`; the caller does, immediately after this returns.
      *
      * @param cfg       Storage slot to write into.
-     * @param incoming  Decoded native config to copy from.
+     * @param incoming  Decoded native wire terms to copy from.
      */
-    function _storeNative(NativeConfig storage cfg, NativeConfig memory incoming) internal {
+    function _storeNative(NativeConfig storage cfg, NativeTerms memory incoming) internal {
         cfg.validUntil = incoming.validUntil;
         cfg.target = incoming.target;
         cfg.selector = incoming.selector;

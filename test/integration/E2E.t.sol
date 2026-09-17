@@ -208,7 +208,7 @@ contract E2ETest is BaseTest {
         bytes memory keyConfig = ed25519 ? ed25519Config(bytes32(uint256(uint160(agentAddr)))) : ecdsaConfig(agentAddr);
 
         vm.prank(BOB_UEA);
-        permissionId = bobAgw.grantMandate(canonicalSession(keyConfig, _urpConfig()), MandateType.UNIVERSAL);
+        permissionId = bobAgw.grantMandate(canonicalSession(keyConfig, _urpConfig()));
         assertTrue(engine.isPermissionEnabled(PermissionId.wrap(permissionId), address(bobAgw)), "mandate live");
 
         // Steps 3 and 4: funds and gas reach the wallet.
@@ -287,7 +287,7 @@ contract E2ETest is BaseTest {
         // wallet's monotonic grantNonce gave the replacement a different permissionId, which is
         // bound into op-hash field 5.
         vm.prank(BOB_UEA);
-        bytes32 newPid = bobAgw.grantMandate(canonicalSession(keyConfig, _urpConfig()), MandateType.UNIVERSAL);
+        bytes32 newPid = bobAgw.grantMandate(canonicalSession(keyConfig, _urpConfig()));
         assertTrue(newPid != permissionId, "the regranted mandate has a NEW id");
 
         vm.prank(RELAYER);
@@ -431,8 +431,7 @@ contract E2ETest is BaseTest {
         bobAgw = PushAgentWallet(payable(factory.deployWallet("lending")));
 
         vm.prank(BOB_UEA);
-        permissionId =
-            bobAgw.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _urpConfig()), MandateType.UNIVERSAL);
+        permissionId = bobAgw.grantMandate(canonicalSession(ecdsaConfig(agentAddr), _urpConfig()));
 
         pUSDC.mint(address(bobAgw), HUNDRED_USDC);
         vm.deal(address(bobAgw), 1 ether);
@@ -550,7 +549,7 @@ contract E2ETest is BaseTest {
         );
 
         vm.prank(BOB_UEA);
-        bytes32 nativePid = bobAgw.grantMandate(_nativeSessionFor(stake, address(bobAgw)), MandateType.NATIVE);
+        bytes32 nativePid = bobAgw.grantMandate(_nativeSessionFor(stake, address(bobAgw)));
 
         // A SEPARATE NONCE LANE — the SDK convention is one lane per mandate (register N-42), and
         // this is why: lane 0 was consumed by the universal flow above, so reusing it would collide
@@ -695,7 +694,7 @@ contract E2ETest is BaseTest {
         );
 
         vm.prank(BOB_UEA);
-        pid = w.grantMandate(_nativeSessionFor(stake, address(w)), MandateType.NATIVE);
+        pid = w.grantMandate(_nativeSessionFor(stake, address(w)));
     }
 
     /// @dev The native action's config id: `keccak(account . keccak(pid . actionId))`, where

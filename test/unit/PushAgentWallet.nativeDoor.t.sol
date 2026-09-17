@@ -186,7 +186,7 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
         a[4] = _action(VALUE_SELECTOR, _valueOnlyConfig());
 
         vm.prank(WALLET_OWNER);
-        return wallet.grantMandate(_nativeSession(a), MandateType.NATIVE);
+        return wallet.grantMandate(_nativeSession(a));
     }
 
     // ───────────────────────────── request plumbing ─────────────────────────────
@@ -422,7 +422,7 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
         });
 
         vm.prank(WALLET_OWNER);
-        return w.grantMandate(_nativeSession(a), MandateType.NATIVE);
+        return w.grantMandate(_nativeSession(a));
     }
 
     /// @dev The ten-field op hash and USE-mode envelope for an ARBITRARY wallet, so the second half
@@ -468,7 +468,7 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
 
         vm.prank(WALLET_OWNER);
         vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.ForbiddenActionTarget.selector, address(wallet)));
-        wallet.grantMandate(_nativeSession(a), MandateType.NATIVE);
+        wallet.grantMandate(_nativeSession(a));
     }
 
     /**
@@ -494,9 +494,7 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
 
         // (3)+(4) the engine passes; the wallet's guard fires
         bytes memory cd = ExecutionLib.encodeSingle(
-            address(wallet),
-            0,
-            abi.encodeCall(PushAgentWallet.grantMandate, (_nativeSession(new ActionData[](1)), MandateType.NATIVE))
+            address(wallet), 0, abi.encodeCall(PushAgentWallet.grantMandate, (_nativeSession(new ActionData[](1))))
         );
 
         vm.prank(RELAYER);
@@ -530,7 +528,7 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
 
         vm.prank(WALLET_OWNER);
         vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.ForbiddenActionTarget.selector, ENGINE_FALLBACK_TARGET));
-        wallet.grantMandate(_nativeSession(a), MandateType.NATIVE);
+        wallet.grantMandate(_nativeSession(a));
 
         // (2) the owner door enables it anyway, with Sudo
         SudoPolicy sudo = new SudoPolicy();
@@ -562,13 +560,30 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
                 PushWalletErrors.MandateTypeMismatch.selector, MandateType.NATIVE, uint256(1), GATEWAY
             )
         );
-        wallet.grantMandate(_nativeSession(a), MandateType.NATIVE);
+        wallet.grantMandate(_nativeSession(a));
     }
 
-    /// ⚠️ NEVER-DELETE. And the mirror: a non-gateway action declared UNIVERSAL.
+    /**
+     * ⚠️ NEVER-DELETE. And the mirror: a non-gateway action under a FOREIGN chain.
+     *
+     * The property is unchanged — "a universal mandate can never contain a non-gateway action" — but
+     * since the mode became derived there is no argument to force it with. The chain does that work
+     * now: a Sepolia envelope on a Push-side target derives UNIVERSAL, and the target check refuses
+     * it. That is a strictly better test, because it is the shape an SDK would actually produce by
+     * mistake, rather than one only reachable by passing the wrong enum.
+     */
     function test_NonGatewayTargetRefusedAsUniversal() public {
+        // A Push-side target, but the envelope declares Sepolia -> derives UNIVERSAL.
+        //
+        // The BODY is still a native config, and that is deliberate: the wallet reads the chain and
+        // nothing else, so an inconsistent body must not change its answer. URP would reject this
+        // body at init — but the wallet refuses the session first, which is the ordering under test.
+        PolicyData[] memory ps = new PolicyData[](1);
+        ps[0] =
+            PolicyData({ policy: address(urp), initData: envelope(CHAIN_SEPOLIA, abi.encode(_terms(_claimConfig()))) });
+
         ActionData[] memory a = new ActionData[](1);
-        a[0] = _action(CLAIM, _claimConfig());
+        a[0] = ActionData({ actionTargetSelector: CLAIM, actionTarget: address(stakeDummy), actionPolicies: ps });
 
         vm.prank(WALLET_OWNER);
         vm.expectRevert(
@@ -576,7 +591,7 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
                 PushWalletErrors.MandateTypeMismatch.selector, MandateType.UNIVERSAL, uint256(0), address(stakeDummy)
             )
         );
-        wallet.grantMandate(_nativeSession(a), MandateType.UNIVERSAL);
+        wallet.grantMandate(_nativeSession(a));
     }
 
     /// ⚠️ NEVER-DELETE. The engine's wildcard action, refused by target AND by selector.
@@ -594,7 +609,7 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
 
         vm.prank(WALLET_OWNER);
         vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.ForbiddenActionTarget.selector, ENGINE_FALLBACK_TARGET));
-        wallet.grantMandate(_nativeSession(a), MandateType.NATIVE);
+        wallet.grantMandate(_nativeSession(a));
 
         // A legitimate target with a fallback SELECTOR is refused on the selector.
         _expectForbiddenSelector(bytes4(0x00000001));
@@ -612,7 +627,7 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
 
         vm.prank(WALLET_OWNER);
         vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.ForbiddenActionSelector.selector, sel));
-        wallet.grantMandate(_nativeSession(a), MandateType.NATIVE);
+        wallet.grantMandate(_nativeSession(a));
     }
 
     /**
@@ -635,7 +650,7 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
         }
 
         vm.prank(WALLET_OWNER);
-        bytes32 pid = wallet.grantMandate(_nativeSession(a), MandateType.NATIVE);
+        bytes32 pid = wallet.grantMandate(_nativeSession(a));
 
         // Eight actions configured, and NONE of them is the wallet — so a self-targeted request
         // finds no matching action and the engine refuses it before the guard is even needed.
