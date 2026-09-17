@@ -91,7 +91,7 @@ All of Bob's addresses are **deterministic and computable before anything is dep
 | # | Call | Effect |
 | --- | --- | --- |
 | 1 | `AGWFactory.deployWallet("lending")` | **`0xbobagw` deployed** at the predicted address; owner = `0xbobuea`, baked into bytecode. **Inside the same call the factory invokes `initializeAccount()`, which installs SmartSession** — atomic, no uninitialised state |
-| 2 | `0xbobagw.grantMandate(session, UNIVERSAL)` | 🔑 **MANDATE GRANTED** — see below |
+| 2 | `0xbobagw.grantMandate(session)` | 🔑 **MANDATE GRANTED** — see below |
 | 3 | `pUSDC.transfer(0xbobagw, 100e6)` | 💰 funds → the agent wallet |
 | 4 | `PC.transfer(0xbobagw, …)` | ⛽ the wallet needs its own PC — it pays for the outbound gas swap |
 
@@ -99,7 +99,11 @@ All of Bob's addresses are **deterministic and computable before anything is dep
 
 ### 🔑 The mandate grant (step 2) in detail
 
-`grantMandate` does exactly three things: it **overwrites the salt** with the wallet's own monotonic `grantNonce`, it **enforces the canonical session shape** for the declared kind, and it **asserts the declared kind against the action** — under `UNIVERSAL`, exactly one action, and it must be the gateway's outbound send. A wrong policy, an extra action or a stray user-op policy reverts `MalformedSessionShape`; a target that is wrong *for the kind* — anything but the gateway here — reverts `MandateTypeMismatch(UNIVERSAL, 0, target)`, naming what was tried.
+`grantMandate` takes **one argument**. Nobody tells it what kind of mandate this is: it reads the **chain** the policy envelope declares, and derives the kind from that. Sepolia is not Push, so this is a `UNIVERSAL` mandate — one that leaves the chain through the gateway.
+
+It then does exactly three things: it **overwrites the salt** with the wallet's own monotonic `grantNonce`, it **enforces the canonical session shape** for the derived kind, and it **asserts that kind against the action** — under `UNIVERSAL`, exactly one action, and it must be the gateway's outbound send. A wrong policy, an extra action or a stray user-op policy reverts `MalformedSessionShape`; a target that is wrong *for the kind* — anything but the gateway here — reverts `MandateTypeMismatch(UNIVERSAL, 0, target)`, naming what was tried.
+
+**Why the chain and not a flag.** Bob is choosing a chain, a contract, some functions and a budget. The kind of mandate that implies is a *consequence*, not a fifth decision — so the system computes it rather than asking. It used to be declared twice, once to the wallet and once inside the policy data, with nothing comparing the two at grant; a mismatch produced a mandate that looked granted, described itself wrongly in its own event, and died at first use.
 
 ```
 sessionValidator         = PushSessionValidator
@@ -114,15 +118,17 @@ actions: [ EXACTLY ONE — the UNIVERSAL shape ]
   actionTarget           = UniversalGatewayPC
   actionTargetSelector   = sendUniversalTxOutbound.selector
   actionPolicies: [ URP AND ONLY URP ]
-    initData = (kind = UNIVERSAL, body = ↓)      ← URP records the kind beside the config
+    initData = (chain = "eip155:11155111", body = ↓)   ← THE CHAIN. Not Push ⇒ UNIVERSAL.
       validUntil        = now + 60 min      ← THE EXPIRY LIVES INSIDE URP
-      asset             = PRC20_USDC        ← pins the destination chain transitively
+      asset             = PRC20_USDC        ← checked AT GRANT against the declared chain
       expectedCEA       = 0xbobagwcea       ← DERIVED at grant, committed forever
       maxAmountPerCall  = 100e6
       maxAmountTotal    = 100e6
       maxPCPerCall      = <bounded>
       allowedCalls      = { Aave v3, Morpho Blue, Spark } × { supply } + beneficiary offsets
 ```
+
+**The chain is not just a label — it is checked against the money.** When URP writes this config it asks the asset itself which chain it came from (`PRC20_USDC.SOURCE_CHAIN_NAMESPACE()`, the very view the gateway reads on every outbound to decide where to route) and **refuses the grant** if that disagrees with the declared chain (`ChainMismatch`), or if the asset cannot answer at all (`InvalidAsset`). So Bob cannot accidentally authorise "Sepolia" while funding the mandate with a token bound somewhere else. And because gate 5 pins the token on every request, that one check at grant makes the chain true for the mandate's whole life — with no extra work at execution time.
 
 **Why URP is the *only* action policy.** The engine requires at least one action policy per action. With URP as the only one, **removing URP leaves zero policies and every request dies**. Add a second policy — a separate time-window policy, say — and that property is gone: stripping URP would leave one policy standing and the request would pass. **This is why the expiry lives inside URP and not in a policy of its own.**
 
@@ -273,7 +279,7 @@ msg.sender = 0xbobagwcea · onBehalfOf = 0xbobagwcea · shares → 0xbobagwcea
 
 - **Withdraw** — `execute([...])`. **There is no `withdraw()` function**; the owner path *is* withdrawal, with no destination restriction and no policy in the path. It must succeed in every degraded state — zero mandates, engine uninstalled, hostile validator installed.
 - **Revoke** — `stopMandate(pid)` (existence-checked, so a typo reverts loudly instead of silently "succeeding") or `stopAll()`. Immediate on Push, unblockable, no callbacks on the path. **One honest limit:** an instruction already dispatched across the bridge still completes.
-- **Change a mandate** — **it cannot be edited.** A change is one owner transaction batching: `URP.assertSpent(expected)` → `stopMandate(old)` → `grantMandate(new, UNIVERSAL)`. If the agent spent in the composition window, the assertion reverts the whole change. **Counters restart at zero on the new mandate**, and any request the agent signed against the old id is dead, because the op hash binds the permission id.
+- **Change a mandate** — **it cannot be edited.** A change is one owner transaction batching: `URP.assertSpent(expected)` → `stopMandate(old)` → `grantMandate(new)`. If the agent spent in the composition window, the assertion reverts the whole change. **Counters restart at zero on the new mandate**, and any request the agent signed against the old id is dead, because the op hash binds the permission id.
 
 ### STAGE 7b — the second action, and why it may carry zero USDC
 
@@ -327,7 +333,8 @@ msg.sender = 0xbobagwcea · onBehalfOf = 0xbobagwcea · shares → 0xbobagwcea
                         ├──1─▶ AGWFactory.deployWallet  → 0xbobagw (owner baked in)
                         │        └─ factory calls initializeAccount() → SmartSession installed
                         │           NO executor module · NO hook · NO fallback
-                        ├──2─▶ 🔑 grantMandate  — salt from grantNonce, shape enforced
+                        ├──2─▶ 🔑 grantMandate(session) — kind DERIVED from the chain,
+                        │                       salt from grantNonce, shape enforced
                         │        URP: expiry · asset · caps · allow-list · expectedCEA
                         ├──3─▶ 💰 100 pUSDC ──▶ 0xbobagw
                         └──4─▶ ⛽ PC ──▶ 0xbobagw   (pays its own outbound gas swap)

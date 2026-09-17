@@ -2,6 +2,7 @@
 pragma solidity 0.8.26;
 
 import { BaseTest } from "../Base.t.sol";
+import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
 import { URP } from "../../src/policies/URP.sol";
 import { IURP, MAX_PINS } from "../../src/interfaces/IURP.sol";
 import { ConfigId } from "smartsessions/DataTypes.sol";
@@ -120,14 +121,14 @@ contract URPNativeTest is BaseTest {
         assertEq(cfg.amount.maxPerCall, 50e6, "amount rule copied");
     }
 
-    /// An out-of-range mode is NAMED, which is the entire reason the wrapper carries a `uint8`
-    /// rather than the enum — decoding straight into `MandateType` would panic unnamed.
-    function test_native_init_invalidPolicyMode() public {
-        bytes memory body = abi.encode(_nativeConfig());
-        vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(IURP.InvalidPolicyMode.selector, uint8(2)));
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(uint8(2), body));
-    }
+    // REMOVED 2026-09-17 (chain-derived mode, decision 88): `test_native_init_invalidPolicyMode`.
+    // The envelope carries a CHAIN STRING, not a mode byte, so `InvalidPolicyMode` no longer exists
+    // and there is no out-of-range mode to reject — the test had nothing left to assert. What
+    // replaced its coverage: an unrecognised chain derives UNIVERSAL and is refused against the
+    // action targets (`PushAgentWallet.chainDerivation.t.sol`), and every malformed envelope shape
+    // is covered case-by-case in `URP.envelope.t.sol`. Recorded rather than silently dropped,
+    // because a test that disappears without explanation is indistinguishable from one that was
+    // quietly found inconvenient.
 
     /**
      * ⚠️ THE THIRD DOCUMENTED UNNAMED-REVERT EXCEPTION (standing test rule 1).
@@ -253,7 +254,7 @@ contract URPNativeTest is BaseTest {
             validUntil: VALID_UNTIL,
             destChainHash: bytes32(0),
             expectedCEA: makeAddr("cea"),
-            asset: makeAddr("asset"),
+            asset: address(new MockPRC20()),
             maxAmountPerCall: 1,
             maxAmountTotal: 1,
             maxPCPerCall: 1,
@@ -722,7 +723,7 @@ contract URPNativeTest is BaseTest {
             validUntil: VALID_UNTIL,
             destChainHash: bytes32(0),
             expectedCEA: makeAddr("cea"),
-            asset: makeAddr("asset"),
+            asset: address(new MockPRC20()),
             maxAmountPerCall: 1 ether,
             maxAmountTotal: 1 ether,
             maxPCPerCall: 1 ether,

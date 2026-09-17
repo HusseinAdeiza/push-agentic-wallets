@@ -38,24 +38,36 @@ contract NativeMandateTest is Test {
     bytes4 internal constant UNSTAKE = bytes4(keccak256("unstake()"));
     bytes4 internal constant APPROVE = bytes4(keccak256("approve(address,uint256)"));
 
-    /// @dev Decode a session's single policy `initData` back into the mode and the config.
-    function _decode(bytes memory initData) internal pure returns (uint8 mode, IURP.NativeConfig memory cfg) {
+    /// @dev Decode a session's single policy `initData` back into the declared chain and the terms.
+    ///      The envelope is `abi.encode(string chain, bytes body)` — there is no mode in it, because
+    ///      the mode is DERIVED from the chain by the wallet and by URP independently.
+    function _decode(bytes memory initData) internal pure returns (string memory chain, IURP.NativeTerms memory terms) {
         bytes memory body;
-        (mode, body) = abi.decode(initData, (uint8, bytes));
-        cfg = abi.decode(body, (IURP.NativeConfig));
+        (chain, body) = abi.decode(initData, (string, bytes));
+        terms = abi.decode(body, (IURP.NativeTerms));
+    }
+
+    /// @dev What this chain calls itself — built from `block.chainid`, never a literal, for the same
+    ///      reason the library builds it that way.
+    function _thisChain() internal view returns (string memory) {
+        return string.concat("eip155:", vm.toString(block.chainid));
     }
 
     /**
-     * @dev ⚠️ THE MODE WRAPPER. URP's `initData` is `abi.encode(uint8 mode, bytes body)`, and a
-     *      v2-style bare `abi.encode(Config)` does not mis-decode into something wrong — it
-     *      REVERTS, unnamed, on an uninitialised config. This asserts the wrapper is present and
-     *      says NATIVE, because getting it wrong is a whole wasted act.
+     * @dev ⚠️ THE ENVELOPE, AND THE CHAIN THAT DECIDES THE MODE.
+     *
+     *      URP's `initData` is `abi.encode(string chain, bytes body)`. Nothing in it states a mode:
+     *      the wallet hashes this string, compares it to its own chain, and derives NATIVE — and URP
+     *      does the same, independently, from the same bytes. So the ONE thing worth asserting here
+     *      is that the string is this chain's, byte-exact. A near miss like "EIP155:42101" would
+     *      derive UNIVERSAL and the grant would be refused against the target, which is a whole
+     *      wasted act for a reason that reads like something else entirely.
      */
     function test_stake_carriesTheNativeModeWrapper() public view {
-        (uint8 mode,) = _decode(
+        (string memory chain,) = _decode(
             NativeMandate.stakeSession(agent, wallet, stakeDummy, STAKE_FOR).actions[0].actionPolicies[0].initData
         );
-        assertEq(mode, uint8(MandateType.NATIVE), "the mode wrapper must say NATIVE");
+        assertEq(chain, _thisChain(), "the envelope must declare THIS chain, which is what derives NATIVE");
     }
 
     /**
@@ -64,7 +76,7 @@ contract NativeMandateTest is Test {
      *      all 32 bytes.
      */
     function test_stake_pinsTheBeneficiaryToTheWallet() public view {
-        (, IURP.NativeConfig memory cfg) = _decode(
+        (, IURP.NativeTerms memory cfg) = _decode(
             NativeMandate.stakeSession(agent, wallet, stakeDummy, STAKE_FOR).actions[0].actionPolicies[0].initData
         );
 
@@ -75,7 +87,7 @@ contract NativeMandateTest is Test {
 
     /// @dev Offset 36 is the second argument word. Off by four and the meter reads the wrong bytes.
     function test_stake_metersTheAmountAtOffset36() public view {
-        (, IURP.NativeConfig memory cfg) = _decode(
+        (, IURP.NativeTerms memory cfg) = _decode(
             NativeMandate.stakeSession(agent, wallet, stakeDummy, STAKE_FOR).actions[0].actionPolicies[0].initData
         );
 
@@ -91,7 +103,7 @@ contract NativeMandateTest is Test {
      *      it is what makes G5 a real refusal rather than a contrived one.
      */
     function test_stake_permitsNoNativeValue() public view {
-        (, IURP.NativeConfig memory cfg) = _decode(
+        (, IURP.NativeTerms memory cfg) = _decode(
             NativeMandate.stakeSession(agent, wallet, stakeDummy, STAKE_FOR).actions[0].actionPolicies[0].initData
         );
 
@@ -132,7 +144,7 @@ contract NativeMandateTest is Test {
      *      here could never match, and the mandate would authorise nothing at all.
      */
     function test_unstake_hasNoPinsAndNoAmountRule() public view {
-        (, IURP.NativeConfig memory cfg) =
+        (, IURP.NativeTerms memory cfg) =
             _decode(NativeMandate.unstakeSession(agent, stakeDummy, UNSTAKE).actions[0].actionPolicies[0].initData);
 
         assertEq(cfg.pins.length, 0, "unstake() has no argument to pin");
@@ -147,10 +159,10 @@ contract NativeMandateTest is Test {
      *      attributed to the other difference. This asserts every other field matches.
      */
     function test_approve_pinnedAndUnpinnedDifferOnlyInPins() public view {
-        (, IURP.NativeConfig memory unpinned) = _decode(
+        (, IURP.NativeTerms memory unpinned) = _decode(
             NativeMandate.approveSession(agent, token, APPROVE, address(0)).actions[0].actionPolicies[0].initData
         );
-        (, IURP.NativeConfig memory pinned) =
+        (, IURP.NativeTerms memory pinned) =
             _decode(NativeMandate.approveSession(agent, token, APPROVE, wallet).actions[0].actionPolicies[0].initData);
 
         assertEq(unpinned.pins.length, 0, "the unpinned mandate is the hole");

@@ -26,7 +26,7 @@ import { StakeDummy } from "../../contracts/StakeDummy.sol";
 ///       CHANGED. A payload built against the old one-argument shape does not fail a shape check;
 ///       it misses the function entirely.
 interface IWalletGrant {
-    function grantMandate(Session calldata session, MandateType mandateType) external returns (bytes32 permissionId);
+    function grantMandate(Session calldata session) external returns (bytes32 permissionId);
 }
 
 /**
@@ -87,7 +87,7 @@ contract GrantMandate is Script {
         // the declared type against the action target, so a mismatch is `MandateTypeMismatch` rather
         // than a silent acceptance.
         (UniversalPayload memory payload, bytes memory signature) = BobPayload.signedCall(
-            uea, agw, abi.encodeCall(IWalletGrant.grantMandate, (session, MandateType.UNIVERSAL)), bobPk, VALID_FOR
+            uea, agw, abi.encodeCall(IWalletGrant.grantMandate, (session)), bobPk, VALID_FOR
         );
 
         vm.recordLogs();
@@ -117,12 +117,18 @@ contract GrantMandate is Script {
         // bare `abi.encode(Config)`. A legacy bare struct does not mis-decode into something wrong;
         // it reverts, UNNAMED, which is the one unnamed revert `initializeWithMultiplexer` has. That
         // is a deliberate design choice upstream, and it is why this wrapper is not optional.
+        // THE POLICY ENVELOPE: `abi.encode(string chain, bytes body)`. The chain is Sepolia, so the
+        // wallet derives UNIVERSAL and URP derives UNIVERSAL independently from these same bytes.
+        // Nobody declares the kind.
+        //
+        // AND THE STRING MUST BE BYTE-EXACT WHAT THE ASSET REPORTS. URP asks the PRC20 for its own
+        // `SOURCE_CHAIN_NAMESPACE()` at init and refuses the grant unless the two match — which is
+        // what stops this mandate from claiming Sepolia while spending a token bound to some other
+        // chain. `USDC.eth` on Donut answers exactly this string.
         PolicyData[] memory actionPolicies = new PolicyData[](1);
         actionPolicies[0] = PolicyData({
             policy: urp,
-            initData: abi.encode(
-                uint8(MandateType.UNIVERSAL), abi.encode(_config(cea, prc20, stakeDummy, maxPCPerCall))
-            )
+            initData: abi.encode("eip155:11155111", abi.encode(_config(cea, prc20, stakeDummy, maxPCPerCall)))
         });
 
         ActionData[] memory actions = new ActionData[](1);
@@ -152,7 +158,7 @@ contract GrantMandate is Script {
     function _config(address cea, address prc20, address stakeDummy, uint256 maxPCPerCall)
         internal
         view
-        returns (IURP.Config memory)
+        returns (IURP.UniversalTerms memory)
     {
         IURP.AllowedCall[] memory allowed = new IURP.AllowedCall[](2);
 
@@ -174,16 +180,17 @@ contract GrantMandate is Script {
             maxValue: 0
         });
 
-        return IURP.Config({
-            initialized: false,
+        // THE WIRE TYPE, not the storage struct. `UniversalTerms` carries only what the OWNER
+        // decides; `initialized`, `spent` and the `destChainHash` relic are URP's own business and
+        // are no longer typed here at all. The chain moved out to the envelope, where it is stated
+        // once and verified against the asset.
+        return IURP.UniversalTerms({
             validUntil: uint48(block.timestamp) + VALIDITY,
-            destChainHash: BobPayload.chainHash("11155111"),
             expectedCEA: cea,
             asset: prc20,
             maxAmountPerCall: Amounts.perCall(),
             maxAmountTotal: Amounts.total(),
             maxPCPerCall: maxPCPerCall,
-            spent: 0,
             allowedCalls: allowed
         });
     }

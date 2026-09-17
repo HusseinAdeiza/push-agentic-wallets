@@ -16,6 +16,10 @@ import { ERC20 } from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
 contract MockPRC20 is ERC20 {
     constructor() ERC20("USDC.eth", "USDC.eth") { }
 
+    /// @dev The origin chain, which URP reads at universal init and compares against the chain
+    ///      the policy envelope declares. The live `USDC.eth` on Donut answers exactly this.
+    string public constant SOURCE_CHAIN_NAMESPACE = "eip155:11155111";
+
     function decimals() public pure override returns (uint8) {
         return 6;
     }
@@ -93,7 +97,7 @@ contract AgentSigningLiveTest is BaseTest {
             IURP.Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 7 days),
-                destChainHash: keccak256(abi.encode("eip155", "11155111")),
+                destChainHash: bytes32(0), // v2 relic; the chain lives in the envelope now
                 expectedCEA: EXPECTED_CEA,
                 asset: address(pUSDC),
                 maxAmountPerCall: STAKE,
@@ -130,7 +134,7 @@ contract AgentSigningLiveTest is BaseTest {
      */
     function test_opHash_equalsTheWalletsOwn() public {
         vm.prank(owner);
-        bytes32 permissionId = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()), MandateType.UNIVERSAL);
+        bytes32 permissionId = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()));
 
         bytes memory ecd = _executionCalldata();
         bytes32 mode = ModeCode.unwrap(ModeLib.encodeSimpleSingle());
@@ -184,7 +188,7 @@ contract AgentSigningLiveTest is BaseTest {
      */
     function test_opHash_wrongFieldIsRejected() public {
         vm.prank(owner);
-        bytes32 permissionId = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()), MandateType.UNIVERSAL);
+        bytes32 permissionId = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()));
 
         bytes memory ecd = _executionCalldata();
         bytes32 mode = ModeCode.unwrap(ModeLib.encodeSimpleSingle());
@@ -204,7 +208,7 @@ contract AgentSigningLiveTest is BaseTest {
     ///      byte first, permission id in bytes 1:33. Asserted through acceptance, not by reading.
     function test_envelope_isAcceptedByTheWallet() public {
         vm.prank(owner);
-        bytes32 permissionId = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()), MandateType.UNIVERSAL);
+        bytes32 permissionId = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()));
 
         bytes memory ecd = _executionCalldata();
         bytes32 mode = ModeCode.unwrap(ModeLib.encodeSimpleSingle());

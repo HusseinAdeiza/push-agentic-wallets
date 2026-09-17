@@ -4,6 +4,7 @@ pragma solidity 0.8.26;
 import { Vm } from "forge-std/Vm.sol";
 
 import { BaseTest } from "../Base.t.sol";
+import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
 import { MandateType } from "../../src/libraries/PushWalletTypes.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
@@ -28,8 +29,13 @@ contract PushAgentWalletLifecycleTest is BaseTest {
     PushAgentWallet internal wallet;
     address internal WALLET_OWNER;
 
+    /// @dev The mandate asset. A real PRC20 mock, not an EOA: URP interrogates the asset at
+    ///      universal init and an address with no code is refused `InvalidAsset` by design.
+    address internal PRC20;
+
     function setUp() public override {
         super.setUp();
+        PRC20 = address(new MockPRC20());
         WALLET_OWNER = makeAddr("walletOwner");
         wallet = newWallet(WALLET_OWNER);
         vm.deal(address(wallet), 100 ether);
@@ -56,7 +62,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
                 validUntil: uint48(block.timestamp + 365 days),
                 destChainHash: keccak256("eip155:11155111"),
                 expectedCEA: _addr("cea"),
-                asset: _addr("prc20"),
+                asset: PRC20,
                 maxAmountPerCall: 100 ether,
                 maxAmountTotal: 1000 ether,
                 maxPCPerCall: 5 ether,
@@ -73,14 +79,14 @@ contract PushAgentWalletLifecycleTest is BaseTest {
 
     function _grant(Session memory s) internal returns (bytes32) {
         vm.prank(WALLET_OWNER);
-        return wallet.grantMandate(s, MandateType.UNIVERSAL);
+        return wallet.grantMandate(s);
     }
 
     /// @dev Assert a deviation is refused with the ONE error the shape check ever raises.
     function _expectMalformed(Session memory s) internal {
         vm.prank(WALLET_OWNER);
         vm.expectRevert(PushWalletErrors.MalformedSessionShape.selector);
-        wallet.grantMandate(s, MandateType.UNIVERSAL);
+        wallet.grantMandate(s);
     }
 
     // ═══════════════════════════════════ W-24 ═══════════════════════════════════
@@ -125,12 +131,26 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         _expectMalformed(s);
     }
 
-    /// Rule 1 under UNIVERSAL: still exactly one action. PRESERVED VERBATIM through the 2026-09-09
-    /// rewrite — the one-action rule was relaxed for NATIVE only, never for UNIVERSAL.
+    /**
+     * Rule 1: a mandate must authorise at least one action.
+     *
+     * THE ERROR CHANGED ON 2026-09-17 AND THE "PRESERVED VERBATIM" NOTE THIS CARRIED IS GONE WITH
+     * IT, because it is no longer true. Zero actions is now `TooManyActions(0)` rather than
+     * `MalformedSessionShape`, for both modes, and the reason is structural rather than cosmetic:
+     * the mode is derived from action 0's policy envelope, so with no actions there is no envelope,
+     * no chain, and therefore no mode to report a shape violation against. The count check must run
+     * before the derivation, so it answers first.
+     *
+     * The one-action rule under UNIVERSAL is unchanged and still `MalformedSessionShape` — see
+     * `test_W24_Deviation_TwoActions`.
+     */
     function test_W24_Deviation_ZeroActions() public {
         Session memory s = _canonical();
         s.actions = new ActionData[](0);
-        _expectMalformed(s);
+
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.TooManyActions.selector, uint256(0)));
+        wallet.grantMandate(s);
     }
 
     /// ⚠️ THE ASSERTION §8.2 REQUIRES BE PRESERVED. Under `UNIVERSAL` a second action is still
@@ -168,7 +188,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
 
     function _grantNative(Session memory s) internal returns (bytes32) {
         vm.prank(WALLET_OWNER);
-        return wallet.grantMandate(s, MandateType.NATIVE);
+        return wallet.grantMandate(s);
     }
 
     /// One action is a legal native mandate.
@@ -193,7 +213,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         Session memory s = _nativeSession(new ActionData[](0));
         vm.prank(WALLET_OWNER);
         vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.TooManyActions.selector, uint256(0)));
-        wallet.grantMandate(s, MandateType.NATIVE);
+        wallet.grantMandate(s);
     }
 
     function test_W24_Native_NineActionsRejected() public {
@@ -204,7 +224,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         Session memory s = _nativeSession(a);
         vm.prank(WALLET_OWNER);
         vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.TooManyActions.selector, uint256(9)));
-        wallet.grantMandate(s, MandateType.NATIVE);
+        wallet.grantMandate(s);
     }
 
     /// The same (target, selector) twice would hash to one actionId.
@@ -218,7 +238,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         Session memory s = _nativeSession(a);
         vm.prank(WALLET_OWNER);
         vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.DuplicateAction.selector, t, sel));
-        wallet.grantMandate(s, MandateType.NATIVE);
+        wallet.grantMandate(s);
     }
 
     /// The COMMON rules apply identically to both types.
@@ -230,7 +250,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         s.permitERC4337Paymaster = true;
         vm.prank(WALLET_OWNER);
         vm.expectRevert(PushWalletErrors.MalformedSessionShape.selector);
-        wallet.grantMandate(s, MandateType.NATIVE);
+        wallet.grantMandate(s);
     }
 
     /// A wrong POLICY is `MalformedSessionShape` in BOTH modes — the invariant, stated once.
@@ -247,7 +267,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         Session memory s = _nativeSession(a);
         vm.prank(WALLET_OWNER);
         vm.expectRevert(PushWalletErrors.MalformedSessionShape.selector);
-        wallet.grantMandate(s, MandateType.NATIVE);
+        wallet.grantMandate(s);
     }
 
     /**
@@ -269,7 +289,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
                 PushWalletErrors.MandateTypeMismatch.selector, MandateType.UNIVERSAL, uint256(0), wrong
             )
         );
-        wallet.grantMandate(s, MandateType.UNIVERSAL);
+        wallet.grantMandate(s);
     }
 
     /// Same rewrite: the gateway with the wrong selector is still a type mismatch, and the reported
@@ -284,7 +304,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
                 PushWalletErrors.MandateTypeMismatch.selector, MandateType.UNIVERSAL, uint256(0), GATEWAY
             )
         );
-        wallet.grantMandate(s, MandateType.UNIVERSAL);
+        wallet.grantMandate(s);
     }
 
     /// Rule 4 — THE FAIL-CLOSED ANCHOR. Zero action policies would mean the engine's minimum-one
@@ -354,7 +374,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         Session memory s = _canonical();
         vm.prank(AGENT);
         vm.expectRevert(PushWalletErrors.NotOwner.selector);
-        wallet.grantMandate(s, MandateType.UNIVERSAL);
+        wallet.grantMandate(s);
     }
 
     /// grantMandate does NOT validate URP's config CONTENTS — that is URP's own job, and it fails
@@ -389,7 +409,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         // arrives as itself.
         vm.prank(WALLET_OWNER);
         vm.expectRevert(IURP.InvalidConfigField.selector);
-        wallet.grantMandate(s, MandateType.UNIVERSAL);
+        wallet.grantMandate(s);
     }
 
     // ═══════════════════════════════════ W-17 ═══════════════════════════════════
@@ -465,7 +485,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
     function test_W15_OtherWalletsIdIsAGhost() public {
         PushAgentWallet other = newWallet(WALLET_OWNER);
         vm.prank(WALLET_OWNER);
-        bytes32 theirs = other.grantMandate(_canonical(), MandateType.UNIVERSAL);
+        bytes32 theirs = other.grantMandate(_canonical());
 
         vm.prank(WALLET_OWNER);
         vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.UnknownPermission.selector, theirs));
@@ -532,7 +552,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
      * W-10 — THE CANONICAL PERMISSION-CHANGE FLOW, in ONE owner signature, ONE execute batch.
      *
      * There is no "reconfigure". Change is atomic revoke-and-regrant:
-     *     URP.assertSpent(old) -> stopMandate(old) -> grantMandate(new, MandateType.UNIVERSAL) -> approval payload
+     *     URP.assertSpent(old) -> stopMandate(old) -> grantMandate(new) -> approval payload
      *
      * The two lifecycle legs target the WALLET, so they arrive with `msg.sender == address(this)`
      * and reach `onlyOwnerOrSelf`. That modifier exists for exactly this batch (ruling A).
@@ -581,9 +601,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
             target: address(wallet), value: 0, callData: abi.encodeCall(PushAgentWallet.stopMandate, (oldPid))
         });
         batch[2] = Execution({
-            target: address(wallet),
-            value: 0,
-            callData: abi.encodeCall(PushAgentWallet.grantMandate, (_canonical(), MandateType.UNIVERSAL))
+            target: address(wallet), value: 0, callData: abi.encodeCall(PushAgentWallet.grantMandate, (_canonical()))
         });
         batch[3] = Execution({
             target: token,
@@ -672,15 +690,14 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         for (uint256 i; i < grantLogs.length; ++i) {
             if (
                 grantLogs[i].emitter == address(wallet)
-                    && grantLogs[i].topics[0] == keccak256("MandateGranted(bytes32,uint8)")
+                    && grantLogs[i].topics[0] == keccak256("MandateGranted(bytes32,uint8,bytes32,string)")
             ) {
                 assertEq(grantLogs[i].topics[1], pid, "MandateGranted carries the returned id");
-                // The type is an unindexed enum, so it lands in `data` as a padded uint8.
-                assertEq(
-                    abi.decode(grantLogs[i].data, (uint8)),
-                    uint8(MandateType.UNIVERSAL),
-                    "MandateGranted carries the declared type"
-                );
+                assertEq(grantLogs[i].topics[2], keccak256(bytes(CHAIN_SEPOLIA)), "and the chain it was granted for");
+                // The type and the chain string are unindexed, so they land in `data`.
+                (uint8 mode, string memory chain) = abi.decode(grantLogs[i].data, (uint8, string));
+                assertEq(mode, uint8(MandateType.UNIVERSAL), "MandateGranted carries the DERIVED type");
+                assertEq(chain, CHAIN_SEPOLIA, "and the chain string, for human readers");
                 sawGrant = true;
             }
         }
@@ -713,7 +730,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         // the config exists and is initialised
         IURP.Config memory before = urp.getConfig(ConfigId.wrap(configId), address(wallet));
         assertTrue(before.initialized, "URP config written during the grant");
-        assertEq(before.asset, _addr("prc20"), "and carries the terms");
+        assertEq(before.asset, PRC20, "and carries the terms");
 
         vm.prank(WALLET_OWNER);
         wallet.stopMandate(pid);

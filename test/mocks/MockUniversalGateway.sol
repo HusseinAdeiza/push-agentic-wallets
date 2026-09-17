@@ -74,6 +74,19 @@ contract MockPRC20 {
     string public constant symbol = "pUSDC";
     uint8 public constant decimals = 6;
 
+    /// @dev The CAIP-2 chain this token came from. URP reads this at universal init and compares it
+    ///      to the chain the policy envelope declares; the real gateway reads the same view on every
+    ///      outbound to decide where to route. Defaults to Sepolia because pUSDC is the Sepolia USDC
+    ///      — the live `USDC.eth` on Donut answers exactly this string.
+    ///
+    ///      OBSERVER, NOT ORACLE: this supplies the string, URP does the hashing and the comparing.
+    string public SOURCE_CHAIN_NAMESPACE = "eip155:11155111";
+
+    /// @dev Test-only. The real PRC20 sets this once in `initialize` and has no setter.
+    function setSourceChainNamespace(string calldata ns) external {
+        SOURCE_CHAIN_NAMESPACE = ns;
+    }
+
     mapping(address => uint256) public balanceOf;
     mapping(address => mapping(address => uint256)) public allowance;
 

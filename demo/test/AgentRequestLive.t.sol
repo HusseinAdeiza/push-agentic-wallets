@@ -15,6 +15,10 @@ import { MockUniversalGateway } from "../../test/mocks/MockUniversalGateway.sol"
 contract MockPRC20b is ERC20 {
     constructor() ERC20("USDC.eth", "USDC.eth") { }
 
+    /// @dev The origin chain, which URP reads at universal init and compares against the chain
+    ///      the policy envelope declares. The live `USDC.eth` on Donut answers exactly this.
+    string public constant SOURCE_CHAIN_NAMESPACE = "eip155:11155111";
+
     function decimals() public pure override returns (uint8) {
         return 6;
     }
@@ -78,7 +82,7 @@ contract AgentRequestLiveTest is BaseTest {
             IURP.Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 7 days),
-                destChainHash: keccak256(abi.encode("eip155", "11155111")),
+                destChainHash: bytes32(0), // v2 relic; the chain lives in the envelope now
                 expectedCEA: EXPECTED_CEA,
                 asset: address(pUSDC),
                 maxAmountPerCall: AMOUNT,
@@ -104,7 +108,7 @@ contract AgentRequestLiveTest is BaseTest {
      */
     function test_opHashIsRecoverableFromTheEvent() public {
         vm.prank(owner);
-        bytes32 pid = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()), MandateType.UNIVERSAL);
+        bytes32 pid = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()));
 
         bytes memory ecd = _exec();
         bytes32 mode = Requests.singleMode();
@@ -137,7 +141,7 @@ contract AgentRequestLiveTest is BaseTest {
     /// @dev The indexed fields live in topics, not data — which is why `data` holds only two words.
     function test_indexedFieldsAreInTopics() public {
         vm.prank(owner);
-        bytes32 pid = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()), MandateType.UNIVERSAL);
+        bytes32 pid = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()));
 
         bytes memory ecd = _exec();
         bytes32 mode = Requests.singleMode();
@@ -166,7 +170,7 @@ contract AgentRequestLiveTest is BaseTest {
     ///      successful run is itself the assertion that the encoding is right.
     function test_requestsLibraryProducesAnAcceptedOutbound() public {
         vm.prank(owner);
-        bytes32 pid = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()), MandateType.UNIVERSAL);
+        bytes32 pid = agw.grantMandate(canonicalSession(ecdsaConfig(agent), _config()));
 
         bytes memory ecd = _exec();
         bytes32 mode = Requests.singleMode();

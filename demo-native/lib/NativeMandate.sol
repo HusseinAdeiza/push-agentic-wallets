@@ -5,7 +5,7 @@ import { Session, ActionData, PolicyData, ERC7739Data, ERC7739Context } from "sm
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
 
 import { IURP } from "../../src/interfaces/IURP.sol";
-import { MandateType } from "../../src/libraries/PushWalletTypes.sol";
+import { Strings } from "@openzeppelin/contracts/utils/Strings.sol";
 
 import { AddressBook } from "./AddressBook.sol";
 import { Amounts } from "./Amounts.sol";
@@ -240,8 +240,29 @@ library NativeMandate {
         });
     }
 
-    /// @dev The mode wrapper. See the contract notes — this is not optional and not cosmetic.
-    function _initData(IURP.NativeConfig memory cfg) private pure returns (bytes memory) {
-        return abi.encode(uint8(MandateType.NATIVE), abi.encode(cfg));
+    /**
+     * @dev THE POLICY ENVELOPE: `abi.encode(string chain, bytes body)`.
+     *
+     *      NOBODY DECLARES A MANDATE'S KIND any more. The chain string decides it — this chain means
+     *      a Push-side call, so the wallet derives NATIVE and URP derives NATIVE independently from
+     *      these same bytes. Changing the string is the only way to change the mode.
+     *
+     *      THE CHAIN IS BUILT FROM `block.chainid`, NEVER A LITERAL. A hard-coded "eip155:42101"
+     *      would silently produce a UNIVERSAL mandate anywhere else — on a local anvil fork, on a
+     *      future testnet, on mainnet — and the failure would surface as a target mismatch rather
+     *      than as the wrong chain string.
+     */
+    function _initData(IURP.NativeConfig memory cfg) private view returns (bytes memory) {
+        IURP.NativeTerms memory terms = IURP.NativeTerms({
+            validUntil: cfg.validUntil,
+            target: cfg.target,
+            selector: cfg.selector,
+            maxValuePerCall: cfg.maxValuePerCall,
+            maxValueTotal: cfg.maxValueTotal,
+            amount: cfg.amount,
+            maxCalls: cfg.maxCalls,
+            pins: cfg.pins
+        });
+        return abi.encode(string.concat("eip155:", Strings.toString(block.chainid)), abi.encode(terms));
     }
 }
