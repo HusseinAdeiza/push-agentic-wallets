@@ -319,8 +319,33 @@ contract URPTest is BaseTest {
             "allowedCalls"
         ];
         uint256[10] memory universalSlots = [uint256(0), 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        // OFFSET AND TYPE ARE PINNED TOO, not just the slot. A retype that keeps every slot number —
+        // `uint48 validUntil` to `uint64`, `address expectedCEA` to `bytes32` — changes how the
+        // packed bytes of slot 0 are read while leaving the slot column untouched. Slot-only
+        // assertions would wave that through.
+        uint256[10] memory universalOffsets = [uint256(0), 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        string[10] memory universalTypes = [
+            "t_bool",
+            "t_uint48",
+            "t_bytes32",
+            "t_address",
+            "t_address",
+            "t_uint256",
+            "t_uint256",
+            "t_uint256",
+            "t_uint256",
+            // Prefix only: the artifact appends a build-varying numeric id to composite types.
+            "t_array(t_struct(AllowedCall)"
+        ];
 
-        _assertStructLayout("Config", universalLabels.length, _toDyn(universalLabels), _toDyn(universalSlots));
+        _assertStructLayout(
+            "Config",
+            universalLabels.length,
+            _toDyn(universalLabels),
+            _toDyn(universalSlots),
+            _toDyn(universalOffsets),
+            _toDyn(universalTypes)
+        );
 
         string[12] memory nativeLabels = [
             "initialized",
@@ -341,8 +366,32 @@ contract URPTest is BaseTest {
         // not derived by hand — a first draft of this test guessed 6 and 8 and was wrong, which is
         // itself the argument for pinning these against solc's output rather than arithmetic.
         uint256[12] memory nativeSlots = [uint256(0), 0, 0, 0, 1, 2, 3, 4, 7, 8, 8, 9];
+        // Slot 0 packs four members and slot 8 packs two; those offsets are the whole reason a
+        // slot-only assertion would be insufficient here.
+        uint256[12] memory nativeOffsets = [uint256(0), 1, 7, 27, 0, 0, 0, 0, 0, 0, 4, 0];
+        string[12] memory nativeTypes = [
+            "t_bool",
+            "t_uint48",
+            "t_address",
+            "t_bytes4",
+            "t_uint256",
+            "t_uint256",
+            "t_uint256",
+            "t_struct(AmountRule)",
+            "t_uint256",
+            "t_uint32",
+            "t_uint32",
+            "t_array(t_struct(ArgPin)"
+        ];
 
-        _assertStructLayout("NativeConfig", nativeLabels.length, _toDyn(nativeLabels), _toDyn(nativeSlots));
+        _assertStructLayout(
+            "NativeConfig",
+            nativeLabels.length,
+            _toDyn(nativeLabels),
+            _toDyn(nativeSlots),
+            _toDyn(nativeOffsets),
+            _toDyn(nativeTypes)
+        );
     }
 
     /// @dev Reads one struct's member slots out of URP's compiled artifact and compares them.
@@ -350,7 +399,9 @@ contract URPTest is BaseTest {
         string memory structName,
         uint256 count,
         string[] memory labels,
-        uint256[] memory slots
+        uint256[] memory slots,
+        uint256[] memory offsets,
+        string[] memory types
     ) internal view {
         string memory artifact = vm.readFile("out/URP.sol/URP.json");
         string[] memory typeKeys = vm.parseJsonKeys(artifact, ".storageLayout.types");
@@ -386,6 +437,18 @@ contract URPTest is BaseTest {
                 vm.parseJsonUint(artifact, string.concat(at, ".slot")),
                 slots[i],
                 string.concat(structName, ": ", labels[i], " moved slot - every live config would misread")
+            );
+            assertEq(
+                vm.parseJsonUint(artifact, string.concat(at, ".offset")),
+                offsets[i],
+                string.concat(structName, ": ", labels[i], " moved within its slot - packed bytes would shift")
+            );
+            // PREFIX, not equality: composite type keys carry a build-varying numeric id
+            // (`t_array(t_struct(AllowedCall)71575_storage)dyn_storage`), so pinning the whole
+            // string would break on an unrelated recompile. The prefix still catches a retype.
+            assertTrue(
+                _startsWith(vm.parseJsonString(artifact, string.concat(at, ".type")), types[i]),
+                string.concat(structName, ": ", labels[i], " changed type - same slot, different meaning")
             );
         }
     }

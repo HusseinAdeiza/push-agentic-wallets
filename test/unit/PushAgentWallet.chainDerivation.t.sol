@@ -5,6 +5,7 @@ import { Vm } from "forge-std/Vm.sol";
 
 import { BaseTest } from "../Base.t.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
+import { URP } from "../../src/policies/URP.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
 import { IURP } from "../../src/interfaces/IURP.sol";
 import { MandateType, SEND_OUTBOUND_SELECTOR } from "../../src/libraries/PushWalletTypes.sol";
@@ -296,6 +297,44 @@ contract PushAgentWalletChainDerivationTest is BaseTest {
 
         ActionData[] memory a = new ActionData[](1);
         a[0] = ActionData({ actionTargetSelector: STAKE, actionTarget: address(stakeDummy), actionPolicies: ps });
+
+        vm.prank(WALLET_OWNER);
+        vm.expectRevert(PushWalletErrors.MalformedSessionShape.selector);
+        wallet.grantMandate(_session(a));
+    }
+
+    /**
+     * ⚠️ MUTATION TEST FOR THE PER-ACTION SHAPE CHECK — and the gap that made it necessary.
+     *
+     * Every test above puts its bad policy on ACTION 0, which the pre-loop check catches. Nothing
+     * exercised the `_requirePolicyShape(a)` inside the native loop: deleting that line left the
+     * ENTIRE SUITE GREEN (376/376). Measured, twice — once by the architecture review, once here.
+     *
+     * WHAT THE MISSING LINE WOULD COST: a native mandate whose third action names a foreign policy
+     * with a well-formed envelope would be GRANTED, and the engine would install that policy for
+     * that action. The agent would then hold an action with no URP gate on it at all — no caps, no
+     * pins, no expiry — while the mandate as a whole looked correctly formed. Owner-authored rather
+     * than attacker-reachable, but it breaks both the stated invariant ("a wrong POLICY is always
+     * `MalformedSessionShape`") and the system promise that every agent action passes URP.
+     *
+     * The bad policy is a REAL, FRESHLY DEPLOYED URP rather than an EOA, and its envelope is valid:
+     * that removes every incidental reason this could revert — no missing code, no decode failure —
+     * leaving the shape check as the only thing that can refuse it. A test that reverts for the
+     * wrong reason would pass here while the guard was gone.
+     */
+    function test_Grant_nonUrpPolicyOnLaterActionRefused() public {
+        bytes memory goodEnvelope =
+            envelope(nativeChain(), abi.encode(_terms(_nativeCfg(address(stakeDummy), bytes4(0x22222222)))));
+
+        PolicyData[] memory impostor = new PolicyData[](1);
+        impostor[0] = PolicyData({ policy: address(new URP()), initData: goodEnvelope });
+
+        ActionData[] memory a = new ActionData[](3);
+        a[0] = _nativeAction(nativeChain(), STAKE);
+        a[1] = _nativeAction(nativeChain(), bytes4(0x11111111));
+        a[2] = ActionData({
+            actionTargetSelector: bytes4(0x22222222), actionTarget: address(stakeDummy), actionPolicies: impostor
+        });
 
         vm.prank(WALLET_OWNER);
         vm.expectRevert(PushWalletErrors.MalformedSessionShape.selector);

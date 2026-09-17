@@ -230,8 +230,11 @@ contract Deploy is Script {
      *      source-versus-deployed drift measured on 2026-09-17. `getOriginForUEA` reads the same
      *      admin-set string through a function that is actually live.
      *
-     *      (3) is skipped rather than failed when `UEA_FACTORY` is unset or has no code, because a
-     *      local anvil run has no core deployment and must still be able to deploy.
+     *      (3) IS SKIPPED ONLY ON A LOCAL CHAIN, and only because anvil has no core deployment. It
+     *      is NOT skipped when `UEA_FACTORY` is merely unset or mistyped: a check that silently
+     *      disappears on a typo is the "a skipped test is not a passing test" defect, sitting in the
+     *      deploy path that decision 90 says must STOP. Off 31337 the variable is mandatory and the
+     *      address must have code, matching how `FACTORY_ADMIN` is handled above.
      */
     function _assertChainIdentity(URP urp) internal view {
         bytes32 expected = keccak256(bytes(string.concat("eip155:", vm.toString(block.chainid))));
@@ -244,8 +247,10 @@ contract Deploy is Script {
             );
         }
 
-        address ueaFactory = vm.envOr("UEA_FACTORY", address(0));
-        if (ueaFactory == address(0) || ueaFactory.code.length == 0) return;
+        if (block.chainid == 31_337) return;
+
+        address ueaFactory = vm.envAddress("UEA_FACTORY");
+        require(ueaFactory.code.length != 0, "UEA_FACTORY has no code - wrong address or wrong chain");
 
         (UniversalAccountId memory origin, bool isUEA) = IUEAFactoryOrigin(ueaFactory).getOriginForUEA(address(0xdEaD));
         require(!isUEA, "the probe address is a registered UEA - pick another");

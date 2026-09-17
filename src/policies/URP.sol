@@ -826,6 +826,15 @@ contract URP is IURP, Initializable {
      *         initialised UNIVERSAL mandate, but no chain was ever recorded for it, so the zero it
      *         returns here is the honest answer — "unverified", not "chain zero". Deriving a chain
      *         for such a config would be inventing one.
+     *
+     *         THE TWO FIELDS ANSWER DIFFERENT QUESTIONS, deliberately: `initialized`/`mode` is "is
+     *         there a rulebook, and which one" — legacy-aware, so pre-envelope configs still answer;
+     *         `chainHash` is "was a chain declared and verified" — zero means no.
+     *
+     *         AND FOR SUCH A CONFIG, DO NOT GO LOOKING IN `getConfig(...).destChainHash` INSTEAD. It
+     *         may hold a value the SDK wrote before the envelope existed, under any of the four
+     *         conventions that field accumulated, and NOTHING EVER VERIFIED IT. A zero here is more
+     *         truthful than a number there.
      * @param  id       Config id identifying the mandate.
      * @param  account  The wallet the mandate belongs to.
      * @return The stored mode record.

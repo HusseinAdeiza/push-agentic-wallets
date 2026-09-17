@@ -188,6 +188,15 @@ contract URPTeethTest is BaseTest {
         cfg.target = hostileTarget;
         cfg.selector = bytes4(keccak256("stake(uint256)"));
 
+        // ⚠️ THE ASSERTION THAT MAKES THE NAME TRUE. Count 0 means "must never be called", and empty
+        // calldata matches ANY calldata — so this fails if native init calls the target with any
+        // selector at all, not merely with `SOURCE_CHAIN_NAMESPACE()`.
+        //
+        // Without it, this test rested on the mock reverting, which proves only that URP did not
+        // make the ONE call the mock rejects. A call with a different selector would have gone
+        // unobserved, and the test would have kept its name while covering less than it claimed.
+        vm.expectCall(hostileTarget, "", 0);
+
         vm.prank(address(engine));
         urp.initializeWithMultiplexer(ACCOUNT, CID, nativeInitData(cfg));
 
