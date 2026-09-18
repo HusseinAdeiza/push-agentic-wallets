@@ -253,16 +253,28 @@ library NativeMandate {
      *      than as the wrong chain string.
      */
     function _initData(IURP.NativeConfig memory cfg) private view returns (bytes memory) {
-        IURP.NativeTerms memory terms = IURP.NativeTerms({
-            validUntil: cfg.validUntil,
-            target: cfg.target,
-            selector: cfg.selector,
-            maxValuePerCall: cfg.maxValuePerCall,
-            maxValueTotal: cfg.maxValueTotal,
-            amount: cfg.amount,
-            maxCalls: cfg.maxCalls,
-            pins: cfg.pins
-        });
-        return abi.encode(string.concat("eip155:", Strings.toString(block.chainid)), abi.encode(terms));
+        return abi.encode(_thisChain(), abi.encode(_terms(cfg)));
+    }
+
+    /**
+     * @dev SPLIT OUT FOR STACK DEPTH, not for tidiness. Building the eight-field struct literal and
+     *      the chain string in one expression puts this three slots too deep under `via_ir` - the
+     *      same hazard `_unstakeConfig` documents above. Two statements, two frames, no juggling.
+     */
+    function _terms(IURP.NativeConfig memory cfg) private pure returns (IURP.NativeTerms memory t) {
+        t.validUntil = cfg.validUntil;
+        t.target = cfg.target;
+        t.selector = cfg.selector;
+        t.maxValuePerCall = cfg.maxValuePerCall;
+        t.maxValueTotal = cfg.maxValueTotal;
+        t.amount = cfg.amount;
+        t.maxCalls = cfg.maxCalls;
+        t.pins = cfg.pins;
+    }
+
+    /// @dev This chain's CAIP-2 identifier, from `block.chainid` and never a literal - a hard-coded
+    ///      "eip155:42101" would derive UNIVERSAL anywhere else and fail as a target mismatch.
+    function _thisChain() private view returns (string memory) {
+        return string.concat("eip155:", Strings.toString(block.chainid));
     }
 }

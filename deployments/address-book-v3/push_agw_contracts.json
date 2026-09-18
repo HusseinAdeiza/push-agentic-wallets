@@ -1,0 +1,138 @@
+{
+  "generation": "v3.2",
+  "chainId": 42101,
+  "network": "Push Chain Donut testnet",
+  "explorer": "https://donut.push.network",
+  "deployedAtBlock": 23296330,
+  "commit": "67929f208886187ec7bab5479d4036d45394cfb1",
+  "branch": "pushAgenticWallet_v3",
+  "engineForkCommit": "7dc20e4",
+  "deployer": "0xa89523351BE1e2De64937AA9AF61Ae06eAd199C7",
+  "totalGasUsed": 13782317,
+  "toolchain": {
+    "solc": "0.8.26",
+    "optimizerRuns": 833,
+    "evmVersion": "cancun",
+    "viaIR": true,
+    "forge": "1.5.1-stable (b0a9dd9ceda36f63e2326ce530c10e6916f4b8a2)"
+  },
+
+  "whatChangedFromV2": "THE MANDATE MODE IS NO LONGER DECLARED BY ANYONE. `grantMandate` takes ONE argument (the session) instead of two; the policy envelope is `abi.encode(string chain, bytes body)` instead of `abi.encode(uint8 mode, bytes body)`; and the wallet and URP each DERIVE the mode from that one chain string, independently, from byte-identical input. A universal grant additionally verifies the declared chain against the asset's own `SOURCE_CHAIN_NAMESPACE()` - the same view the gateway reads on every outbound to decide routing - so the chain is enforced rather than merely recorded. Every address below is new; v2 mandates do not carry over.",
+
+  "contracts": {
+    "factoryProxy": {
+      "address": "0x2578041963f692f8b51A137A1c7ddc0c84a8226A",
+      "contract": "ERC1967Proxy -> AGWFactory",
+      "runtimeSize": 141,
+      "verified": true,
+      "explorerName": "AGWFactory",
+      "note": "THE USER-FACING ADDRESS. Every integration points here. Permanent: the wallet salt derivation and the 40-byte immutable-args encoding are frozen forever, because counterfactual funding is a supported flow with no recovery path.",
+      "liveChecks": [
+        "walletImplementation() -> 0xD7FEF338572f96edBeF89E720f1F0fF1284ec79C",
+        "defaultAdminDelay() -> 172800 (48h)",
+        "hasRole(DEFAULT_ADMIN_ROLE, deployer) -> true",
+        "deployWallet(\"smoke-v3\") deployed a real clone; walletCount(deployer) -> 1"
+      ]
+    },
+    "factoryLogic": {
+      "address": "0x517a10C2F2E786CC8271dbD489dFE27dE8F7BE67",
+      "contract": "AGWFactory",
+      "runtimeSize": 8300,
+      "verified": true,
+      "note": "UUPS implementation. Never called directly. Unchanged in source from v2 - redeployed only because the wallet implementation it points at changed."
+    },
+    "walletImplementation": {
+      "address": "0xD7FEF338572f96edBeF89E720f1F0fF1284ec79C",
+      "contract": "PushAgentWallet",
+      "runtimeSize": 12312,
+      "verified": true,
+      "note": "Clone template. Every wallet is a minimal clone of this with 40 bytes of immutable args (owner 0-19, factory 20-39). NEW IN v3.2: `grantMandate(Session)` - one argument, no MandateType; the mode is derived from the chain each action's policy envelope declares, and every action must declare the same chain (`InconsistentChain(i)`). Its `urp` arg is the PROXY, so wallets keep working across URP upgrades. Grew 11,626 -> 12,312 B.",
+      "constructorArgs": {
+        "sessionEngine": "0x046B2874Fc9F920ad53A317b3cf9d3d1974466f3",
+        "urp": "0xeAd99E254ACD64219d057400cdC2A2390bC74372",
+        "sessionValidator": "0xF77660838Cebb65BD6357FDe71d19f97CC65E829",
+        "universalGatewayPC": "0x00000000000000000000000000000000000000C1"
+      },
+      "liveChecks": [
+        "urp() -> the PROXY, not the implementation",
+        "accountId() -> \"push.agentwallet.1.0.0\""
+      ]
+    },
+    "urp": {
+      "address": "0xeAd99E254ACD64219d057400cdC2A2390bC74372",
+      "contract": "TransparentUpgradeableProxy -> URP",
+      "runtimeSize": 830,
+      "verified": true,
+      "explorerName": "URP",
+      "note": "THE POLICY ADDRESS. Every wallet pins this; every session names it as its only action policy. The explorer resolves it as an EIP-1967 proxy and serves URP's verified source here - see README, 'Reading the verification fields'.",
+      "liveChecks": [
+        "version() -> \"1.0.0\"",
+        "UNIVERSAL_GATEWAY_PC() -> 0x...00C1",
+        "UNIVERSAL_EXECUTOR_MODULE() -> 0x1419...D7d7",
+        "SESSION_ENGINE() -> 0x046B...66f3",
+        "pushChainHash() -> 0x3d6bc1f1d3fb03065860265a8e93840b586e57075d956cd41b4319d040be87f9 == keccak256(\"eip155:42101\"), computed from block.chainid, NOT configured"
+      ]
+    },
+    "urpImplementation": {
+      "address": "0xc95f179D3aDE283E11CF90f3F8E04BFE8534ff4F",
+      "contract": "URP",
+      "runtimeSize": 13176,
+      "verified": true,
+      "note": "The two-rulebook security boundary: sixteen gates for a cross-chain mandate, nine for a Push-side one. Which runs is decided by the mode stored at init, which was derived from the envelope's chain. NEW IN v3.2: the envelope decoder, `pushChainHash()`, and the init-time asset-chain check (`ChainMismatch` / `InvalidAsset`). Grew 12,134 -> 13,176 B. NEVER initialise this directly; its constructor disables the initialiser."
+    },
+    "urpProxyAdmin": {
+      "address": "0xA634a0cB4F374D89B2cccbdc77300c8Ac3827BF4",
+      "contract": "ProxyAdmin",
+      "runtimeSize": 926,
+      "verified": true,
+      "note": "KEEP THIS ADDRESS - no URP upgrade is possible without it. TUP creates it internally and returns it nowhere; it was read from the URP proxy's ERC-1967 admin slot and confirmed live. VERIFIED THIS TIME, unlike v2: the explorer previously refused inner-CREATE contracts with is_contract:false. Owner is the deployer EOA for testnet; production should hold this in a multisig.",
+      "liveChecks": ["owner() -> 0xa89523351BE1e2De64937AA9AF61Ae06eAd199C7"]
+    },
+    "sessionValidator": {
+      "address": "0xF77660838Cebb65BD6357FDe71d19f97CC65E829",
+      "contract": "PushSessionValidator",
+      "runtimeSize": 1720,
+      "verified": true,
+      "note": "Stateless signature check: secp256k1, or Ed25519 via a raw staticcall to the USV precompile. Unchanged in source from v2."
+    },
+    "sessionEngine": {
+      "address": "0x046B2874Fc9F920ad53A317b3cf9d3d1974466f3",
+      "contract": "SmartSession",
+      "runtimeSize": 22581,
+      "verified": true,
+      "note": "Vendored fork 7dc20e4, adopted UNMODIFIED. Byte-identical to the v2 deployment, which is the evidence that nothing in this change disturbed the engine. 1,995 B under EIP-170 - the tightest margin in the build, and why optimizer_runs is pinned at 833."
+    }
+  },
+
+  "adminState": {
+    "factoryDefaultAdmin": "0xa89523351BE1e2De64937AA9AF61Ae06eAd199C7",
+    "defaultAdminDelaySeconds": 172800,
+    "urpProxyAdminOwner": "0xa89523351BE1e2De64937AA9AF61Ae06eAd199C7",
+    "note": "Admin is the deployer EOA for testnet, matching v2. TWO DISTINCT UPGRADE AUTHORITIES exist and they are different powers: the factory's DEFAULT_ADMIN_ROLE (UUPS upgrade of factory logic - the only action that can strand counterfactually funded addresses) and the URP ProxyAdmin owner (can replace every gate in the policy). A production deployment should hold both in a multisig, and they should NOT be the same key."
+  },
+
+  "smokeTest": {
+    "transaction": "0x1f98c54bb1ac4a51f094251d4eed295820dcbfed8b3336ef4f321b63f7727ad3",
+    "block": 23296566,
+    "wallet": "0x1A02CC8Ed94a160D490D6851401F6F3879c69991",
+    "label": "smoke-v3",
+    "checks": [
+      "isWallet -> true",
+      "ownerOf -> the deployer",
+      "clone.owner() -> the deployer",
+      "clone.urp() -> the URP PROXY",
+      "clone.factory() -> the factory proxy",
+      "clone.accountId() -> \"push.agentwallet.1.0.0\""
+    ],
+    "note": "A real wallet deployed through the real factory, not a simulation. The deployment is not considered verified until this passes."
+  },
+
+  "breakingChanges": [
+    "`grantMandate` takes ONE argument. Its selector changed again; a payload built against the two-argument form misses the function entirely rather than failing a shape check.",
+    "Policy `initData` is `abi.encode(string chain, bytes body)`. A v2 `(uint8 mode, bytes)` envelope decodes to an EMPTY chain and reverts with a NAMED `EmptyChain()`; so does a bare struct.",
+    "The SDK encodes `UniversalTerms` / `NativeTerms`, not `Config` / `NativeConfig`. Seven fields URP owns (`initialized`, `spent`, `destChainHash`, `valueSpent`, `amountSpent`, `callsUsed`) are no longer typed by the caller.",
+    "`Config.destChainHash` keeps slot 1 and is NEVER written. A mandate's chain is `getMode(id, account).chainHash`.",
+    "`MandateGranted` gained two fields: the chain hash (indexed) and the chain string.",
+    "`InvalidPolicyMode` is removed; `EmptyChain`, `InconsistentChain`, `ChainMismatch` and `InvalidAsset` are new."
+  ]
+}

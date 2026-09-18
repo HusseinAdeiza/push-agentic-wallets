@@ -43,7 +43,7 @@ library AddressBook {
      *      input to every permission id, so mixing a v1 validator with a v2 engine derives ids that
      *      address an empty config — failing at gate N1 rather than anywhere informative.
      */
-    string internal constant OURS_DIR = "deployments/address-book-v2/";
+    string internal constant OURS_DIR = "deployments/address-book-v3/";
 
     /// @dev The named failure this library exists to produce. Names the file and the key.
     error MissingAddress(string file, string name);

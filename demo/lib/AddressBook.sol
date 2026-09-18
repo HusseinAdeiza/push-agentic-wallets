@@ -50,7 +50,7 @@ library AddressBook {
      *      with a v2 engine would derive ids that address an empty config — failing at gate 1
      *      rather than anywhere informative.
      */
-    string internal constant OURS_DIR = "deployments/address-book-v2/";
+    string internal constant OURS_DIR = "deployments/address-book-v3/";
 
     /// @dev The named failure this library exists to produce. Names the file and the key.
     error MissingAddress(string chain, string name);

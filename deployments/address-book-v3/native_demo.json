@@ -1,0 +1,14 @@
+{
+  "network": "push-donut-testnet",
+  "chainId": 42101,
+  "explorer": "https://donut.push.network",
+  "note": "DEMO-ONLY contracts for the Push-native agentic demo. NOT part of the protocol deployment and never referenced by anything outside demo-native/. CARRIED OVER UNCHANGED FROM address-book-v2: these are demo fixtures, not protocol contracts, so the v3.2 redeploy does not affect them - both were re-measured live at block ~23297k and hold code (DemoUSDC 1707 B, StakeDummy 1033 B). DemoUSDC is a freely mintable test token with no owner; StakeDummy has no owner, no pause and no supply accounting and would be drained within a block on a live network. Neither may ever be deployed to mainnet.",
+  "DemoUSDC": "0xfedb3d565c41158ac2e2033e6af13fba8ecbb585",
+  "StakeDummy": "0xa6eef2c811fe526f5bcae265f45199ef570463fe",
+  "writtenBy": {
+    "DemoUSDC": "demo-native/script/00_setup/00_DeployDemoUSDC.s.sol",
+    "StakeDummy": "demo-native/script/00_setup/01_DeployStakeDummy.s.sol"
+  },
+  "placeholders": "Both addresses ship as the zero address deliberately. AddressBook.native() enforces a never-zero rule, so an unwritten key fails with a named MissingAddress naming the script that writes it - rather than letting a script proceed against address(0) and fail minutes later with nothing on screen explaining why.",
+  "carriedOverFrom": "deployments/address-book-v2/native_demo.json"
+}
