@@ -2,6 +2,13 @@
 pragma solidity 0.8.26;
 
 import { BaseTest } from "../Base.t.sol";
+import {
+    OWNER_LANE_FLAG as OWNER_LANE_FLAG_,
+    OWNER_INTENT_TYPEHASH,
+    OWNER_INTENT_DOMAIN_TYPEHASH,
+    OWNER_INTENT_DOMAIN_NAME_HASH,
+    OWNER_INTENT_DOMAIN_VERSION_HASH
+} from "../../src/libraries/PushWalletTypes.sol";
 import { IdLib } from "smartsessions/lib/IdLib.sol";
 import { ActionId } from "smartsessions/DataTypes.sol";
 import {
@@ -151,5 +158,31 @@ contract ConstantMirrorsTest is BaseTest {
     function test_mandateTypeZeroValueIsUniversal() public pure {
         assertEq(uint8(MandateType.UNIVERSAL), 0, "UNIVERSAL must be the zero value");
         assertEq(uint8(MandateType.NATIVE), 1, "NATIVE must be 1");
+    }
+
+    // ─────────────── the owner-intent constants (UniversalMarketplace PRD, Change A) ───────────────
+
+    /// @dev The owner-lane flag is the top bit of a uint192 nonce key, and nothing else.
+    function test_OwnerLaneFlag_IsTopBitOfUint192() public pure {
+        assertEq(uint256(OWNER_LANE_FLAG_), uint256(1) << 191);
+        assertEq(uint256(OWNER_LANE_FLAG_ & (OWNER_LANE_FLAG_ - 1)), 0, "exactly one bit");
+    }
+
+    /// @dev Every type string, hashed from its literal here. A one-character drift in the production
+    ///      string — a field renamed, retyped, reordered or dropped — fails this test. The SDK signs
+    ///      against these exact strings.
+    function test_OwnerIntent_TypehashesMatchLiterals() public pure {
+        assertEq(
+            OWNER_INTENT_TYPEHASH,
+            keccak256(
+                "OwnerIntent(address owner,address wallet,address executor,uint96 index,bytes32 sessionHash,bytes32 mode,bytes32 execCalldataHash,uint192 nonceKey,uint64 nonceSeq,uint64 grantNonce,uint48 deadline,uint256 signerChainId)"
+            )
+        );
+        assertEq(
+            OWNER_INTENT_DOMAIN_TYPEHASH,
+            keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)")
+        );
+        assertEq(OWNER_INTENT_DOMAIN_NAME_HASH, keccak256("AGWFactory"));
+        assertEq(OWNER_INTENT_DOMAIN_VERSION_HASH, keccak256("1"));
     }
 }

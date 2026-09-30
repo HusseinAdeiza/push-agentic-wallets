@@ -102,3 +102,62 @@ bytes4 constant SEND_OUTBOUND_SELECTOR =
  *      deliberately not tied to the wallet contract's own semver, which advances with releases.
  */
 bytes32 constant OP_HASH_DOMAIN = keccak256("PushAgentWallet.Op.v3");
+
+/**
+ * @dev The owner's signed authorisation for up to three actions: deploy, grant, execute.
+ *
+ *      SIGNED ONCE under the FACTORY's EIP-712 domain and verified by the factory and by every wallet
+ *      it deploys. Each door checks only its own fields and advances its own nonce, so one signature
+ *      serves each door exactly once.
+ *
+ *      - Presentable ONLY by `executor`: every door, on its signature path, requires
+ *        `intent.executor != address(0) && msg.sender == intent.executor`. Without that, anyone who saw
+ *        the intent in calldata could drive the doors out of order and burn the owner's signature.
+ *      - A zero `sessionHash` / `execCalldataHash` means "not authorised for that action".
+ *      - EVERY FIELD IS IN THE TYPEHASH, IN DECLARATION ORDER. A field outside the typed data would
+ *        guarantee the SDK and the contract disagree about what was signed.
+ *
+ *      DECLARED HERE, beside the other values the factory and the wallet must agree on exactly.
+ */
+struct OwnerIntent {
+    address owner; // the wallet owner (UEA or EOA)
+    address wallet; // the wallet this intent is for — the predicted address if not yet deployed
+    address executor; // the ONLY msg.sender allowed to present this intent to a door
+    uint96 index; // wallet index under owner; deployWallet requires index == walletCount(owner)
+    bytes32 sessionHash; // keccak256(abi.encode(Session)) for grantMandateWithSig; 0 = no grant
+    bytes32 mode; // ERC-7579 mode word for executeWithSig
+    bytes32 execCalldataHash; // keccak256(executionCalldata) for executeWithSig; 0 = no exec
+    uint192 nonceKey; // owner lane for executeWithSig; must have OWNER_LANE_FLAG set
+    uint64 nonceSeq; // expected _nonces[nonceKey] at execution
+    uint64 grantNonce; // expected _grantNonce at grant
+    uint48 deadline; // unix seconds; all three doors reject after this
+    uint256 signerChainId; // EIP-712 domain.chainId the signer's wallet accepts — the owner's HOME chain
+}
+
+/// @dev The struct string must list every OwnerIntent field, in declaration order, with its exact type.
+bytes32 constant OWNER_INTENT_TYPEHASH = keccak256(
+    "OwnerIntent(address owner,address wallet,address executor,uint96 index,bytes32 sessionHash,"
+    "bytes32 mode,bytes32 execCalldataHash,uint192 nonceKey,uint64 nonceSeq,uint64 grantNonce,"
+    "uint48 deadline,uint256 signerChainId)"
+);
+
+/**
+ * @dev The intent's EIP-712 domain. Five fields:
+ *      - `chainId` is the SIGNER's home chain (`intent.signerChainId`), not Push: MetaMask refuses to
+ *        sign typed data whose `domain.chainId` differs from the active chain.
+ *      - `salt` is `bytes32(block.chainid)` — the Push chain id — which is what isolates one Push chain
+ *        from another.
+ *      - `verifyingContract` is the FACTORY PROXY for both the factory and every wallet; the wallet
+ *        reads it from its immutable args. The `wallet` field stops cross-wallet replay.
+ */
+bytes32 constant OWNER_INTENT_DOMAIN_TYPEHASH =
+    keccak256("EIP712Domain(string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)");
+bytes32 constant OWNER_INTENT_DOMAIN_NAME_HASH = keccak256("AGWFactory");
+bytes32 constant OWNER_INTENT_DOMAIN_VERSION_HASH = keccak256("1");
+
+/**
+ * @dev Top bit of a uint192 nonce key. SET = an owner lane, consumable only by `executeWithSig`; CLEAR =
+ *      an agent lane, consumable only by `executeWithSession`. A pure calldata partition of `_nonces`:
+ *      no new storage, and neither door can ever consume the other's replay position.
+ */
+uint192 constant OWNER_LANE_FLAG = uint192(1) << 191;

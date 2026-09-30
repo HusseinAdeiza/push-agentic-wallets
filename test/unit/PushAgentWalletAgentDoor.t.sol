@@ -4,7 +4,7 @@ pragma solidity 0.8.26;
 import { Vm } from "forge-std/Vm.sol";
 
 import { BaseTest } from "../Base.t.sol";
-import { MandateType } from "../../src/libraries/PushWalletTypes.sol";
+import { MandateType, OwnerIntent, OWNER_LANE_FLAG } from "../../src/libraries/PushWalletTypes.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
@@ -1158,6 +1158,82 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         // No mandate exists on this wallet, so the engine refuses the permission id outright.
         vm.expectRevert(abi.encodeWithSelector(ISmartSession.InvalidPermissionId.selector, PermissionId.wrap(r.pid)));
         fresh.executeWithSession(r.validator, r.mode, r.executionCalldata, sig, 0, 0, 0);
+    }
+
+    // ═══════════════════ the owner-intent doors (UniversalMarketplace PRD, C and D) ═══════════════════
+
+    /// ⚠️ NEVER-DELETE. Owner lanes belong to `executeWithSig`: the agent door refuses them BEFORE
+    ///      reading or consuming the nonce, and an agent lane still works afterwards.
+    function test_W_agentDoor_rejectsOwnerLane_revertsOwnerLaneForbidden() public {
+        Req memory r = _defaultReq();
+        r.nonceKey = OWNER_LANE_FLAG;
+        bytes memory sig = _signed(r);
+        vm.prank(RELAYER);
+        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.OwnerLaneForbidden.selector, OWNER_LANE_FLAG));
+        wallet.executeWithSession(
+            r.validator, r.mode, r.executionCalldata, sig, r.nonceKey, r.nonceSeq, r.requestExpiry
+        );
+        assertEq(wallet.getNonce(OWNER_LANE_FLAG), 0, "the owner lane was not consumed");
+
+        Req memory ok = _defaultReq();
+        _run(ok);
+        assertEq(wallet.getNonce(0), 1, "an agent lane still works");
+    }
+
+    /// ⚠️ NEVER-DELETE. The AGENT's key signing an OwnerIntent produces nothing the agent door accepts.
+    function test_X17_ownerIntentSigNeverValidatesAsSessionSig() public {
+        OwnerIntent memory i = blankIntent(WALLET_OWNER, address(wallet), RELAYER);
+        Req memory r = _defaultReq();
+        i.mode = r.mode;
+        i.execCalldataHash = keccak256(r.executionCalldata);
+        bytes memory intentSig = signIntent(agentPk, i);
+        bytes memory wrapped = abi.encodePacked(uint8(SmartSessionMode.USE), r.pid, intentSig);
+
+        etchCallRecorder(GATEWAY);
+        vm.prank(RELAYER);
+        vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.ValidationFailed.selector, address(1)));
+        wallet.executeWithSession(
+            r.validator, r.mode, r.executionCalldata, wrapped, r.nonceKey, r.nonceSeq, r.requestExpiry
+        );
+    }
+
+    /// ⚠️ NEVER-DELETE. Neither new door is reachable from the agent side:
+    ///   (a) at grant, the wallet is never a grantable native target, whatever the selector;
+    ///   (b) at dispatch, with URP bypassed by a session enabled directly on the engine, the dispatch
+    ///       guard refuses `address(this)` — selector-independent, so it covers both new doors.
+    function test_W_agentDoorCannotReach_grantMandateWithSig() public {
+        bytes4[2] memory sels = [PushAgentWallet.grantMandateWithSig.selector, PushAgentWallet.executeWithSig.selector];
+        for (uint256 k; k < 2; ++k) {
+            // (a) grant time
+            Session memory s = sessionWithPolicy(address(urp), ecdsaConfig(agentAddr), envelope(nativeChain(), ""));
+            s.actions[0].actionTarget = address(wallet);
+            s.actions[0].actionTargetSelector = sels[k];
+            vm.prank(WALLET_OWNER);
+            vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.ForbiddenActionTarget.selector, address(wallet)));
+            wallet.grantMandate(s);
+
+            // (b) dispatch time
+            PermissivePolicy permissive = new PermissivePolicy();
+            Session memory bypass = sessionWithPolicy(address(permissive), ecdsaConfig(agentAddr), "");
+            bypass.actions[0].actionTarget = address(wallet);
+            bypass.actions[0].actionTargetSelector = sels[k];
+            bypass.salt = bytes32(uint256(0xC0DE + k));
+            Session[] memory arr = new Session[](1);
+            arr[0] = bypass;
+            vm.prank(address(wallet));
+            bytes32 bypassPid = PermissionId.unwrap(engine.enableSessions(arr)[0]);
+
+            Req memory r = _defaultReq();
+            r.pid = bypassPid;
+            r.nonceKey = uint192(100 + k);
+            r.executionCalldata = ExecutionLib.encodeSingle(address(wallet), 0, abi.encodePacked(sels[k], bytes32(0)));
+            bytes memory sig = _signed(r);
+            vm.prank(RELAYER);
+            vm.expectRevert(abi.encodeWithSelector(PushWalletErrors.ForbiddenDispatchTarget.selector, address(wallet)));
+            wallet.executeWithSession(
+                r.validator, r.mode, r.executionCalldata, sig, r.nonceKey, r.nonceSeq, r.requestExpiry
+            );
+        }
     }
 }
 

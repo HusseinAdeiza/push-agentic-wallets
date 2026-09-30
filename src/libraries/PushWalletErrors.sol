@@ -121,6 +121,30 @@ library PushWalletErrors {
     ///      `grantMandate` entirely. Do not move this check before `_validate`.
     error ForbiddenDispatchTarget(address target);
 
+    // ─────────────────── the owner-intent doors ───────────────────
+    //
+    // One shape per name, shared with AGWFactory and UniversalMarketplace, so a test encodes one
+    // selector whichever contract reverts first.
+
+    /// @dev `intent.deadline` has passed.
+    error OwnerSigExpired(uint48 deadline);
+    /// @dev The signature is not the owner's over the intent.
+    error InvalidOwnerSignature();
+    /// @dev `intent.wallet` is not this wallet.
+    error IntentWalletMismatch(address expected, address provided);
+    /// @dev Presented by someone other than `intent.executor`, or `intent.executor` is zero.
+    error ExecutorMismatch(address expected, address actual);
+    /// @dev `intent.sessionHash` is zero or is not the hash of the session being granted.
+    error IntentSessionMismatch(bytes32 actual);
+    /// @dev `intent.grantNonce` is not the wallet's current grant nonce.
+    error IntentGrantNonceMismatch(uint64 expected, uint64 provided);
+    /// @dev `intent.execCalldataHash` is zero or does not match, or `intent.mode` does not match.
+    error IntentExecMismatch(bytes32 actualCalldataHash);
+    /// @dev `executeWithSig` on a nonce key without `OWNER_LANE_FLAG`.
+    error OwnerLaneRequired(uint192 nonceKey);
+    /// @dev `executeWithSession` on a nonce key with `OWNER_LANE_FLAG` — an owner lane.
+    error OwnerLaneForbidden(uint192 nonceKey);
+
     // ──────────────────── used by ExecutionLib ────────────────────
 
     /// @dev ExecutionLib.decodeBatch — the only error any library in src/ actually references.

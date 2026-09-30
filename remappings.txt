@@ -12,3 +12,4 @@ module-bases/=lib/vendor/@rhinestone/module-bases/src/
 flatbytes/=lib/vendor/@rhinestone/flatbytes/src/
 solady/=lib/vendor/solady/src/
 excessively-safe-call/=lib/vendor/excessively-safe-call/src/
+push-core/=lib/push-chain-core-contracts/src/

@@ -3,7 +3,7 @@ pragma solidity 0.8.26;
 
 import { BaseTest } from "../Base.t.sol";
 import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
-import { MandateType } from "../../src/libraries/PushWalletTypes.sol";
+import { MandateType, OwnerIntent } from "../../src/libraries/PushWalletTypes.sol";
 import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { IPushAgentWallet } from "../../src/interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
@@ -633,7 +633,7 @@ contract PushAgentWalletTest is BaseTest {
      * test fails and a human decides whether the ABI change was intended.
      */
     function test_W25_Clone_NoUpgradeSurface_ExactSelectorSet() public view {
-        bytes4[] memory expected = new bytes4[](25);
+        bytes4[] memory expected = new bytes4[](28);
         uint256 i;
 
         // one-shot initialisation
@@ -641,6 +641,10 @@ contract PushAgentWalletTest is BaseTest {
         // owner door + lifecycle
         expected[i++] = PushAgentWallet.execute.selector;
         expected[i++] = PushAgentWallet.grantMandate.selector;
+        // UniversalMarketplace PRD, Changes C and D: the owner-intent doors and their domain view.
+        expected[i++] = PushAgentWallet.grantMandateWithSig.selector;
+        expected[i++] = PushAgentWallet.executeWithSig.selector;
+        expected[i++] = PushAgentWallet.intentDomainSeparator.selector;
         expected[i++] = PushAgentWallet.stopMandate.selector;
         expected[i++] = PushAgentWallet.stopAll.selector;
         // agent door
@@ -668,7 +672,7 @@ contract PushAgentWalletTest is BaseTest {
         expected[i++] = PushAgentWallet.supportsInterface.selector;
         expected[i++] = PushAgentWallet.isValidSignature.selector;
 
-        assertEq(i, 25, "the hard-coded list must be complete");
+        assertEq(i, 28, "the hard-coded list must be complete");
         assertSelectorSet("PushAgentWallet", expected);
     }
 
@@ -884,6 +888,51 @@ contract PushAgentWalletTest is BaseTest {
         vm.prank(AGENT);
         vm.expectRevert(PushWalletErrors.InvalidSessionSignature.selector);
         wallet.executeWithSession(address(engine), _singleMode(), "", "", 0, 0, 0);
+    }
+
+    // ═══════════════════ execute() is untouched (UniversalMarketplace PRD, D5) ═══════════════════
+
+    /**
+     * ⚠️ NEVER-DELETE. The main pin for "execute is not modified": it touches NO wallet storage at all,
+     * single or batch — no read, no write. The reentrancy guard is transient (TLOAD/TSTORE, not
+     * recorded) and the owner comes from the clone's code, so zero is exact. `executeWithSig`, which
+     * reads the nonce lane, is the contrast that shows the recorder is live.
+     */
+    function test_W_execute_readsNoStorage() public {
+        address target = makeAddr("anyTarget");
+        vm.deal(address(wallet), 1 ether);
+
+        vm.record();
+        vm.prank(WALLET_OWNER);
+        wallet.execute(ModeCode.unwrap(ModeLib.encodeSimpleSingle()), ExecutionLib.encodeSingle(target, 1, ""));
+        (bytes32[] memory reads, bytes32[] memory writes) = vm.accesses(address(wallet));
+        assertEq(reads.length, 0, "execute (single) must read no wallet storage");
+        assertEq(writes.length, 0, "execute (single) must write no wallet storage");
+
+        Execution[] memory b = new Execution[](2);
+        b[0] = Execution({ target: target, value: 1, callData: "" });
+        b[1] = Execution({ target: target, value: 1, callData: "" });
+        vm.record();
+        vm.prank(WALLET_OWNER);
+        wallet.execute(ModeCode.unwrap(ModeLib.encodeSimpleBatch()), ExecutionLib.encodeBatch(b));
+        (reads, writes) = vm.accesses(address(wallet));
+        assertEq(reads.length, 0, "execute (batch) must read no wallet storage");
+        assertEq(writes.length, 0, "execute (batch) must write no wallet storage");
+
+        // Positive control: the recorder does see the new door's nonce lane.
+        (address o, uint256 opk) = ecdsaKey("recorderControlOwner");
+        PushAgentWallet w = newWallet(o);
+        bytes memory cd = ExecutionLib.encodeSingle(target, 0, "");
+        OwnerIntent memory i = blankIntent(o, address(w), RELAYER);
+        i.mode = ModeCode.unwrap(ModeLib.encodeSimpleSingle());
+        i.execCalldataHash = keccak256(cd);
+        bytes memory sig = signIntent(opk, i);
+        vm.record();
+        vm.prank(RELAYER);
+        w.executeWithSig(i.mode, cd, i, sig);
+        (reads, writes) = vm.accesses(address(w));
+        assertGt(reads.length, 0, "control: executeWithSig reads its nonce lane");
+        assertGt(writes.length, 0, "control: executeWithSig writes its nonce lane");
     }
 }
 

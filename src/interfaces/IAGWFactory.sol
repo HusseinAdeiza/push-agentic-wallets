@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import { OwnerIntent } from "../libraries/PushWalletTypes.sol";
+
 /**
  * @title  IAGWFactory — the factory's complete external surface.
  * @notice Functions not declared here must not exist on `AGWFactory` (the inherited
@@ -34,11 +36,34 @@ interface IAGWFactory {
     error NotAWallet(address account);
     /// @dev predictWallet beyond the next deployable index.
     error IndexOutOfRange(uint256 index, uint256 next);
+    /// @dev deployWallet(intent, …): `intent.index` is not the owner's next index.
+    error IndexMismatch(uint96 expected, uint96 provided);
+    /// @dev deployWallet(intent, …): `intent.wallet` is not the address this call would deploy.
+    error IntentWalletMismatch(address expected, address provided);
+    /// @dev deployWallet(intent, …): signature path presented by someone other than `intent.executor`,
+    ///      or `intent.executor` is zero.
+    error ExecutorMismatch(address expected, address actual);
+    /// @dev deployWallet(intent, …): signature path after `intent.deadline`.
+    error SignatureExpired(uint48 deadline);
+    /// @dev deployWallet(intent, …): the signature is not the owner's over the intent.
+    error InvalidOwnerSignature();
 
     // ───────────────────────────── deployment ─────────────────────────────
 
     /// @notice Deploys the caller's next agent wallet. THE CALLER IS THE OWNER — no parameter.
     function deployWallet(string calldata label) external returns (address wallet);
+
+    /// @notice Deploys wallet `intent.index` for `intent.owner`.
+    /// @dev    The owner is the caller, OR the signer of an OwnerIntent naming this owner, index and
+    ///         wallet, presented by `intent.executor`. Salt and immutable args are identical to the
+    ///         single-argument form, so every predicted address is unchanged.
+    function deployWallet(OwnerIntent calldata intent, bytes calldata sig, string calldata label)
+        external
+        returns (address wallet);
+
+    /// @notice The OwnerIntent EIP-712 domain separator for a signer on `signerChainId`.
+    /// @dev    Exposed so the SDK can verify its local derivation before prompting the owner.
+    function domainSeparator(uint256 signerChainId) external view returns (bytes32);
 
     // ────────────────────── prediction & enumeration ──────────────────────
 

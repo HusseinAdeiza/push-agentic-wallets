@@ -14,7 +14,10 @@ import { IPushSessionValidator } from "./interfaces/IPushSessionValidator.sol";
 import { IPushAgentWallet } from "./interfaces/IPushAgentWallet.sol";
 import { PushWalletErrors } from "./libraries/PushWalletErrors.sol";
 import { PushChainLib } from "./libraries/PushChainLib.sol";
+import { OwnerAuthLib } from "./libraries/OwnerAuthLib.sol";
 import {
+    OwnerIntent,
+    OWNER_LANE_FLAG,
     SEND_OUTBOUND_SELECTOR,
     OP_HASH_DOMAIN,
     MandateType,
@@ -290,6 +293,93 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
     }
 
     /**
+     * @notice The owner door, authorised by a signed OwnerIntent instead of `msg.sender`. Relayable.
+     *
+     * @dev    - A THIRD door, separate from `execute`. `execute` is untouched: it still reads only the
+     *           immutable-args owner and its calldata, and remains the unblockable fallback. This door
+     *           reads storage (the nonce lane) and may therefore fail where `execute` cannot.
+     *         - The mode switch below is DUPLICATED from `execute`, not shared with it, so that no
+     *           refactor can ever add a check to `execute`.
+     *         - Checks, in order: deadline · `intent.wallet == this` · owner · presenter is
+     *           `intent.executor` · owner lane · `mode` and a non-zero `execCalldataHash` match ·
+     *           nonce (consumed before the signature check, as on the agent door; any revert unwinds
+     *           it) · the owner's signature under the FACTORY's domain.
+     *         - Single or batch, default exec type. No dispatch guard: this is owner authority, so a
+     *           batch may call the wallet's own lifecycle functions through `onlyOwnerOrSelf`.
+     *         - Emits `OwnerExecutedWithSig`.
+     *
+     * @param  mode               ERC-7579 mode word; must equal `intent.mode`.
+     * @param  executionCalldata  Encoded execution; its hash must equal `intent.execCalldataHash`.
+     * @param  intent             The owner's intent; the grant fields are ignored here.
+     * @param  sig                The owner's signature over `intent`.
+     */
+    function executeWithSig(
+        bytes32 mode,
+        bytes calldata executionCalldata,
+        OwnerIntent calldata intent,
+        bytes calldata sig
+    ) external nonReentrant {
+        address owner_ = _requireIntentPresenter(intent);
+
+        uint192 nonceKey = intent.nonceKey;
+        if (nonceKey & OWNER_LANE_FLAG == 0) revert PushWalletErrors.OwnerLaneRequired(nonceKey);
+
+        bytes32 calldataHash = keccak256(executionCalldata);
+        if (intent.execCalldataHash == bytes32(0) || intent.execCalldataHash != calldataHash || intent.mode != mode) {
+            revert PushWalletErrors.IntentExecMismatch(calldataHash);
+        }
+
+        uint64 expected = _nonces[nonceKey];
+        if (intent.nonceSeq != expected) revert PushWalletErrors.InvalidNonce(nonceKey, expected, intent.nonceSeq);
+        _nonces[nonceKey] = expected + 1;
+
+        _requireOwnerSig(owner_, intent, sig);
+
+        (CallType callType, ExecType execType,,) = ModeCode.wrap(mode).decode();
+        if (execType != EXECTYPE_DEFAULT) revert PushWalletErrors.UnsupportedExecutionMode();
+        if (callType == CALLTYPE_SINGLE) {
+            (address target, uint256 value, bytes calldata callData) = ExecutionLib.decodeSingle(executionCalldata);
+            _execute(target, value, callData);
+        } else if (callType == CALLTYPE_BATCH) {
+            Execution[] calldata execs = ExecutionLib.decodeBatch(executionCalldata);
+            uint256 len = execs.length;
+            for (uint256 i; i < len;) {
+                _execute(execs[i].target, execs[i].value, execs[i].callData);
+                unchecked {
+                    ++i;
+                }
+            }
+        } else {
+            revert PushWalletErrors.UnsupportedExecutionMode();
+        }
+
+        emit OwnerExecutedWithSig(mode, calldataHash, nonceKey, intent.nonceSeq);
+    }
+
+    /**
+     * @dev The checks every intent door shares, in order: deadline, wallet, owner, presenter.
+     *      Returns the owner so the caller does not re-read the immutable args.
+     */
+    function _requireIntentPresenter(OwnerIntent calldata intent) internal view returns (address owner_) {
+        if (block.timestamp > intent.deadline) revert PushWalletErrors.OwnerSigExpired(intent.deadline);
+        if (intent.wallet != address(this)) {
+            revert PushWalletErrors.IntentWalletMismatch(address(this), intent.wallet);
+        }
+        owner_ = _owner();
+        if (intent.owner != owner_) revert PushWalletErrors.NotOwner();
+        if (intent.executor == address(0) || msg.sender != intent.executor) {
+            revert PushWalletErrors.ExecutorMismatch(intent.executor, msg.sender);
+        }
+    }
+
+    /// @dev The owner's signature over `intent`, under the factory's domain. Last check before effects.
+    function _requireOwnerSig(address owner_, OwnerIntent calldata intent, bytes calldata sig) internal view {
+        if (!OwnerAuthLib.isOwnerSig(owner_, OwnerAuthLib.intentDigest(_factory(), intent), sig)) {
+            revert PushWalletErrors.InvalidOwnerSignature();
+        }
+    }
+
+    /**
      * @notice Grants one mandate to an agent key. One of exactly two lifecycle operations.
      *
      * @dev    - Reverts unless the caller is the owner or the wallet itself.
@@ -332,6 +422,52 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
      * @return permissionId  The engine's id for the newly enabled mandate.
      */
     function grantMandate(Session calldata session) external onlyOwnerOrSelf returns (bytes32 permissionId) {
+        return _grantMandate(session);
+    }
+
+    /**
+     * @notice `grantMandate`, authorised by the owner's signed OwnerIntent instead of `msg.sender`.
+     *
+     * @dev    - Checks, in order: deadline · `intent.wallet == this` · `intent.owner` is this wallet's
+     *           owner · presenter is `intent.executor` (non-zero) · `sessionHash` is non-zero and is the
+     *           hash of `session` · `grantNonce` is the current `_grantNonce` · the owner's signature under
+     *           the FACTORY's domain. Then the entire `grantMandate` body, unchanged.
+     *         - `_grantNonce` advances on every grant, so an intent grants at most once and dies on any
+     *           other grant. No new storage.
+     *         - `sessionHash` covers the session AS SUPPLIED, salt included; the salt is then overwritten
+     *           with the grant nonce exactly as on the owner path.
+     *         - Unreachable from the agent door: the wallet is never a grantable action target, and the
+     *           dispatch guard refuses `address(this)` whatever the selector.
+     *         - No reentrancy guard, for the same reason `grantMandate` has none.
+     *
+     * @param  session  The session to enable.
+     * @param  intent   The owner's intent; the exec fields are ignored here.
+     * @param  sig      The owner's signature over `intent`.
+     * @return permissionId  The engine's id for the newly enabled mandate.
+     */
+    function grantMandateWithSig(Session calldata session, OwnerIntent calldata intent, bytes calldata sig)
+        external
+        returns (bytes32 permissionId)
+    {
+        address owner_ = _requireIntentPresenter(intent);
+
+        bytes32 sessionHash = keccak256(abi.encode(session));
+        if (intent.sessionHash == bytes32(0) || intent.sessionHash != sessionHash) {
+            revert PushWalletErrors.IntentSessionMismatch(sessionHash);
+        }
+        if (intent.grantNonce != _grantNonce) {
+            revert PushWalletErrors.IntentGrantNonceMismatch(_grantNonce, intent.grantNonce);
+        }
+        _requireOwnerSig(owner_, intent, sig);
+
+        return _grantMandate(session);
+    }
+
+    /**
+     * @dev The entire body `grantMandate` always had, moved here unchanged so both entry points run the
+     *      same checks in the same order with the same errors. See `grantMandate` for the rules.
+     */
+    function _grantMandate(Session calldata session) internal returns (bytes32 permissionId) {
         // ─── rules COMMON to both types, first ───
 
         if (session.userOpPolicies.length != 0) revert PushWalletErrors.MalformedSessionShape();
@@ -639,6 +775,9 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
 
         if (!_installedValidators[validator]) revert PushWalletErrors.ValidatorNotInstalled(validator);
 
+        // Owner lanes belong to `executeWithSig`. A pure calldata check, before any nonce read.
+        if (nonceKey & OWNER_LANE_FLAG != 0) revert PushWalletErrors.OwnerLaneForbidden(nonceKey);
+
         uint64 expected = _nonces[nonceKey];
         if (nonceSeq != expected) revert PushWalletErrors.InvalidNonce(nonceKey, expected, nonceSeq);
         _nonces[nonceKey] = expected + 1;
@@ -943,6 +1082,12 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
     /// @notice The salt the next grant will use.
     function grantNonce() external view returns (uint64) {
         return _grantNonce;
+    }
+
+    /// @notice The OwnerIntent domain separator this wallet verifies against, for a signer on
+    ///         `signerChainId`. Identical to the factory's: the factory is the verifying contract.
+    function intentDomainSeparator(uint256 signerChainId) external view returns (bytes32) {
+        return OwnerAuthLib.domainSeparator(_factory(), signerChainId);
     }
 
     /// @notice The ERC-7579 account id, in vendor.account.semver form.

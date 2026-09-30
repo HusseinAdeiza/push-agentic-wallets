@@ -31,6 +31,11 @@ interface IPushAgentWallet {
     ///         hash is what an observer needs to tie the event to the transaction it came from.
     event OwnerExecuted(bytes32 indexed mode, bytes32 executionCalldataHash);
 
+    /// @notice The owner executed through `executeWithSig`, authorised by a signed OwnerIntent.
+    /// @dev    A separate event from `OwnerExecuted` so an indexer can tell a relayed owner action
+    ///         from one the owner submitted directly. The lane position ties it to the intent.
+    event OwnerExecutedWithSig(bytes32 indexed mode, bytes32 executionCalldataHash, uint192 nonceKey, uint64 nonceSeq);
+
     // ─────────────────────────────── module manager ───────────────────────────────
 
     event ModuleInstalled(uint256 moduleTypeId, address module);

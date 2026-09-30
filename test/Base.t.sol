@@ -19,7 +19,9 @@ import {
     UniversalOutboundTxRequest,
     Multicall,
     MandateType,
-    MULTICALL_SELECTOR
+    MULTICALL_SELECTOR,
+    OwnerIntent,
+    OWNER_LANE_FLAG
 } from "../src/libraries/PushWalletTypes.sol";
 import { IURP } from "../src/interfaces/IURP.sol";
 
@@ -575,6 +577,97 @@ abstract contract BaseTest is Test {
     /// @dev Asserts `target` was never called. Requires etchCallRecorder(target) first.
     function assertNoCallsTo(address target) internal view {
         assertEq(callsRecorded(target), 0, "expected no calls to target");
+    }
+
+    // ─────────────────────────── owner intents ───────────────────────────
+
+    /// @dev The origin chain the default signer "lives on" — Ethereum mainnet. Deliberately NOT
+    ///      block.chainid: the intent domain's chainId is the signer's home chain.
+    uint256 internal constant SIGNER_CHAIN_ID = 1;
+
+    /// @dev Every signature the intent helpers produce is counted here, so an integration test can
+    ///      assert how many times the owner was asked to sign (cheatcode calls themselves are not
+    ///      countable).
+    uint256 internal intentSignatures;
+
+    /**
+     * @notice The OwnerIntent digest, built BY HAND from the literal type strings.
+     * @dev    INDEPENDENT WITNESS, not a call into OwnerAuthLib: every field is listed here explicitly,
+     *         so a library that dropped, reordered or retyped a field produces a different digest and
+     *         the signature this helper makes stops verifying.
+     */
+    function intentDigestWitness(address factoryAddr, OwnerIntent memory i) internal view returns (bytes32) {
+        bytes32 domain = keccak256(
+            abi.encode(
+                keccak256(
+                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)"
+                ),
+                keccak256("AGWFactory"),
+                keccak256("1"),
+                i.signerChainId,
+                factoryAddr,
+                bytes32(block.chainid)
+            )
+        );
+        bytes32 structHash = keccak256(
+            bytes.concat(
+                abi.encode(
+                    keccak256(
+                        "OwnerIntent(address owner,address wallet,address executor,uint96 index,bytes32 sessionHash,bytes32 mode,bytes32 execCalldataHash,uint192 nonceKey,uint64 nonceSeq,uint64 grantNonce,uint48 deadline,uint256 signerChainId)"
+                    ),
+                    i.owner,
+                    i.wallet,
+                    i.executor,
+                    i.index,
+                    i.sessionHash,
+                    i.mode
+                ),
+                abi.encode(i.execCalldataHash, i.nonceKey, i.nonceSeq, i.grantNonce, i.deadline, i.signerChainId)
+            )
+        );
+        return keccak256(abi.encodePacked("\x19\x01", domain, structHash));
+    }
+
+    /// @dev Sign `i` with `pk` under the real factory's domain. 65-byte r‖s‖v.
+    function signIntent(uint256 pk, OwnerIntent memory i) internal returns (bytes memory) {
+        return signIntentFor(FACTORY, pk, i);
+    }
+
+    function signIntentFor(address factoryAddr, uint256 pk, OwnerIntent memory i) internal returns (bytes memory) {
+        intentSignatures++;
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, intentDigestWitness(factoryAddr, i));
+        return abi.encodePacked(r, s, v);
+    }
+
+    /**
+     * @notice An intent with every door disabled, ready for a test to switch on the fields it needs.
+     * @dev    Zero session and exec hashes mean "not authorised" (D9); the deadline is an hour out.
+     */
+    function blankIntent(address owner_, address wallet_, address executor_)
+        internal
+        view
+        returns (OwnerIntent memory)
+    {
+        return OwnerIntent({
+            owner: owner_,
+            wallet: wallet_,
+            executor: executor_,
+            index: 0,
+            sessionHash: bytes32(0),
+            mode: bytes32(0),
+            execCalldataHash: bytes32(0),
+            nonceKey: OWNER_LANE_FLAG,
+            nonceSeq: 0,
+            grantNonce: 0,
+            deadline: uint48(block.timestamp + 1 hours),
+            signerChainId: SIGNER_CHAIN_ID
+        });
+    }
+
+    /// @dev The predicted address of `owner_`'s next wallet on the real factory.
+    function nextWallet(address owner_) internal view returns (address wallet_, uint96 index_) {
+        index_ = uint96(factory.walletCount(owner_));
+        (wallet_,) = factory.predictWallet(owner_, index_);
     }
 }
 

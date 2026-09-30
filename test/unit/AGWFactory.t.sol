@@ -10,6 +10,10 @@ import { PushAgentWallet } from "../../src/PushAgentWallet.sol";
 import { PushWalletErrors } from "../../src/libraries/PushWalletErrors.sol";
 import { ModeLib, ModeCode } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib } from "../../src/libraries/ExecutionLib.sol";
+import { OwnerIntent } from "../../src/libraries/PushWalletTypes.sol";
+import { OwnerAuthLib } from "../../src/libraries/OwnerAuthLib.sol";
+import { MockUEA } from "../mocks/MockUEA.sol";
+import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
 import { IAccessControl } from "@openzeppelin/contracts/access/IAccessControl.sol";
@@ -411,10 +415,13 @@ contract AGWFactoryTest is BaseTest {
      * one under any name.
      */
     function test_T09_NoImplementationSetter_ABI() public view {
-        string[34] memory sigs = [
+        string[36] memory sigs = [
             // ours
             "initialize(address,address)",
             "deployWallet(string)",
+            // UniversalMarketplace PRD, Change B: the owner-intent deploy and its domain view.
+            "deployWallet((address,address,address,uint96,bytes32,bytes32,bytes32,uint192,uint64,uint64,uint48,uint256),bytes,string)",
+            "domainSeparator(uint256)",
             "predictWallet(address,uint256)",
             "walletCount(address)",
             "ownerOf(address)",
@@ -800,5 +807,238 @@ contract RevertingInitWallet {
 
     function initializeAccount() external pure {
         revert InitRejected();
+    }
+}
+
+/**
+ * @title  AGWFactory — the owner-intent deploy (Change B of the UniversalMarketplace PRD).
+ * @notice The F-series. Salt and args are unchanged, so every address is unchanged; the new form only
+ *         widens WHO may supply the owner, and only on the owner's signature, presented by the intent's
+ *         executor.
+ */
+contract AGWFactoryIntentTest is BaseTest {
+    address internal signer;
+    uint256 internal signerPk;
+    address internal EXECUTOR;
+
+    function setUp() public override {
+        super.setUp();
+        (signer, signerPk) = ecdsaKey("walletOwner");
+        EXECUTOR = makeAddr("marketplace");
+        bytes32 pauserRole = factory.PAUSER_ROLE();
+        vm.prank(FACTORY_ADMIN);
+        factory.grantRole(pauserRole, address(this));
+    }
+
+    function _intent(address owner_) internal view returns (OwnerIntent memory i) {
+        (address w, uint96 idx) = nextWallet(owner_);
+        i = blankIntent(owner_, w, EXECUTOR);
+        i.index = idx;
+    }
+
+    function _deployAs(address caller, OwnerIntent memory i, bytes memory sig) internal returns (address) {
+        vm.prank(caller);
+        return factory.deployWallet(i, sig, "lbl");
+    }
+
+    function test_F_deployWithIntent_eoaOwner_deploysAndOwnerIsSigner() public {
+        OwnerIntent memory i = _intent(signer);
+        address w = _deployAs(EXECUTOR, i, signIntent(signerPk, i));
+        assertEq(factory.ownerOf(w), signer);
+        assertTrue(factory.isWallet(w));
+        assertEq(factory.indexOf(w), 0);
+        assertEq(factory.walletCount(signer), 1);
+        assertEq(PushAgentWallet(payable(w)).owner(), signer);
+    }
+
+    function test_F_deployWithIntent_ueaOwner_viaVerifySelector() public {
+        MockUEA uea = new MockUEA(signer);
+        OwnerIntent memory i = _intent(address(uea));
+        address w = _deployAs(EXECUTOR, i, signIntent(signerPk, i));
+        assertEq(factory.ownerOf(w), address(uea));
+    }
+
+    /// @dev The "salt unchanged" proof: the intent form deploys exactly where the frozen formula says,
+    ///      recomputed here from scratch, and where the single-argument form deploys for the same owner.
+    function test_F_deployWithIntent_addressEqualsPredictWallet_andLegacyDerivation() public {
+        OwnerIntent memory i = _intent(signer);
+        (address predicted,) = factory.predictWallet(signer, 0);
+        address frozen = Clones.predictDeterministicAddressWithImmutableArgs(
+            address(walletImpl), abi.encodePacked(signer, FACTORY), keccak256(abi.encode(signer, uint96(0))), FACTORY
+        );
+        assertEq(predicted, frozen, "predictWallet drifted from the frozen formula");
+        uint256 snap = vm.snapshotState();
+        address viaIntent = _deployAs(EXECUTOR, i, signIntent(signerPk, i));
+        vm.revertToState(snap);
+        vm.prank(signer);
+        address viaLegacy = factory.deployWallet("lbl");
+        assertEq(viaIntent, frozen);
+        assertEq(viaLegacy, frozen);
+    }
+
+    function test_F_deployWithIntent_wrongIndex_revertsIndexMismatch() public {
+        OwnerIntent memory i = _intent(signer);
+        i.index = 1;
+        bytes memory sig = signIntent(signerPk, i);
+        vm.expectRevert(abi.encodeWithSelector(IAGWFactory.IndexMismatch.selector, uint96(0), uint96(1)));
+        _deployAs(EXECUTOR, i, sig);
+
+        vm.prank(signer);
+        factory.deployWallet("first");
+        OwnerIntent memory j = _intent(signer);
+        j.index = 0;
+        sig = signIntent(signerPk, j);
+        vm.expectRevert(abi.encodeWithSelector(IAGWFactory.IndexMismatch.selector, uint96(1), uint96(0)));
+        _deployAs(EXECUTOR, j, sig);
+    }
+
+    function test_F_deployWithIntent_wrongWalletField_revertsIntentWalletMismatch() public {
+        OwnerIntent memory i = _intent(signer);
+        address predicted = i.wallet;
+        i.wallet = address(0xdead);
+        bytes memory sig = signIntent(signerPk, i);
+        vm.expectRevert(abi.encodeWithSelector(IAGWFactory.IntentWalletMismatch.selector, predicted, address(0xdead)));
+        _deployAs(EXECUTOR, i, sig);
+    }
+
+    function test_F_deployWithIntent_replay_revertsIndexMismatch() public {
+        OwnerIntent memory i = _intent(signer);
+        bytes memory sig = signIntent(signerPk, i);
+        _deployAs(EXECUTOR, i, sig);
+        vm.expectRevert(abi.encodeWithSelector(IAGWFactory.IndexMismatch.selector, uint96(1), uint96(0)));
+        _deployAs(EXECUTOR, i, sig);
+    }
+
+    /// ⚠️ NEVER-DELETE. The intent is presentable only by its executor.
+    function test_F_deployWithIntent_wrongExecutor_revertsExecutorMismatch() public {
+        OwnerIntent memory i = _intent(signer);
+        bytes memory sig = signIntent(signerPk, i);
+        vm.expectRevert(abi.encodeWithSelector(IAGWFactory.ExecutorMismatch.selector, EXECUTOR, RELAYER));
+        _deployAs(RELAYER, i, sig);
+    }
+
+    function test_F_deployWithIntent_zeroExecutor_revertsExecutorMismatch() public {
+        OwnerIntent memory i = _intent(signer);
+        i.executor = address(0);
+        bytes memory sig = signIntent(signerPk, i);
+        vm.expectRevert(abi.encodeWithSelector(IAGWFactory.ExecutorMismatch.selector, address(0), address(0)));
+        _deployAs(address(0), i, sig);
+    }
+
+    function test_F_deployWithIntent_expired_reverts() public {
+        OwnerIntent memory i = _intent(signer);
+        bytes memory sig = signIntent(signerPk, i);
+        vm.warp(uint256(i.deadline) + 1);
+        vm.expectRevert(abi.encodeWithSelector(IAGWFactory.SignatureExpired.selector, i.deadline));
+        _deployAs(EXECUTOR, i, sig);
+    }
+
+    function test_F_deployWithIntent_wrongSigner_reverts() public {
+        OwnerIntent memory i = _intent(signer);
+        (, uint256 otherPk) = ecdsaKey("other");
+        bytes memory sig = signIntent(otherPk, i);
+        vm.expectRevert(IAGWFactory.InvalidOwnerSignature.selector);
+        _deployAs(EXECUTOR, i, sig);
+    }
+
+    function test_F_deployWithIntent_wrongSignerChainId_reverts() public {
+        OwnerIntent memory i = _intent(signer);
+        bytes memory sig = signIntent(signerPk, i); // signed with signerChainId = 1
+        i.signerChainId = 11_155_111;
+        vm.expectRevert(IAGWFactory.InvalidOwnerSignature.selector);
+        _deployAs(EXECUTOR, i, sig);
+    }
+
+    function test_F_deployWithIntent_wrongPushChainSalt_reverts() public {
+        OwnerIntent memory i = _intent(signer);
+        bytes memory sig = signIntent(signerPk, i);
+        vm.chainId(42_101);
+        vm.expectRevert(IAGWFactory.InvalidOwnerSignature.selector);
+        _deployAs(EXECUTOR, i, sig);
+    }
+
+    function test_F_deployWithIntent_wrongFactoryDomain_reverts() public {
+        OwnerIntent memory i = _intent(signer);
+        bytes memory sig = signIntentFor(address(0xBEEF), signerPk, i);
+        vm.expectRevert(IAGWFactory.InvalidOwnerSignature.selector);
+        _deployAs(EXECUTOR, i, sig);
+    }
+
+    function test_F_deployWithIntent_ownerIsSender_ignoresSigDeadlineAndExecutor() public {
+        OwnerIntent memory i = _intent(signer);
+        i.executor = address(0);
+        i.deadline = 0;
+        vm.warp(1000);
+        address w = _deployAs(signer, i, "");
+        assertEq(factory.ownerOf(w), signer);
+
+        // index and wallet field are still checked on the owner path
+        OwnerIntent memory j = _intent(signer);
+        address predicted = j.wallet;
+        j.wallet = address(0xdead);
+        vm.expectRevert(abi.encodeWithSelector(IAGWFactory.IntentWalletMismatch.selector, predicted, address(0xdead)));
+        _deployAs(signer, j, "");
+    }
+
+    function test_F_deployWithIntent_zeroOwner_revertsZeroAddress() public {
+        OwnerIntent memory i = blankIntent(address(0), address(0), EXECUTOR);
+        vm.expectRevert(IAGWFactory.ZeroAddress.selector);
+        _deployAs(EXECUTOR, i, "");
+    }
+
+    function test_F_deployWithIntent_paused_reverts() public {
+        factory.pause();
+        OwnerIntent memory i = _intent(signer);
+        bytes memory sig = signIntent(signerPk, i);
+        vm.expectRevert(PausableUpgradeable.EnforcedPause.selector);
+        _deployAs(EXECUTOR, i, sig);
+    }
+
+    /// ⚠️ NEVER-DELETE. The griefing guard: nobody advances an owner's count without the owner.
+    function test_F_deployWithIntent_thirdPartyCannotAdvanceCountWithoutSig() public {
+        address victim = signer;
+        OwnerIntent memory i = _intent(victim);
+        i.executor = RELAYER;
+        (, uint256 attackerPk) = ecdsaKey("attacker");
+        bytes memory garbage = signIntent(attackerPk, i);
+        vm.expectRevert(IAGWFactory.InvalidOwnerSignature.selector);
+        _deployAs(RELAYER, i, garbage);
+        assertEq(factory.walletCount(victim), 0);
+    }
+
+    function test_F_deployWithIntent_grantAndExecFieldsIgnoredHere() public {
+        OwnerIntent memory i = _intent(signer);
+        i.sessionHash = keccak256("x");
+        i.execCalldataHash = keccak256("y");
+        i.nonceSeq = 77;
+        i.grantNonce = 99;
+        address w = _deployAs(EXECUTOR, i, signIntent(signerPk, i));
+        assertTrue(factory.isWallet(w));
+    }
+
+    function test_F_legacyDeployWallet_unchanged() public {
+        vm.recordLogs();
+        vm.prank(signer);
+        address w = factory.deployWallet("legacy");
+        (address predicted,) = factory.predictWallet(signer, 0);
+        assertEq(w, predicted);
+        assertEq(factory.ownerOf(w), signer);
+        assertEq(factory.walletCount(signer), 1);
+    }
+
+    function test_F_domainSeparator_matchesOwnerAuthLib() public view {
+        bytes32 expected = keccak256(
+            abi.encode(
+                keccak256(
+                    "EIP712Domain(string name,string version,uint256 chainId,address verifyingContract,bytes32 salt)"
+                ),
+                keccak256("AGWFactory"),
+                keccak256("1"),
+                uint256(1),
+                FACTORY,
+                bytes32(block.chainid)
+            )
+        );
+        assertEq(factory.domainSeparator(1), expected);
     }
 }
