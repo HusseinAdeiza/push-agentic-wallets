@@ -18,11 +18,27 @@ walkthroughs. `docs-internal/` holds the build specifications, the decision regi
 ## Commands
 
 ```
-make build    # forge build
-make test     # forge test -vv
-make sizes    # the S-06 size gate — forge build --sizes, exits non-zero over 24,576 B
-forge fmt     # line_length 120, tab_width 4
+make build             # forge build
+make test              # check-execute, then forge test -vv
+make sizes             # the S-06 size gate — forge build --sizes, exits non-zero over 24,576 B
+make check-execute     # sha256 pin: execute() must be byte-identical to its audited text at 67929f2
+make snapshot-execute  # WARNING only — owner-door test gas vs .gas-snapshot-execute (±1000 gas)
+make e2e               # builds lib/push-chain-core-contracts first, then Marketplace.e2e.t.sol
+forge fmt              # line_length 120, tab_width 4
 ```
+
+**`execute()` is hash-pinned.** `script/check-execute.sh` hashes the source span of
+`PushAgentWallet.execute` — not a byte, not a comment may change. Owner-authority features go in
+*sibling* doors (`executeWithSig`, `grantMandateWithSig`), never in `execute`.
+
+**The Marketplace E2E deploys the core repo's own artifacts** via `vm.deployCode` (core is
+shanghai / 99,999 runs / OZ 5.3; this repo does not recompile it). Run `make e2e` — `test_E2E_13` fails on
+a stale core artifact. `lib/push-chain-core-contracts` is currently a **symlink** to the sibling checkout
+(`../../push-chain-core-contracts`), which is why `foundry.toml` carries a temporary `allow_paths`.
+
+The two demos have their own Foundry profiles so `forge test` runs only the v3 specification suite:
+`FOUNDRY_PROFILE=demo forge test`, `FOUNDRY_PROFILE=demo-native forge test` (each wrapped by its `justfile`;
+see `demo/README.md`, `demo-native/README.md`).
 
 `make sizes` runs `--sizes` twice — once for the build, once for the vendored engine explicitly. That is
 deliberate: **which contracts the default table covers is forge-version-dependent** (1.5.1-stable includes
@@ -71,9 +87,9 @@ about lives inside the payload, two decode levels down. **URP is the contract th
 
 | Contract | Role |
 |---|---|
-| `AGWFactory` (`src/`) | UUPS proxy. Deploys wallet clones at pre-computable addresses; the registry of record for "is this a real wallet, and who owns it?" The caller is always the owner — there is no owner parameter. |
+| `AGWFactory` (`src/`) | UUPS proxy. Deploys wallet clones at pre-computable addresses; the registry of record for "is this a real wallet, and who owns it?" There is no owner parameter: the owner is the caller, or the signer of an `OwnerIntent` (the `deployWallet(intent, sig, label)` form). |
 | `PushAgentWallet` (`src/`) | Holds funds. Minimal clone with 40 bytes of immutable args (owner 0–19, factory 20–39). Push Chain has no ERC-4337 EntryPoint, so the wallet does the EntryPoint's jobs itself. |
-| `URP` (`src/policies/`) | The only novel contract and the security boundary. **Two rulebooks** — sixteen gates for a cross-chain mandate, nine for a Push-side one — in normative order, fail closed. Which one runs is decided by the mandate's chain, never by a flag anyone sets. Upgradeable behind a transparent proxy. |
+| `URP` (`src/policies/`) | The only novel contract and the security boundary. **Three rulebooks**, in normative order, fail closed: universal-EVM (gates 1–16), universal-SVM (S1–S18; S1–S10 restate gates 1–10, S11+ parse the Solana execute payload), and native/Push-side (nine gates). Which one runs is derived from the mandate's chain string, never from a flag anyone sets. Upgradeable behind a transparent proxy. |
 | `PushSessionValidator` (`src/validators/`) | Stateless signature check: secp256k1, or Ed25519 via a raw `staticcall` to the USV precompile. |
 | `SmartSession` (`lib/smartsessions/`) | Adopted unmodified. Stores mandates, runs policies, deletes on revoke. The wallet's only installed module. |
 
@@ -84,6 +100,13 @@ about lives inside the payload, two decode levels down. **URP is the contract th
   must succeed with the engine uninstalled, a hostile validator installed, or ghost-mandate state. Adding
   any check is the catastrophic regression. `executeWithSession` (agent door) is permissionless — signature,
   nonce and bound op-hash are the authority, never the caller.
+- **Owner-intent doors are siblings, not extensions, of `execute`.** `executeWithSig` and
+  `grantMandateWithSig` let a relayer (`intent.executor`) present an EIP-712 `OwnerIntent` signed by the
+  owner — usually a UEA, which has no ERC-1271, so `OwnerAuthLib.isOwnerSig` tries
+  `verifyUniversalPayloadSignature` first, then ERC-1271, via raw staticcalls that never revert. The domain
+  is the **factory's**, shared by factory and wallets. These doors read storage (nonce lanes; the owner lane
+  requires `OWNER_LANE_FLAG`), which is exactly why they cannot live in `execute`; `executeWithSig`
+  duplicates `execute`'s mode switch deliberately rather than sharing it.
 - **`execute(bytes32,bytes)` is a frozen signature.** The engine branches on this selector; any other shape
   routes validation to a path where URP's value gate sees a hardcoded zero instead of the real value.
 - **The ten-field operation hash** (`_computeOpHash`) uses `abi.encode`, never `encodePacked`. Fields 5
@@ -141,7 +164,15 @@ about lives inside the payload, two decode levels down. **URP is the contract th
   therefore nothing to configure wrongly. A near-miss string (`"EIP155:42101"`) derives the *other* mode
   and is refused against the action targets — the hash comparison is the whole rule, and the wallet
   deliberately does not parse, normalise or length-check the string.
-- **`Config` and `NativeConfig` are STORAGE types; `UniversalTerms` and `NativeTerms` are the wire types.**
+  **For a UNIVERSAL mandate URP derives a second thing, the VM family:** `PushChainLib.deriveVm` reads the
+  7-byte prefix (`eip155:` → EVM, `solana:` → SVM, anything else reverts `UnsupportedNamespace` at init).
+  The result is stored on `ModeSlot.vm` and routes `checkAction` to `_checkUniversal` or `_checkSvm`. Mode
+  still comes from the full hash; `deriveVm` is never asked about a native string.
+- **Tests must pin `block.chainid`.** Foundry defaults to 31337, so the native chain string is
+  `eip155:31337` unless a test calls `vm.chainId(42101)`. Native helpers build the string from
+  `block.chainid`, never a literal.
+- **`Config`, `SvmConfig` and `NativeConfig` are STORAGE types; `UniversalTerms`, `SvmTerms` and
+  `NativeTerms` are the wire types.** URP storage is append-only — `$svm` took slot 7 and one `__gap` slot.
   The SDK encodes the latter. `Config.destChainHash` is a v2 relic that keeps slot 1 and is never written —
   a mandate's chain lives on `ModeSlot.chainHash`, where it has been checked against the asset.
   `test_upgradeable_configStructLayoutIsFrozen` pins every member's label, slot, offset and type, because a
@@ -242,9 +273,11 @@ conveniences: the artifact-based storage-layout and selector-set assertions depe
 | `src/policies/` | `URP.sol` |
 | `src/validators/` | `PushSessionValidator.sol` |
 | `src/interfaces/` | `IURP`, `IPushSessionValidator`, `IAGWFactory`, `IPushAgentWallet`, `IPushAgentWalletInit`, gateway + module interfaces |
-| `src/libraries/` | `PushWalletTypes` (authoritative gateway struct mirror), `ModeLib`, `ExecutionLib`, `PushWalletErrors` |
+| `src/libraries/` | `PushWalletTypes` (authoritative gateway struct mirror, `OwnerIntent` + EIP-712 typehashes), `PushChainLib` (mode/VM derivation), `OwnerAuthLib` (owner-signature check shared by factory and wallet), `ModeLib`, `ExecutionLib`, `PushWalletErrors` |
 | `test/Base.t.sol` | Shared harness — every suite extends `BaseTest` |
-| `test/unit/`, `test/integration/`, `test/mocks/` | Per-contract suites, end-to-end flows, observers |
+| `test/unit/`, `test/integration/`, `test/mocks/` | Per-contract suites (URP split: `URP.t.sol`, `URP.svm.t.sol`; wallet split by door), end-to-end flows, observers |
+| `script/check-execute.sh`, `script/snapshot-execute.sh` | The `execute()` source pin and its advisory gas check |
+| `demo/`, `demo-native/` | Cross-chain and Push-native demos — own `justfile`, Foundry profile and `state/` ledger |
 | `script/Deploy.s.sol` | The five-contract deployment, in dependency order |
 | `deployments/` | `<chainId>.json` records — **never committed** |
 | `_to_delete/` | v1/v2 code staged for deletion — **ignore entirely** |
