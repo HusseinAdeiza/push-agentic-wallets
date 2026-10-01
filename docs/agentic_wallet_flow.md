@@ -4,7 +4,9 @@
 
 **Bob's intent:** *"Find the best-yielding stablecoin lending vault and deploy 100 USDC into it."*
 
-> **This is one of the two agentic workflows v3 supports — the UNIVERSAL one.** Bob's agent acts on a *far* chain, through Push Chain's gateway, under a `UNIVERSAL` mandate. The other workflow — the agent acting on *Push Chain itself*, under a `NATIVE` mandate, with no gateway and no far side — is walked in `push_native_agentic_wallet_flow.md`. The wallet, the engine, URP and the validator are the same contracts in both; what differs is the kind of mandate Bob grants, which of URP's two rulebooks runs, and where the money ends up. Both kinds may live on one wallet at once.
+> **This is one of the two agentic workflows v3 supports — the UNIVERSAL one.** Bob's agent acts on a *far* chain, through Push Chain's gateway, under a `UNIVERSAL` mandate. The other workflow — the agent acting on *Push Chain itself*, under a `NATIVE` mandate, with no gateway and no far side — is walked in `push_native_agentic_wallet_flow.md`. The wallet, the engine, URP and the validator are the same contracts in both; what differs is the kind of mandate Bob grants, which of URP's rulebooks runs, and where the money ends up. Both kinds may live on one wallet at once.
+>
+> **Bob's far chain here is an EVM chain.** A universal mandate for Solana walks the same seven stages through the same contracts; what changes is inside URP. The `solana:` namespace selects URP's Solana rulebook instead of the EVM one, the payload is a single program instruction instead of an instruction list, and account and data pins take the place of beneficiary offsets. `v3-architecture.md` §6.2c and §6.4c walk it gate by gate.
 
 > **⚠ THIS DOCUMENT IS v3. It supersedes every earlier flow description.**
 > If anything you read elsewhere in this repo contradicts this file, this file wins. In particular: **there is no OutboundExecutor module, no wallet-level "provider" slot, no guardian, no pause on any wallet, and no in-place editing of a granted permission.** *(The factory alone has a pause, and it only blocks new wallet creation.)* The companion document `v3-architecture.md` carries the full reasoning.
@@ -22,7 +24,7 @@
 | `0xagentkey` | The agent's signing key (ECDSA **or** Ed25519) — **a key, not an account** | off-chain |
 | `AGWFactory` | Deploys agent wallets at predictable addresses; the registry of record | Push Chain |
 | `SmartSession` | The adopted permission engine — the wallet's only installed module | Push Chain |
-| `URP` | Universal Rules Policy — **the only contract that inspects what the agent really does on the far chain.** Its universal rulebook runs here; its native rulebook is the other document's subject | Push Chain |
+| `URP` | Universal Rules Policy — **the only contract that inspects what the agent really does on the far chain.** Its universal EVM rulebook runs here; its Solana rulebook is in `v3-architecture.md` §6.4c, its native rulebook is the other document's subject | Push Chain |
 | `PushSessionValidator` | Stateless signature checker (secp256k1 / Ed25519). **Never installed** — named inside each permission | Push Chain |
 | `UniversalGatewayPC` | The frozen outbound gateway — the only thing a **universal** agent action may call, and the one thing a native action never may | Push Chain |
 
@@ -99,7 +101,7 @@ All of Bob's addresses are **deterministic and computable before anything is dep
 
 ### 🔑 The mandate grant (step 2) in detail
 
-`grantMandate` takes **one argument**. Nobody tells it what kind of mandate this is: it reads the **chain** the policy envelope declares, and derives the kind from that. Sepolia is not Push, so this is a `UNIVERSAL` mandate — one that leaves the chain through the gateway.
+`grantMandate` takes **one argument**. Nobody tells it what kind of mandate this is: it reads the **chain** the policy envelope declares, and derives the kind from that. Sepolia is not Push, so this is a `UNIVERSAL` mandate — one that leaves the chain through the gateway. URP then reads the namespace: `eip155:` means an EVM destination and URP's EVM rulebook (`solana:` would select its Solana rulebook). The wallet makes no such distinction; to it, both are the same one-action gateway mandate.
 
 It then does exactly three things: it **overwrites the salt** with the wallet's own monotonic `grantNonce`, it **enforces the canonical session shape** for the derived kind, and it **asserts that kind against the action** — under `UNIVERSAL`, exactly one action, and it must be the gateway's outbound send. A wrong policy, an extra action or a stray user-op policy reverts `MalformedSessionShape`; a target that is wrong *for the kind* — anything but the gateway here — reverts `MandateTypeMismatch(UNIVERSAL, 0, target)`, naming what was tried.
 
@@ -118,7 +120,7 @@ actions: [ EXACTLY ONE — the UNIVERSAL shape ]
   actionTarget           = UniversalGatewayPC
   actionTargetSelector   = sendUniversalTxOutbound.selector
   actionPolicies: [ URP AND ONLY URP ]
-    initData = (chain = "eip155:11155111", body = ↓)   ← THE CHAIN. Not Push ⇒ UNIVERSAL.
+    initData = (chain = "eip155:11155111", body = ↓)   ← THE CHAIN. Not Push ⇒ UNIVERSAL; eip155: ⇒ EVM rulebook.
       validUntil        = now + 60 min      ← THE EXPIRY LIVES INSIDE URP
       asset             = PRC20_USDC        ← checked AT GRANT against the declared chain
       expectedCEA       = 0xbobagwcea       ← DERIVED at grant, committed forever
@@ -191,7 +193,7 @@ Layer 1  the wallet operation   mode, executionCalldata, lane + position, reques
         │
         └─▶ SmartSession.validateUserOp
               ├─ permission enabled?
-              ├─ URP.checkAction  ── reads the mode record: UNIVERSAL ──
+              ├─ URP.checkAction  ── reads the mode record: UNIVERSAL · EVM ──
               │                    ── the 16-gate gauntlet, in order ──
               │     1 configured · 2 NOT EXPIRED · 3 gateway only · 4 send selector
               │     5 token == USDC · 6 per-call cap · 7 lifetime cap · 8 PC value cap
