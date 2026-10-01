@@ -24,7 +24,7 @@ make test              # check-execute, then forge test -vv
 make sizes             # the S-06 size gate — forge build --sizes, exits non-zero over 24,576 B
 make check-execute     # sha256 pin: execute() byte-identical to its audited text (67929f2 + the nomenclature rename)
 make snapshot-execute  # WARNING only — owner-door test gas vs .gas-snapshot-execute (±1000 gas)
-make e2e               # builds lib/push-chain-core-contracts first, then 24_marketplaceE2E.t.sol
+make e2e               # PARKED: prints that the Marketplace E2E awaits its rewrite, exits 1
 forge fmt              # line_length 120, tab_width 4
 ```
 
