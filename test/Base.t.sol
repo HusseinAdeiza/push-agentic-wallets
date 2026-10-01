@@ -4,26 +4,38 @@ pragma solidity 0.8.26;
 import { Test } from "forge-std/Test.sol";
 
 import { SmartSession } from "smartsessions/SmartSession.sol";
+
 import { Session, ActionData, PolicyData, ERC7739Data, ERC7739Context } from "smartsessions/DataTypes.sol";
+
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
 
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
+
 import { ERC1967Proxy } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Proxy.sol";
+
 import { TransparentUpgradeableProxy } from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 
-import { PushSessionValidator } from "../src/validators/PushSessionValidator.sol";
-import { URP } from "../src/policies/URP.sol";
-import { PushAgentWallet } from "../src/PushAgentWallet.sol";
+import { AgentValidator } from "../src/validators/AgentValidator.sol";
+
+import { UniversalRulesPolicy } from "../src/policies/UniversalRulesPolicy.sol";
+
+import { AGW } from "../src/AGW.sol";
+
 import { AGWFactory } from "../src/AGWFactory.sol";
+
 import {
-    UniversalOutboundTxRequest,
+    Config,
     Multicall,
-    MandateType,
     MULTICALL_SELECTOR,
+    NativeConfig,
+    NativeTerms,
+    OWNER_LANE_FLAG,
     OwnerIntent,
-    OWNER_LANE_FLAG
-} from "../src/libraries/PushWalletTypes.sol";
-import { IURP } from "../src/interfaces/IURP.sol";
+    RulesType,
+    SvmTerms,
+    UniversalOutboundTxRequest,
+    UniversalTerms
+} from "../src/libraries/Types.sol";
 
 /**
  * @title  BaseTest — the shared harness every v3 suite extends.
@@ -34,20 +46,20 @@ abstract contract BaseTest is Test {
     // ───────────────────────────── deployments ─────────────────────────────
 
     SmartSession internal engine;
-    PushSessionValidator internal validator;
+    AgentValidator internal validator;
 
     /// @dev THE REAL URP — a TransparentUpgradeableProxy in front of `urpImplementation`. Every
     ///      suite drives this, so every test runs against the deployed shape.
-    URP internal urp;
+    UniversalRulesPolicy internal urp;
 
     /// @dev The URP IMPLEMENTATION. Holds no config of its own; its initialiser is disabled.
-    URP internal urpImplementation;
+    UniversalRulesPolicy internal urpImplementation;
 
     /// @dev The proxy itself, typed. Needed to reach the admin, which TUP creates internally.
     TransparentUpgradeableProxy internal urpProxy;
 
     /// @dev The wallet IMPLEMENTATION. Clones delegatecall into it; it is never driven directly.
-    PushAgentWallet internal walletImpl;
+    AGW internal walletImpl;
 
     /// @dev THE REAL FACTORY — an ERC-1967 proxy in front of `factoryLogic`. Every wallet in every
     ///      suite is now deployed through it, so the wallet's `_factory()` immutable arg is the
@@ -65,7 +77,7 @@ abstract contract BaseTest is Test {
 
     // ─────────────────────────── named addresses ───────────────────────────
 
-    /// @dev The Ed25519 precompile. Must equal PushSessionValidator.USV — asserted in the smoke test.
+    /// @dev The Ed25519 precompile. Must equal AgentValidator.USV — asserted in the smoke test.
     address internal constant USV = 0xEC00000000000000000000000000000000000001;
 
     address internal GATEWAY;
@@ -78,7 +90,7 @@ abstract contract BaseTest is Test {
 
     /// @dev Asserted against IUniversalGatewayPC.sendUniversalTxOutbound.selector in the smoke test.
     ///
-    ///      DELIBERATELY HAND-TYPED, not imported from PushWalletTypes.sol. The production constant
+    ///      DELIBERATELY HAND-TYPED, not imported from Types.sol. The production constant
     ///      lives there and both the wallet and URP read it from that one place; this copy is the
     ///      INDEPENDENT WITNESS that the shared constant is the value the gateway actually exposes.
     ///      Importing it here would make the test agree with the source by construction and assert
@@ -88,7 +100,7 @@ abstract contract BaseTest is Test {
         bytes4(keccak256("sendUniversalTxOutbound((bytes,address,uint256,uint256,uint256,uint256,bytes,address))"));
 
     /// @dev The smallest possible ABI encoding of a UniversalOutboundTxRequest argument list.
-    ///      Derivation (PushWalletTypes.sol:9-18): 32 (outer offset word — the struct is dynamic,
+    ///      Derivation (Types.sol:9-18): 32 (outer offset word — the struct is dynamic,
     ///      so abi.encode prefixes a pointer) + 256 (eight head words) + 32 + 32 (length words for
     ///      the two empty dynamic `bytes` fields, `recipient` and `payload`) = 352.
     ///      DO NOT hand-maintain this number: it is pinned against abi.encode of an empty request,
@@ -109,22 +121,22 @@ abstract contract BaseTest is Test {
         FACTORY_ADMIN = makeAddr("factoryAdmin");
 
         engine = new SmartSession();
-        validator = new PushSessionValidator();
+        validator = new AgentValidator();
 
         // URP BEHIND ITS REAL PROXY, not a bare instance. Every suite therefore exercises the
         // deployed shape: storage in the proxy, logic reached by delegatecall. A harness that
         // deployed URP directly would test a contract that does not exist in production, and
         // would silently miss anything that only breaks through a delegatecall.
         URP_ADMIN_OWNER = makeAddr("urpAdminOwner");
-        urpImplementation = new URP();
+        urpImplementation = new UniversalRulesPolicy();
         urpProxy = new TransparentUpgradeableProxy(
             address(urpImplementation),
             URP_ADMIN_OWNER,
-            abi.encodeCall(URP.initialize, (GATEWAY, EXECUTOR_MODULE, address(engine)))
+            abi.encodeCall(UniversalRulesPolicy.initialize, (GATEWAY, EXECUTOR_MODULE, address(engine)))
         );
-        urp = URP(address(urpProxy));
+        urp = UniversalRulesPolicy(address(urpProxy));
 
-        walletImpl = new PushAgentWallet(address(engine), address(urp), address(validator), GATEWAY);
+        walletImpl = new AGW(address(engine), address(urp), address(validator), GATEWAY);
 
         // ERC-1967 proxy -> factory logic, initialised in the SAME transaction, so no
         // initialisation front-run window exists (factory PRD §8 step 3).
@@ -139,9 +151,9 @@ abstract contract BaseTest is Test {
         FACTORY = address(factory);
 
         vm.label(address(engine), "SmartSession");
-        vm.label(address(validator), "PushSessionValidator");
-        vm.label(address(urp), "URP");
-        vm.label(address(walletImpl), "PushAgentWallet(impl)");
+        vm.label(address(validator), "AgentValidator");
+        vm.label(address(urp), "UniversalRulesPolicy");
+        vm.label(address(walletImpl), "AGW(impl)");
         vm.label(address(factory), "AGWFactory(proxy)");
         vm.label(address(factoryLogic), "AGWFactory(logic)");
     }
@@ -155,9 +167,9 @@ abstract contract BaseTest is Test {
      *         20-39) and calls `initializeAccount` itself. Nothing here simulates the factory any
      *         more, so every earlier suite now exercises the production deployment path.
      */
-    function newWallet(address walletOwner) internal returns (PushAgentWallet wallet) {
+    function newWallet(address walletOwner) internal returns (AGW wallet) {
         vm.prank(walletOwner);
-        return PushAgentWallet(payable(factory.deployWallet("")));
+        return AGW(payable(factory.deployWallet("")));
     }
 
     // ─────────────────── URP gates seen through the engine ───────────────────
@@ -475,23 +487,23 @@ abstract contract BaseTest is Test {
     /// @dev The universal case, which is most of them. Takes the storage-shaped `Config` the tests
     ///      already build and narrows it to the wire type — the fields URP owns (`initialized`,
     ///      `spent`, and the `destChainHash` relic) are dropped here rather than at every call site.
-    function universalInitData(IURP.Config memory cfg) internal pure returns (bytes memory) {
+    function universalInitData(Config memory cfg) internal pure returns (bytes memory) {
         return universalInitData(CHAIN_SEPOLIA, cfg);
     }
 
     /// @dev The universal case on a named chain — for the chain-derivation and teeth suites.
-    function universalInitData(string memory chain, IURP.Config memory cfg) internal pure returns (bytes memory) {
+    function universalInitData(string memory chain, Config memory cfg) internal pure returns (bytes memory) {
         return envelope(chain, abi.encode(_terms(cfg)));
     }
 
     /// @dev The native case. The chain is this chain, by definition of the mode.
-    function nativeInitData(IURP.NativeConfig memory cfg) internal view returns (bytes memory) {
+    function nativeInitData(NativeConfig memory cfg) internal view returns (bytes memory) {
         return envelope(nativeChain(), abi.encode(_terms(cfg)));
     }
 
     /// @dev `Config` (storage shape, what tests build) → `UniversalTerms` (wire shape).
-    function _terms(IURP.Config memory cfg) internal pure returns (IURP.UniversalTerms memory) {
-        return IURP.UniversalTerms({
+    function _terms(Config memory cfg) internal pure returns (UniversalTerms memory) {
+        return UniversalTerms({
             validUntil: cfg.validUntil,
             expectedCEA: cfg.expectedCEA,
             asset: cfg.asset,
@@ -503,8 +515,8 @@ abstract contract BaseTest is Test {
     }
 
     /// @dev `NativeConfig` (storage shape) → `NativeTerms` (wire shape).
-    function _terms(IURP.NativeConfig memory cfg) internal pure returns (IURP.NativeTerms memory) {
-        return IURP.NativeTerms({
+    function _terms(NativeConfig memory cfg) internal pure returns (NativeTerms memory) {
+        return NativeTerms({
             validUntil: cfg.validUntil,
             target: cfg.target,
             selector: cfg.selector,
@@ -554,7 +566,7 @@ abstract contract BaseTest is Test {
     string internal constant CHAIN_SOLANA_DEVNET = "solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1";
 
     /// @dev The SVM case. `SvmTerms` is already the wire type, so nothing to narrow.
-    function svmInitData(string memory chain, IURP.SvmTerms memory terms) internal pure returns (bytes memory) {
+    function svmInitData(string memory chain, SvmTerms memory terms) internal pure returns (bytes memory) {
         return envelope(chain, abi.encode(terms));
     }
 

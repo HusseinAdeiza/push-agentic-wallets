@@ -16,20 +16,25 @@ ERC-7579 smart accounts on Push Chain that let an autonomous agent execute bound
 
 | Contract | Status |
 | --- | --- |
-| `AGWFactory` | **To build** — creates agent wallets at addresses computable before deployment |
-| `PushAgentWallet` | **To build** — holds funds; an unrestricted owner door and a fully checked agent door |
-| `URP` | **To build** — the only novel contract: opens the cross-chain payload and enforces every limit |
-| `PushSessionValidator` | **Carried forward** — `src/validators/`, stateless signature check (secp256k1 / Ed25519) |
+| `AGWFactory` | **Built** — `src/AGWFactory.sol`; creates agent wallets at addresses computable before deployment |
+| `AGW` (Agentic Wallet) | **Built** — `src/AGW.sol`; holds funds; an unrestricted owner door and a fully checked agent door |
+| `UniversalRulesPolicy` (URP) | **Built** — `src/policies/UniversalRulesPolicy.sol`; the only novel contract: opens the cross-chain payload and enforces every limit |
+| `AgentValidator` | **Carried forward** — `src/validators/AgentValidator.sol`, stateless signature check (secp256k1 / Ed25519) |
 | `SmartSession` | **Adopted unmodified** — `lib/smartsessions/`, the permission engine |
 
 ## What is in `src/` today
 
 ```
-src/validators/PushSessionValidator.sol   carried forward — see its PRD before editing
-src/libraries/                            PushWalletTypes (authoritative gateway structs),
-                                          ModeLib, ExecutionLib, PushWalletErrors
-src/interfaces/                           IERC7579Module, IUSigVerifier, IUniversalGatewayPC
+src/AGW.sol, src/AGWFactory.sol             the wallet and its factory
+src/policies/UniversalRulesPolicy.sol       URP — the rules policy (three rulebooks)
+src/validators/AgentValidator.sol           the session validator
+src/libraries/                              Types.sol, Errors.sol, PushChainLib, OwnerAuthLib,
+                                            ModeLib, ExecutionLib
+src/interfaces/                             IAGW, IAGWInit, IAGWFactory, IUniversalRulesPolicy,
+                                            IAgentValidator, gateway + module interfaces
 ```
+
+Naming follows the core/gateway standard: see `docs-internal/sdk-first-changes/N-nomenclature_prd.md`.
 
 Everything else is written fresh from the specifications in `docs-internal/v3-architecture-docs/v3-prds/`.
 

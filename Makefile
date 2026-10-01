@@ -6,7 +6,8 @@ build:
 test: check-execute
 	forge test -vv
 
-# execute() — the owner door — must stay byte-identical to its audited text at 67929f2.
+# execute() — the owner door — must stay byte-identical to its audited text at 67929f2, with only the
+# nomenclature change's error-library rename applied (PushWalletErrors. -> AGWErrors.).
 # The binding pins are this source hash and test_W_execute_readsNoStorage (0 reads, 0 writes).
 check-execute:
 	./script/check-execute.sh
@@ -38,4 +39,4 @@ sizes:
 # core's own OZ 5.3 and forge-std must be present for its build (and for the artifact to be the shipped one).
 e2e:
 	cd lib/push-chain-core-contracts && git submodule update --init --recursive && forge build
-	forge test --match-path test/integration/Marketplace.e2e.t.sol -vv
+	@echo "The Marketplace E2E is parked (test/integration/24_marketplaceE2E.t.sol.parked) pending its rewrite against core's new marketplace surface."; exit 1

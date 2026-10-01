@@ -9,7 +9,7 @@ pragma solidity 0.8.26;
  *         Solidity inserts an `extcodesize(target) > 0` check before any high-level
  *         call that ABI-decodes return data, and reverts when the target has no code.
  *         Precompiles have no code, so such a call always reverts on-chain.
- *         `PushSessionValidator` uses a raw staticcall instead, mirroring the audited
+ *         `AgentValidator` uses a raw staticcall instead, mirroring the audited
  *         `UEA_SVM`. This interface exists to document the ABI.
  *
  * @dev    Declared locally rather than imported, to avoid a cross-repo build

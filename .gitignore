@@ -29,3 +29,7 @@ demo/
 demo/state/
 demo/ref_contracts/
 demo-native/state/
+
+# The native demo is frozen against the deployed v1 contracts and does not compile against the renamed
+# src/ (nomenclature change). It is already tracked, so this entry only affects new files.
+demo-native/

@@ -2,7 +2,7 @@
 pragma solidity 0.8.26;
 
 import { Strings } from "@openzeppelin/contracts/utils/Strings.sol";
-import { MandateType, VmFamily } from "./PushWalletTypes.sol";
+import { RulesType, VmFamily } from "./Types.sol";
 
 /**
  * @title  PushChainLib — Push's own CAIP-2 identity, computed, never configured.
@@ -46,13 +46,13 @@ library PushChainLib {
     }
 
     /**
-     * @notice The rulebook a mandate on `chainHash` belongs to.
+     * @notice The rulebook a rules set on `chainHash` belongs to.
      * @dev    This chain ⇒ NATIVE (a Push-side call). Any other ⇒ UNIVERSAL (through the gateway).
      *         An unrecognised or malformed string derives UNIVERSAL and is then refused against the
      *         action targets, or against the asset by URP — never silently accepted.
      */
-    function deriveMode(bytes32 chainHash) internal view returns (MandateType) {
-        return chainHash == selfChainHash() ? MandateType.NATIVE : MandateType.UNIVERSAL;
+    function deriveMode(bytes32 chainHash) internal view returns (RulesType) {
+        return chainHash == selfChainHash() ? RulesType.NATIVE : RulesType.UNIVERSAL;
     }
 
     /// @dev The two CAIP-2 namespaces URP has a universal rulebook for. Seven bytes each, colon
@@ -61,12 +61,12 @@ library PushChainLib {
     bytes7 internal constant NS_SOLANA = "solana:";
 
     /// @notice The declared chain string names a namespace URP has no rulebook for.
-    /// @dev    Raised at config init only, so a grant fails closed instead of producing a mandate
+    /// @dev    Raised at config init only, so a grant fails closed instead of producing a rules set
     ///         that can never be used.
     error UnsupportedNamespace(bytes32 chainHash);
 
     /**
-     * @notice The destination VM of a UNIVERSAL mandate, from its CAIP-2 string.
+     * @notice The destination VM of a UNIVERSAL rules set, from its CAIP-2 string.
      * @dev    - Reads only the 7-byte prefix; the MODE is still derived from the full hash by
      *           `deriveMode`, and the wallet keeps doing exactly that. This is a second, narrower
      *           classification for URP's own routing, never a replacement.
