@@ -49,6 +49,19 @@ enum MandateType {
 }
 
 /**
+ * @dev Which destination VM a UNIVERSAL mandate targets. Derived by URP from the envelope's chain
+ *      namespace prefix (`eip155:` / `solana:`) at config init; the wallet never reads it, because
+ *      its grant rules are identical for every non-Push chain.
+ *
+ *      `EVM` MUST STAY THE ZERO VALUE. URP's `ModeSlot` entries written before this enum existed
+ *      read 0 in the byte that now holds it, and every one of them is an EVM mandate.
+ */
+enum VmFamily {
+    EVM,
+    SVM
+}
+
+/**
  * @dev Mirrors of engine constants that are not importable — `IdLib.VALUE_SELECTOR` is `internal`
  *      to a library, and the fallback flags are file-level constants in the vendored fork.
  *

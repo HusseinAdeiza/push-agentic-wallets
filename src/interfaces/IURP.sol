@@ -4,7 +4,7 @@ pragma solidity 0.8.26;
 import { IActionPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { ConfigId } from "smartsessions/DataTypes.sol";
 
-import { MandateType } from "../libraries/PushWalletTypes.sol";
+import { MandateType, VmFamily } from "../libraries/PushWalletTypes.sol";
 
 /**
  * @dev Maximum pinned arguments per native action. Bounds the N7 loop.
@@ -104,12 +104,20 @@ interface IURP is IActionPolicy {
      *      a bare enum: `MandateType.UNIVERSAL` is the zero value, so an empty storage slot reads as
      *      `UNIVERSAL` and could not be told apart from a real universal mandate. `initialized` is
      *      authoritative; `mode` is MEANINGLESS when it is false.
-     * @param initialized  true once either rulebook has been written for this config
+     * @param initialized  true once any rulebook has been written for this config
      * @param mode         which rulebook; only meaningful when `initialized`
+     * @param vm           which destination VM a UNIVERSAL config targets; meaningless for NATIVE
      */
     struct ModeSlot {
         bool initialized;
         MandateType mode;
+        /// @dev ADDED for the SVM rulebook, PLACED HERE ON PURPOSE. Declared between `mode` and
+        ///      `chainHash` it packs into slot 0 at byte 2 — a byte no earlier implementation ever
+        ///      wrote, so every existing entry reads 0 = `EVM`, which is what every existing entry
+        ///      is. No existing member moves: `chainHash` stays at slot 1. Appending it after
+        ///      `chainHash` would be equally safe and cost one more slot per grant; the layout test
+        ///      pins label, slot, offset and type of all four members either way.
+        VmFamily vm;
         /// @dev keccak256(bytes(chain)) as declared in the policy envelope. THE single chain record
         ///      for BOTH modes — universal stores the destination chain, native stores this chain's
         ///      own hash. Zero on entries written before the envelope carried a chain; treat that as
@@ -202,13 +210,156 @@ interface IURP is IActionPolicy {
         ArgPin[] pins;
     }
 
+    // ───────────────────────── svm mode structs ─────────────────────────
+    //
+    // The third rulebook: a UNIVERSAL mandate whose destination is a `solana:*` chain. On Solana an
+    // outbound is ONE cross-program invocation — a target program, an ordered account list, and an
+    // instruction byte string — signed by the wallet's CEA (a PDA), not an EVM multicall. Every
+    // EVM-shaped gate (multicall walk, `address` target, `bytes4` selector, beneficiary word, per-entry
+    // value) is replaced by the shapes below. See `URP._checkSvm` for the gate list.
+
+    /**
+     * @dev One allow-listed (program, instruction) pair.
+     * @param program           Target program id, 32 bytes.
+     * @param discriminator     Left-aligned instruction tag; only the first `discriminatorLen` bytes
+     *                          are compared. 8 for Anchor (`sha256("global:<name>")[..8]`), 1 for
+     *                          SPL-style instruction indexes.
+     * @param discriminatorLen  1..8, or 0 iff `dataless`.
+     * @param dataless          The instruction carries NO data. The only way to get a length-0 tag,
+     *                          and it forces `ix_data` to be EMPTY at check time — so a rule can never
+     *                          match an instruction its pins were not written for.
+     * @param maxAccounts       0 = unbounded; otherwise the request's account count must EQUAL it.
+     *                          Set to the IDL count for fixed-layout instructions so nothing can be
+     *                          appended behind the pinned positions.
+     */
+    struct AllowedProgram {
+        bytes32 program;
+        bytes8 discriminator;
+        uint8 discriminatorLen;
+        bool dataless;
+        uint8 maxAccounts;
+    }
+
+    /**
+     * @dev `accounts[accountIndex]` of a request matching rule `ruleIndex` must equal `expected`.
+     *      The SVM counterpart of the EVM beneficiary pin: programs read accounts by POSITION, so a
+     *      value-carrying position is pinned to an owner-committed key (the CEA, or one of its ATAs).
+     */
+    struct SvmAccountPin {
+        uint8 ruleIndex;
+        uint8 accountIndex;
+        bytes32 expected;
+    }
+
+    /// @dev How an `SvmDataPin` compares. Integers are LITTLE-ENDIAN (Borsh), `len` bytes wide.
+    enum SvmDataPinMode {
+        EQ,
+        GTE_LE,
+        LTE_LE,
+        RATIO_GTE_LE
+    }
+
+    /**
+     * @dev A constraint on the `ix_data` of a request matching rule `ruleIndex`.
+     *      - EQ            `ix_data[off : off+len] == expected[0 : len]`, `len` 1..32, raw bytes,
+     *                      LEFT-ALIGNED: bytes of `expected` past `len` must be zero.
+     *      - GTE_LE        `uintLE(ix_data[off : off+len]) >= uint256(expected)`, `len` 1..8,
+     *                      RIGHT-ALIGNED integer: `expected` must fit in `len` bytes.
+     *      - LTE_LE        `uintLE(ix_data[off : off+len]) <= uint256(expected)`, same encoding.
+     *      - RATIO_GTE_LE  `uintLE(A) * den >= uintLE(B) * num`, A at `offset`, B at `offsetB`, both
+     *                      `len` bytes and both addressed with the same `fromEnd`; `expected` unused;
+     *                      `num` and `den` both non-zero.
+     *                      This is the min-out floor RELATIVE to the input amount — a static floor on
+     *                      the output alone is bypassed by an input equal to the whole balance.
+     *      - fromEnd       `offset` counts back from the END of `ix_data` to the field's START.
+     *                      Borsh serialises vectors before scalars, so trailing scalar arguments have
+     *                      stable from-end offsets and unstable from-start ones. Requires
+     *                      `offset >= len`.
+     */
+    struct SvmDataPin {
+        uint8 ruleIndex;
+        bool fromEnd;
+        uint16 offset;
+        uint16 offsetB;
+        uint8 len;
+        SvmDataPinMode mode;
+        bytes32 expected;
+        uint64 num;
+        uint64 den;
+    }
+
+    /**
+     * @notice WIRE TYPE — what a `solana:*` UNIVERSAL envelope's body encodes. Not a storage type.
+     *
+     * @dev    ABSENT BY DESIGN, as in `UniversalTerms`: `initialized` and `spent` are URP's.
+     *
+     * @param validUntil        non-zero, in the future (enforced at init); "never" = type(uint48).max
+     * @param expectedCEA       the wallet's CEA on the destination: `PDA(["push_identity", wallet],
+     *                          gatewayProgram)`. Owner-committed — Solidity cannot derive a PDA.
+     * @param gatewayProgram    the Push gateway program on the declared cluster. Owner-committed; the
+     *                          SDK sources it from the chain registry. Forbidden as a target: that
+     *                          route only returns the mandated asset to the owner's wallet, at the
+     *                          owner's rate-limit and gas cost.
+     * @param asset             the one permitted PRC20
+     * @param maxAmountPerCall  PRC20 base units (lamports / SPL base units); Solana amounts are u64
+     * @param maxAmountTotal    type(uint256).max = unlimited
+     * @param maxPCPerCall      Push-native per-call ceiling (protocol fee + gas swap budget)
+     * @param ceaAccounts       every CEA-controlled account that HOLDS VALUE: the CEA, its ATA for the
+     *                          asset, its ATAs for allowed outputs. Each may appear in a request ONLY
+     *                          at a position the matched rule pins to it. Unlisted accounts are not
+     *                          protected — the list is the owner's statement of what is worth taking.
+     *                          Must contain `expectedCEA`; no zero, duplicate, or program entries.
+     * @param programs          the allow-list; first match wins, made exact by the init ambiguity rule
+     * @param pins              account pins, each naming its rule
+     * @param dataPins          `ix_data` pins, each naming its rule
+     */
+    struct SvmTerms {
+        uint48 validUntil;
+        bytes32 expectedCEA;
+        bytes32 gatewayProgram;
+        address asset;
+        uint256 maxAmountPerCall;
+        uint256 maxAmountTotal;
+        uint256 maxPCPerCall;
+        bytes32[] ceaAccounts;
+        AllowedProgram[] programs;
+        SvmAccountPin[] pins;
+        SvmDataPin[] dataPins;
+    }
+
+    /**
+     * @dev The SVM rulebook — STORAGE type, lives inside `$svm`, append-only forever.
+     * @param initialized  set once; re-initialisation is refused
+     * @param spent        lifetime BRIDGED, recorded before dispatch, exactly as `Config.spent`
+     */
+    struct SvmConfig {
+        bool initialized;
+        uint48 validUntil;
+        bytes32 expectedCEA;
+        bytes32 gatewayProgram;
+        address asset;
+        uint256 maxAmountPerCall;
+        uint256 maxAmountTotal;
+        uint256 maxPCPerCall;
+        uint256 spent;
+        bytes32[] ceaAccounts;
+        AllowedProgram[] programs;
+        SvmAccountPin[] pins;
+        SvmDataPin[] dataPins;
+    }
+
     // ──────────────────────────────── events ────────────────────────────────
 
-    /// @dev `mode` and `chainHash` are both DERIVED from the envelope's chain string, not declared.
-    ///      For a universal config `chainHash` has additionally been verified against the asset's own
-    ///      `SOURCE_CHAIN_NAMESPACE()`.
+    /// @dev `mode`, `vm` and `chainHash` are all DERIVED from the envelope's chain string, not
+    ///      declared. For a universal config `chainHash` has additionally been verified against the
+    ///      asset's own `SOURCE_CHAIN_NAMESPACE()`. `vm` was added with the SVM rulebook (1.1.0).
     event URPPolicySet(
-        ConfigId indexed id, address indexed multiplexer, address indexed account, MandateType mode, bytes32 chainHash
+        ConfigId indexed id,
+        address indexed multiplexer,
+        address indexed account,
+        MandateType mode,
+        VmFamily vm,
+        bytes32 chainHash
     );
     /// @dev Emitted on every successful native check. Mirrors the effects: `value` and `amount` may
     ///      both be zero, and the event still fires, because `callsUsed` still moved.
@@ -326,6 +477,83 @@ interface IURP is IActionPolicy {
     ///      ACTUALLY is. An EMPTY slot is not this error: it returns a zeroed struct exactly as
     ///      before, because an empty slot is a state while a wrong-mode read is a caller bug.
     error WrongModeForCall(MandateType actual);
+    /// @dev A getter or assertion was called against the wrong VM family — `getConfig` on an SVM
+    ///      slot, `getSvmConfig` on an EVM one. Carries the family the config ACTUALLY is.
+    error WrongVmForCall(VmFamily actual);
+
+    // ───────────────────────── svm mode errors ─────────────────────────
+
+    // init
+    /// @dev init: zero expectedCEA, gatewayProgram or asset.
+    error InvalidSvmConfigField();
+    /// @dev init: 0 or > MAX_ALLOWED_PROGRAMS.
+    error ProgramListOutOfRange(uint256 length);
+    error TooManySvmPins(uint256 count);
+    error TooManySvmDataPins(uint256 count);
+    error TooManyCeaAccounts(uint256 count);
+    /// @dev init: `discriminatorLen` is 0 without `dataless`, non-zero with it, or above 8.
+    error DiscriminatorLenOutOfRange(uint256 rule, uint8 len);
+    /// @dev init: two rules on one program that a single request could both match. First-match
+    ///      must be EXACT, or the stricter rule is dead and its pins never run.
+    error AmbiguousRule(uint256 i, uint256 j);
+    /// @dev init: a program the rulebook forbids as a target can never be allow-listed either.
+    error ForbiddenProgramInAllowList(uint256 rule, bytes32 program);
+    error SvmPinRuleOutOfRange(uint256 pin, uint8 rule);
+    /// @dev init: account index at or beyond MAX_SVM_ACCOUNTS, or beyond the rule's `maxAccounts`.
+    error SvmPinIndexOutOfRange(uint256 pin, uint8 accountIndex);
+    /// @dev init: a rule's fixed account count exceeds the S13 bound, so no request could meet it.
+    error SvmMaxAccountsOutOfRange(uint256 rule, uint8 maxAccounts);
+    /// @dev init: two account pins name the same (rule, index).
+    error DuplicateSvmPin(uint256 first, uint256 second);
+    /// @dev init: a `ceaAccounts` entry is zero, repeated, or equal to an allow-listed program.
+    error InvalidCeaAccount(uint256 index);
+    /// @dev init: `ceaAccounts` does not contain `expectedCEA`, which would switch S18 off for the
+    ///      one account that always holds value.
+    error CeaAccountsMissExpectedCEA();
+    /// @dev init: a data pin with an impossible shape, or a vacuous / impossible comparison value
+    ///      (a ceiling or floor outside the field's range, a zero ratio term, an EQ value with bytes
+    ///      past `len`). See `SvmDataPin` and `URP._dataPinValueValid`.
+    error SvmDataPinInvalid(uint256 pin);
+    /// @dev init: every rule must own at least one account pin. HYGIENE, not a guarantee: one
+    ///      authority pin always passes. Which positions must be pinned is the compiler's job.
+    error RuleWithoutPin(uint256 rule);
+
+    // check
+    /// @dev S6b. Solana amounts are u64; the node would truncate. Defence in depth.
+    error AmountExceedsU64(uint256 amount);
+    /// @dev S11. The recipient must be a 32-byte, non-zero pubkey — the target program.
+    error RecipientNotPubkey(uint256 length);
+    /// @dev S12. Execute-only: an empty payload is a funds-only withdraw, never admitted (parity
+    ///      with EVM gate 12).
+    error SvmPayloadEmpty();
+    /// @dev S12. 1 = short header, 2 = short account list, 3 = short ix_data, 4 = trailing bytes.
+    ///      The grammar is the node's `decodePayload`, byte for byte.
+    error MalformedSvmPayload(uint8 code);
+    /// @dev S13. Only instruction_id 2 (execute) is admitted.
+    error SvmInstructionNotExecute(uint8 instructionId);
+    error SvmAccountsOutOfRange(uint256 count);
+    error SvmIxDataTooLong(uint256 length);
+    /// @dev S14. The node signs the payload's target but finalises with the recipient; they must
+    ///      agree or the TSS check fails on Solana at the owner's expense.
+    error RecipientTargetMismatch(bytes32 recipient, bytes32 target);
+    /// @dev S15. System, SPL Token, Token-2022, Stake, BPF Loader Upgradeable, Address Lookup Table,
+    ///      the gateway program and the CEA itself.
+    error ForbiddenTargetProgram(bytes32 program);
+    /// @dev S16. No rule matches (program, discriminator). Carries the first 8 bytes of ix_data.
+    error ProgramNotAllowed(bytes32 program, bytes8 discriminator);
+    /// @dev S16. The rule fixes the account count and the request's differs.
+    error SvmAccountCountMismatch(uint256 count, uint8 expected);
+    /// @dev S17. A pinned index does not exist in the request.
+    error SvmAccountCountBelowPin(uint256 pin, uint256 count, uint8 needed);
+    error SvmAccountPinMismatch(uint256 pin, uint8 accountIndex, bytes32 expected, bytes32 actual);
+    /// @dev S17. ix_data is too short for the pin's field.
+    error SvmDataTooShortForPin(uint256 pin, uint256 ixLen);
+    error SvmDataPinMismatch(uint256 pin, bytes32 expected, bytes32 actual);
+    error SvmDataFloorNotMet(uint256 pin, uint256 actual, uint256 floor);
+    error SvmDataCeilingExceeded(uint256 pin, uint256 actual, uint256 ceiling);
+    error SvmDataRatioNotMet(uint256 pin, uint256 a, uint256 b, uint64 num, uint64 den);
+    /// @dev S18. A CEA-controlled account appears at a position the matched rule does not pin to it.
+    error CeaAccountAtUnpinnedIndex(uint256 accountIndex, bytes32 account);
 
     // ───────────────────────────── v3 additions ─────────────────────────────
 
@@ -348,10 +576,15 @@ interface IURP is IActionPolicy {
     ///         a zeroed struct on an empty slot.
     function getNativeConfig(ConfigId id, address account) external view returns (NativeConfig memory);
 
+    /// @notice The SVM config. Reverts `WrongModeForCall(NATIVE)` on a native slot and
+    ///         `WrongVmForCall(EVM)` on an EVM universal slot; returns a zeroed struct on an empty
+    ///         slot, the same convention as the other two getters.
+    function getSvmConfig(ConfigId id, address account) external view returns (SvmConfig memory);
+
     /// @notice The mode record. NEVER REVERTS — the documented first call for any integrator that
     ///         does not already know a mandate's mode. An empty slot returns
-    ///         `(initialized: false, mode: UNIVERSAL, chainHash: 0)`, where the mode value is
-    ///         meaningless. A `chainHash` of zero on an INITIALISED entry means the config predates
+    ///         `(initialized: false, mode: UNIVERSAL, vm: EVM, chainHash: 0)`, where the mode and vm
+    ///         values are meaningless. A `chainHash` of zero on an INITIALISED entry means the config predates
     ///         the envelope carrying a chain — unverified, not "no chain".
     function getMode(ConfigId id, address account) external view returns (ModeSlot memory);
 

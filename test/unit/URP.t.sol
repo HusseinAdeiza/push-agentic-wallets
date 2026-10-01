@@ -10,6 +10,7 @@ import { IERC165 } from "forge-std/interfaces/IERC165.sol";
 import {
     Multicall,
     MandateType,
+    VmFamily,
     MULTICALL_SELECTOR,
     VALUE_SELECTOR,
     UniversalOutboundTxRequest
@@ -270,7 +271,9 @@ contract URPTest is BaseTest {
         // from the deployed layout — that is what makes this an APPEND and not a reinterpretation.
         // The rejected alternative (renaming `$configs` to `$universal`) would have failed here,
         // which is the whole point of the assertion.
-        string[] memory expected = new string[](8);
+        // APPENDED 2026-09-30 for the SVM rulebook: `$svm` after `$native`, `__gap` shrunk 43 -> 42
+        // in the same commit so it still ends at slot 49. Slots 0-6 are unchanged.
+        string[] memory expected = new string[](9);
         expected[0] = "UNIVERSAL_GATEWAY_PC";
         expected[1] = "UNIVERSAL_EXECUTOR_MODULE";
         expected[2] = "SESSION_ENGINE";
@@ -278,7 +281,8 @@ contract URPTest is BaseTest {
         expected[4] = "$credited";
         expected[5] = "$mode";
         expected[6] = "$native";
-        expected[7] = "__gap";
+        expected[7] = "$svm";
+        expected[8] = "__gap";
 
         assertStorageLayout("URP", expected);
     }
@@ -392,6 +396,55 @@ contract URPTest is BaseTest {
             _toDyn(nativeOffsets),
             _toDyn(nativeTypes)
         );
+
+        // `ModeSlot` gained `vm` on 2026-09-30, PLACED BETWEEN `mode` AND `chainHash`: it packs into
+        // slot 0 at byte 2, which no earlier implementation ever wrote, so every live entry reads
+        // 0 = EVM. `chainHash` stays at slot 1. This is the assertion that makes that claim true
+        // rather than argued; an append after `chainHash` would show `vm` at slot 2 and fail here.
+        string[4] memory modeLabels = ["initialized", "mode", "vm", "chainHash"];
+        uint256[4] memory modeSlots = [uint256(0), 0, 0, 1];
+        uint256[4] memory modeOffsets = [uint256(0), 1, 2, 0];
+        string[4] memory modeTypes = ["t_bool", "t_enum(MandateType)", "t_enum(VmFamily)", "t_bytes32"];
+        _assertStructLayout(
+            "ModeSlot", modeLabels.length, _toDyn(modeLabels), _toDyn(modeSlots), _toDyn(modeOffsets), _toDyn(modeTypes)
+        );
+
+        // `SvmConfig`, new on 2026-09-30. Frozen from its first deployment like the other two.
+        string[13] memory svmLabels = [
+            "initialized",
+            "validUntil",
+            "expectedCEA",
+            "gatewayProgram",
+            "asset",
+            "maxAmountPerCall",
+            "maxAmountTotal",
+            "maxPCPerCall",
+            "spent",
+            "ceaAccounts",
+            "programs",
+            "pins",
+            "dataPins"
+        ];
+        uint256[13] memory svmSlots = [uint256(0), 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+        uint256[13] memory svmOffsets = [uint256(0), 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+        string[13] memory svmTypes = [
+            "t_bool",
+            "t_uint48",
+            "t_bytes32",
+            "t_bytes32",
+            "t_address",
+            "t_uint256",
+            "t_uint256",
+            "t_uint256",
+            "t_uint256",
+            "t_array(t_bytes32)",
+            "t_array(t_struct(AllowedProgram)",
+            "t_array(t_struct(SvmAccountPin)",
+            "t_array(t_struct(SvmDataPin)"
+        ];
+        _assertStructLayout(
+            "SvmConfig", svmLabels.length, _toDyn(svmLabels), _toDyn(svmSlots), _toDyn(svmOffsets), _toDyn(svmTypes)
+        );
     }
 
     /// @dev Reads one struct's member slots out of URP's compiled artifact and compares them.
@@ -491,6 +544,34 @@ contract URPTest is BaseTest {
         }
     }
 
+    function _toDyn(string[4] memory a) internal pure returns (string[] memory out) {
+        out = new string[](4);
+        for (uint256 i; i < 4; ++i) {
+            out[i] = a[i];
+        }
+    }
+
+    function _toDyn(uint256[4] memory a) internal pure returns (uint256[] memory out) {
+        out = new uint256[](4);
+        for (uint256 i; i < 4; ++i) {
+            out[i] = a[i];
+        }
+    }
+
+    function _toDyn(string[13] memory a) internal pure returns (string[] memory out) {
+        out = new string[](13);
+        for (uint256 i; i < 13; ++i) {
+            out[i] = a[i];
+        }
+    }
+
+    function _toDyn(uint256[13] memory a) internal pure returns (uint256[] memory out) {
+        out = new uint256[](13);
+        for (uint256 i; i < 13; ++i) {
+            out[i] = a[i];
+        }
+    }
+
     /// @dev TUP stores its admin in the ERC-1967 admin slot; it is created by the proxy's own
     ///      constructor and is not returned anywhere, so it must be read from that slot.
     function _urpAdmin() internal view returns (address) {
@@ -508,7 +589,7 @@ contract URPTest is BaseTest {
      *      Extend this list ONLY for a deliberate addition, in the same commit that adds it.
      */
     function test_URP_exactSelectorSet() public view {
-        bytes4[] memory expected = new bytes4[](17);
+        bytes4[] memory expected = new bytes4[](18);
         uint256 i;
 
         // Wiring anchors and the public constant. Addressed by SIGNATURE, not `.selector`: solc
@@ -538,6 +619,8 @@ contract URPTest is BaseTest {
         // views
         expected[i++] = URP.getConfig.selector;
         expected[i++] = URP.getNativeConfig.selector;
+        // Added 2026-09-30 with the SVM rulebook — the third config getter, one per rulebook.
+        expected[i++] = URP.getSvmConfig.selector;
         expected[i++] = URP.getMode.selector;
         // Added 2026-09-17 with chain-derived mode. Exposes the hash URP derives NATIVE from, so the
         // deploy script asserts what URP will ACTUALLY use rather than recomputing the formula and
@@ -546,7 +629,7 @@ contract URPTest is BaseTest {
 
         expected[i++] = URP.supportsInterface.selector;
 
-        assertEq(i, 17, "the hard-coded list must be complete");
+        assertEq(i, 18, "the hard-coded list must be complete");
         assertSelectorSet("URP", expected);
     }
 
@@ -720,11 +803,13 @@ contract URPTest is BaseTest {
     ///      stops carrying the chain the config was granted for.
     function test_init_emitsBothPolicySetEvents() public {
         vm.expectEmit(true, true, true, true, address(urp));
+        // `vm` ADDED 2026-09-30 with the SVM rulebook: an `eip155:` universal grant reports EVM.
         emit IURP.URPPolicySet(
             CID,
             address(engine),
             ACCOUNT,
             MandateType.UNIVERSAL,
+            VmFamily.EVM,
             0xafa90c317deacd3d68f330a30f96e4fa7736e35e8d1426b2e1b2c04bce1c2fb7
         );
         vm.expectEmit(true, true, true, true, address(urp));

@@ -14,6 +14,7 @@ import {
     UniversalOutboundTxRequest,
     Multicall,
     MandateType,
+    VmFamily,
     MULTICALL_SELECTOR,
     VALUE_SELECTOR,
     SEND_OUTBOUND_SELECTOR as GATEWAY_SEND_OUTBOUND_SELECTOR
@@ -73,6 +74,45 @@ contract URP is IURP, Initializable {
     ///      request, so a new struct field fails the build rather than loosening gate 4c.
     uint256 internal constant MIN_OUTBOUND_BODY_LEN = 352;
 
+    // ───────────────────────────── svm rulebook bounds ─────────────────────────────
+
+    /// @dev Maximum allow-list entries per SVM config. Mirrors MAX_ALLOWED_CALLS.
+    uint256 internal constant MAX_ALLOWED_PROGRAMS = 32;
+    /// @dev Maximum account pins per SVM config. Bounds the S17 and S18 loops.
+    uint256 internal constant MAX_SVM_PINS = 16;
+    /// @dev Maximum ix_data pins per SVM config.
+    uint256 internal constant MAX_SVM_DATA_PINS = 8;
+    /// @dev Maximum CEA-controlled accounts an owner may list. Bounds the S18 loop.
+    uint256 internal constant MAX_CEA_ACCOUNTS = 8;
+    /// @dev Loop bound on a request's account list. Solana's transaction size limit bites first.
+    uint256 internal constant MAX_SVM_ACCOUNTS = 64;
+    /// @dev Loop bound on a request's instruction data.
+    uint256 internal constant MAX_SVM_IX_DATA = 1024;
+
+    // The SVM payload grammar — the node's `decodePayload`, byte for byte:
+    //   [u32 BE count][count × (pubkey32 ‖ is_writable u8)][u32 BE len][ix_data][u8 id][target32]
+    uint256 internal constant SVM_HEADER_LEN = 4;
+    uint256 internal constant SVM_ACCOUNT_LEN = 33;
+    uint256 internal constant SVM_LEN_FIELD = 4;
+    uint256 internal constant SVM_TRAILER_LEN = 33;
+    uint8 internal constant SVM_INSTRUCTION_EXECUTE = 2;
+
+    // Cluster-independent program ids, never targets. Decoded from their base58 ids by tooling and
+    // pinned by `test_svm_forbiddenProgramConstantsMatchBase58` — do not hand-edit a hex word.
+    /// @dev `11111111111111111111111111111111` — a system transfer with the CEA as funder drains it.
+    bytes32 internal constant SYSTEM_PROGRAM = bytes32(0);
+    /// @dev `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` — transfer/approve/close with CEA authority.
+    bytes32 internal constant SPL_TOKEN_PROGRAM = 0x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9;
+    /// @dev `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb` — the same surface on Token-2022.
+    bytes32 internal constant TOKEN_2022_PROGRAM = 0x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc;
+    /// @dev `Stake11111111111111111111111111111111111111` — withdraw with the CEA as authority.
+    bytes32 internal constant STAKE_PROGRAM = 0x06a1d8179137542a983437bdfe2a7ab2557f535c8a78722b68a49dc000000000;
+    /// @dev `BPFLoaderUpgradeab1e11111111111111111111111` — never a CEA action; refused outright.
+    bytes32 internal constant BPF_LOADER_UPGRADEABLE =
+        0x02a8f6914e88a1b0e210153ef763ae2b00c2b93d16c124d2c0537a1004800000;
+    /// @dev `AddressLookupTab1e1111111111111111111111111` — rent drain with the CEA as payer.
+    bytes32 internal constant ADDRESS_LOOKUP_TABLE = 0x0277a6af97339b7ac88d1892c90446f50002309266f62e53c118244982000000;
+
     // ───────────────────────────────── storage ─────────────────────────────────
     //
     // THE LAYOUT BELOW IS FROZEN. Behind a proxy, storage belongs to the proxy and outlives every
@@ -87,7 +127,8 @@ contract URP is IURP, Initializable {
     // slot 4  $credited
     // slot 5  $mode      APPENDED 2026-09-09 (native mode)
     // slot 6  $native    APPENDED 2026-09-09 (native mode)
-    // slots 7..49  __gap (uint256[43])
+    // slot 7  $svm       APPENDED 2026-09-30 (svm rulebook)
+    // slots 8..49  __gap (uint256[42])
     //
     // THE 2026-09-09 APPEND, AND WHY IT IS SAFE. `$mode` and `$native` were added AFTER `$credited`
     // and `__gap` was shrunk 45 -> 43 in the same commit, so slots 0-4 are byte-identical to the
@@ -135,6 +176,13 @@ contract URP is IURP, Initializable {
     ///      of these under eight distinct config ids.
     mapping(ConfigId => mapping(address => mapping(address => NativeConfig))) internal $native;
 
+    /// @dev configId => multiplexer => account => the SVM rulebook.
+    /// @dev APPENDED 2026-09-30 after `$native`; `__gap` shrunk 43 -> 42 in the same commit so it
+    ///      still ends at slot 49. Slots 0-6 are byte-identical to the deployed layout. `ModeSlot`
+    ///      gained a packed byte in the same change (see `IURP.ModeSlot.vm`); no member of any live
+    ///      struct moved. Measured with the layout tests, not assumed.
+    mapping(ConfigId => mapping(address => mapping(address => SvmConfig))) internal $svm;
+
     /**
      * @dev Reserved so a later version can add state without shifting anything above.
      *
@@ -144,9 +192,10 @@ contract URP is IURP, Initializable {
      *      safe and costs nothing here — reordering or removing one is not.
      *
      *      Was `uint256[45]` before the 2026-09-09 native-mode append; `$mode` and `$native` took
-     *      two slots, so it is 43. `__gap` still ends at slot 49.
+     *      two slots, so it became 43. `$svm` took one more on 2026-09-30, so it is 42. `__gap`
+     *      still ends at slot 49.
      */
-    uint256[43] private __gap;
+    uint256[42] private __gap;
 
     /**
      * @notice Locks the implementation so it can never be initialised in its own context.
@@ -208,6 +257,13 @@ contract URP is IURP, Initializable {
         return (false, MandateType.UNIVERSAL);
     }
 
+    /// @dev The family of a UNIVERSAL config. Reads the packed byte raw: a pre-family slot reads 0 =
+    ///      EVM, which is what every such config is. Meaningless for NATIVE and for empty slots;
+    ///      callers check the mode first.
+    function _vmOf(ConfigId id, address mux, address account) internal view returns (VmFamily) {
+        return $mode[id][mux][account].vm;
+    }
+
     /**
      * @notice Writes one permission's configuration. Reached inside `enableSessions` during the
      *         wallet's `grantMandate`, where `msg.sender` becomes the multiplexer key.
@@ -266,17 +322,28 @@ contract URP is IURP, Initializable {
         bytes32 chainHash = keccak256(bytes(chain));
         MandateType mode = PushChainLib.deriveMode(chainHash);
 
+        // THE FAMILY, derived only for UNIVERSAL. A native string is `eip155:` too and would classify
+        // EVM, but NATIVE has no family and must not carry a meaningless one. `deriveVm` refuses any
+        // namespace without a rulebook, so a `cosmos:` grant fails here, named, instead of producing
+        // a mandate that passes init and rejects every request.
+        VmFamily vm = VmFamily.EVM;
         if (mode == MandateType.UNIVERSAL) {
-            _initUniversal($configs[configId][msg.sender][account], body, chainHash);
+            vm = PushChainLib.deriveVm(chain);
+            if (vm == VmFamily.EVM) {
+                _initUniversal($configs[configId][msg.sender][account], body, chainHash);
+            } else {
+                _initSvm($svm[configId][msg.sender][account], body, chainHash);
+            }
         } else {
             _initNative($native[configId][msg.sender][account], body);
         }
 
         slot.initialized = true;
         slot.mode = mode;
+        slot.vm = vm;
         slot.chainHash = chainHash;
 
-        emit URPPolicySet(configId, msg.sender, account, mode, chainHash);
+        emit URPPolicySet(configId, msg.sender, account, mode, vm, chainHash);
         emit PolicySet(configId, msg.sender, account);
     }
 
@@ -328,17 +395,27 @@ contract URP is IURP, Initializable {
         //    expected; the call to a codeless address then SUCCEEDS with empty returndata and the
         //    failure happens when THIS frame tries to ABI-decode it — outside the try/catch. Without
         //    this line a typo'd asset address, the likeliest real mistake, reverts unnamed.
-        if (incoming.asset.code.length == 0) revert InvalidAsset(incoming.asset);
-
-        try IPRC20Source(incoming.asset).SOURCE_CHAIN_NAMESPACE() returns (string memory ns) {
-            bytes32 assetChain = keccak256(bytes(ns));
-            if (assetChain != chainHash) revert ChainMismatch(chainHash, assetChain);
-        } catch {
-            revert InvalidAsset(incoming.asset);
-        }
+        _requireAssetOnChain(incoming.asset, chainHash);
 
         _store(cfg, incoming);
         cfg.initialized = true;
+    }
+
+    /**
+     * @dev THE TEETH, shared by both universal families. Reverts `InvalidAsset` for a codeless
+     *      address, a reverting callee or a non-string answer, and `ChainMismatch` when the asset's
+     *      own `SOURCE_CHAIN_NAMESPACE()` hash differs from the declared chain. See the long note
+     *      in `_initUniversal` for why this external call is safe at init and nowhere else.
+     */
+    function _requireAssetOnChain(address asset, bytes32 chainHash) internal view {
+        if (asset.code.length == 0) revert InvalidAsset(asset);
+
+        try IPRC20Source(asset).SOURCE_CHAIN_NAMESPACE() returns (string memory ns) {
+            bytes32 assetChain = keccak256(bytes(ns));
+            if (assetChain != chainHash) revert ChainMismatch(chainHash, assetChain);
+        } catch {
+            revert InvalidAsset(asset);
+        }
     }
 
     /**
@@ -381,6 +458,223 @@ contract URP is IURP, Initializable {
 
         _storeNative(cfg, incoming);
         cfg.initialized = true;
+    }
+
+    /**
+     * @dev The SVM init guards — the `solana:*` counterpart of `_initUniversal`.
+     *      - Shape bounds first, then expiry and the three identity fields, then the allow-list
+     *        rules, then the pins, then the teeth. Same discipline as the universal branch: every
+     *        decode and guard before any write.
+     *      - The teeth are IDENTICAL to the universal branch and for the same reason: the asset's
+     *        `SOURCE_CHAIN_NAMESPACE()` is what the gateway routes on, so binding the declared chain
+     *        to it here is what makes a `solana:` grant with an EVM asset impossible.
+     * @param cfg        Storage slot to write.
+     * @param body       `abi.encode(SvmTerms)`.
+     * @param chainHash  keccak256 of the declared chain string, verified against the asset.
+     */
+    function _initSvm(SvmConfig storage cfg, bytes memory body, bytes32 chainHash) internal {
+        SvmTerms memory incoming = abi.decode(body, (SvmTerms));
+
+        uint256 ruleCount = incoming.programs.length;
+        if (ruleCount == 0 || ruleCount > MAX_ALLOWED_PROGRAMS) revert ProgramListOutOfRange(ruleCount);
+        if (incoming.pins.length > MAX_SVM_PINS) revert TooManySvmPins(incoming.pins.length);
+        if (incoming.dataPins.length > MAX_SVM_DATA_PINS) revert TooManySvmDataPins(incoming.dataPins.length);
+        if (incoming.ceaAccounts.length > MAX_CEA_ACCOUNTS) revert TooManyCeaAccounts(incoming.ceaAccounts.length);
+
+        if (incoming.validUntil == 0 || incoming.validUntil <= block.timestamp) {
+            revert InvalidExpiry(incoming.validUntil);
+        }
+        if (incoming.expectedCEA == bytes32(0) || incoming.gatewayProgram == bytes32(0) || incoming.asset == address(0))
+        {
+            revert InvalidSvmConfigField();
+        }
+
+        _checkSvmRules(incoming);
+        _checkSvmPinShapes(incoming);
+        _checkCeaAccountList(incoming);
+
+        _requireAssetOnChain(incoming.asset, chainHash);
+
+        _storeSvm(cfg, incoming);
+        cfg.initialized = true;
+    }
+
+    /**
+     * @dev Allow-list rule guards: tag shape, forbidden programs, and pairwise exactness.
+     *      - A rule is `dataless` XOR has a 1..8-byte tag.
+     *      - A fixed account count, if set, is within the S13 bound.
+     *      - A program the check path forbids as a target is refused here too; S15 is then defence
+     *        in depth against state this guard makes unreachable.
+     *      - Two rules on one program must not both match one request, or first-match makes the
+     *        later rule dead and its pins never run. O(n^2) at n <= 32.
+     */
+    function _checkSvmRules(SvmTerms memory t) internal pure {
+        uint256 n = t.programs.length;
+        for (uint256 i; i < n;) {
+            AllowedProgram memory r = t.programs[i];
+            bool badLen = r.dataless ? r.discriminatorLen != 0 : (r.discriminatorLen == 0 || r.discriminatorLen > 8);
+            if (badLen) revert DiscriminatorLenOutOfRange(i, r.discriminatorLen);
+            // A fixed count above the S13 loop bound can never be met: every request would fail
+            // S13 or S16. Refused here so the owner never grants a rule that is dead on arrival.
+            if (r.maxAccounts > MAX_SVM_ACCOUNTS) revert SvmMaxAccountsOutOfRange(i, r.maxAccounts);
+            if (_isForbiddenProgram(r.program, t.gatewayProgram, t.expectedCEA)) {
+                revert ForbiddenProgramInAllowList(i, r.program);
+            }
+            for (uint256 j; j < i;) {
+                if (_rulesCollide(t.programs[j], r)) revert AmbiguousRule(j, i);
+                unchecked {
+                    ++j;
+                }
+            }
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @dev Two rules collide when a single request could match both: same program and either both
+    ///      dataless, or neither dataless with one tag a prefix of the other. A dataless rule and a
+    ///      tagged rule never collide — one needs empty ix_data, the other needs at least the tag.
+    function _rulesCollide(AllowedProgram memory a, AllowedProgram memory b) internal pure returns (bool) {
+        if (a.program != b.program) return false;
+        if (a.dataless || b.dataless) return a.dataless && b.dataless;
+        uint256 shorter = a.discriminatorLen < b.discriminatorLen ? a.discriminatorLen : b.discriminatorLen;
+        bytes8 mask = _prefixMask8(shorter);
+        return (a.discriminator & mask) == (b.discriminator & mask);
+    }
+
+    /**
+     * @dev Pin shape guards, both kinds.
+     *      - Account pins: rule in range; index below the loop bound and, when the rule fixes its
+     *        account count, below that too. Every rule must own at least one — HYGIENE: an
+     *        authority-only pin always passes, and which positions must be pinned is the compiler's
+     *        responsibility, not this contract's.
+     *        One pin per (rule, index).
+     *      - Data pins: rule in range and not dataless; `len` 1..32 for EQ, 1..8 otherwise; from-end
+     *        offsets must reach at least `len` back; every offset stays inside the ix_data bound;
+     *        the comparison value must be one the field can actually be compared against
+     *        (`_dataPinValueValid`).
+     */
+    function _checkSvmPinShapes(SvmTerms memory t) internal pure {
+        uint256 ruleCount = t.programs.length;
+        bool[] memory covered = new bool[](ruleCount); // rule i has at least one account pin
+
+        uint256 n = t.pins.length;
+        for (uint256 i; i < n;) {
+            SvmAccountPin memory pin = t.pins[i];
+            if (pin.ruleIndex >= ruleCount) revert SvmPinRuleOutOfRange(i, pin.ruleIndex);
+            uint8 cap = t.programs[pin.ruleIndex].maxAccounts;
+            if (pin.accountIndex >= MAX_SVM_ACCOUNTS || (cap != 0 && pin.accountIndex >= cap)) {
+                revert SvmPinIndexOutOfRange(i, pin.accountIndex);
+            }
+            // One position, one pin. Two pins on a (rule, index) are either redundant or
+            // contradictory, and a contradictory pair makes the rule unsatisfiable. O(n^2), n <= 16.
+            for (uint256 j; j < i;) {
+                if (t.pins[j].ruleIndex == pin.ruleIndex && t.pins[j].accountIndex == pin.accountIndex) {
+                    revert DuplicateSvmPin(j, i);
+                }
+                unchecked {
+                    ++j;
+                }
+            }
+            covered[pin.ruleIndex] = true;
+            unchecked {
+                ++i;
+            }
+        }
+        for (uint256 r; r < ruleCount;) {
+            if (!covered[r]) revert RuleWithoutPin(r);
+            unchecked {
+                ++r;
+            }
+        }
+
+        n = t.dataPins.length;
+        for (uint256 i; i < n;) {
+            SvmDataPin memory dp = t.dataPins[i];
+            if (dp.ruleIndex >= ruleCount || t.programs[dp.ruleIndex].dataless) revert SvmDataPinInvalid(i);
+            uint256 maxLen = dp.mode == SvmDataPinMode.EQ ? 32 : 8;
+            if (dp.len == 0 || dp.len > maxLen) revert SvmDataPinInvalid(i);
+            if (!_offsetValid(dp.fromEnd, dp.offset, dp.len)) revert SvmDataPinInvalid(i);
+            if (!_dataPinValueValid(dp)) revert SvmDataPinInvalid(i);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @dev A from-start field must end inside the bound; a from-end field must start at least `len`
+    ///      back and no further back than the bound.
+    function _offsetValid(bool fromEnd, uint16 offset, uint8 len) internal pure returns (bool) {
+        if (fromEnd) return uint256(offset) >= len && uint256(offset) <= MAX_SVM_IX_DATA;
+        return uint256(offset) + len <= MAX_SVM_IX_DATA;
+    }
+
+    /**
+     * @dev Refuses a data pin whose comparison is vacuous or impossible, and the encoding mistake that
+     *      would make it so. The two value encodings differ by mode — EQ compares LEFT-ALIGNED raw
+     *      bytes, the integer modes compare a RIGHT-ALIGNED integer — and each mis-encoding of one
+     *      as the other is caught here, at grant, instead of producing a pin that silently never
+     *      fails (a ceiling above the field's range) or never passes.
+     *      - EQ: every byte of `expected` past `len` must be zero (a right-aligned integer would
+     *        leave its value there).
+     *      - GTE / LTE: `expected` must fit in `len` bytes, i.e. `< 2^(8·len)`.
+     *      - RATIO: `num` and `den` non-zero (`num == 0` makes `a·den >= 0` always true), and the
+     *        second field's offset valid.
+     */
+    function _dataPinValueValid(SvmDataPin memory dp) internal pure returns (bool) {
+        if (dp.mode == SvmDataPinMode.EQ) return dp.expected & ~_prefixMask32(dp.len) == bytes32(0);
+        if (dp.mode == SvmDataPinMode.RATIO_GTE_LE) {
+            return dp.num != 0 && dp.den != 0 && _offsetValid(dp.fromEnd, dp.offsetB, dp.len);
+        }
+        return uint256(dp.expected) >> (8 * uint256(dp.len)) == 0;
+    }
+
+    /**
+     * @dev The CEA-controlled account list that S18 enforces.
+     *      - Must contain `expectedCEA`. The CEA always holds value (it is the signer, and pSOL lands
+     *        on it), so an empty or CEA-less list would silently switch the aliasing defence off.
+     *      - No zero entry: `bytes32(0)` is the System program's id, present in most account lists,
+     *        and would make every request fail.
+     *      - No entry equal to an allow-listed program: Anchor passes the program's own account in
+     *        many instructions, and listing it would make every such request fail.
+     *      - No duplicates.
+     *      All four fail closed at check time anyway; refusing them here means an owner never grants
+     *      a mandate that can never be used.
+     */
+    function _checkCeaAccountList(SvmTerms memory t) internal pure {
+        uint256 n = t.ceaAccounts.length;
+        bool hasCea;
+        for (uint256 i; i < n;) {
+            bytes32 key = t.ceaAccounts[i];
+            if (key == bytes32(0)) revert InvalidCeaAccount(i);
+            if (key == t.expectedCEA) hasCea = true;
+            for (uint256 j; j < i;) {
+                if (t.ceaAccounts[j] == key) revert InvalidCeaAccount(i);
+                unchecked {
+                    ++j;
+                }
+            }
+            uint256 rules = t.programs.length;
+            for (uint256 r; r < rules;) {
+                if (t.programs[r].program == key) revert InvalidCeaAccount(i);
+                unchecked {
+                    ++r;
+                }
+            }
+            unchecked {
+                ++i;
+            }
+        }
+        if (!hasCea) revert CeaAccountsMissExpectedCEA();
+    }
+
+    /// @dev The programs an SVM mandate may never target, directly. Inner CPIs are the allow-listed
+    ///      program's own business — this set guards the top level only.
+    function _isForbiddenProgram(bytes32 program, bytes32 gatewayProgram, bytes32 cea) internal pure returns (bool) {
+        return program == SYSTEM_PROGRAM || program == SPL_TOKEN_PROGRAM || program == TOKEN_2022_PROGRAM
+            || program == STAKE_PROGRAM || program == BPF_LOADER_UPGRADEABLE || program == ADDRESS_LOOKUP_TABLE
+            || program == gatewayProgram || program == cea;
     }
 
     /**
@@ -452,8 +746,11 @@ contract URP is IURP, Initializable {
         // This is also what lets pre-upgrade universal mandates keep working with no migration:
         // their `$mode` slot is empty, so they route to `_checkUniversal`, which is correct.
         ModeSlot storage slot = $mode[id][msg.sender][account];
-        if (slot.initialized && slot.mode == MandateType.NATIVE) {
-            return _checkNative(id, account, target, value, data);
+        if (slot.initialized) {
+            if (slot.mode == MandateType.NATIVE) return _checkNative(id, account, target, value, data);
+            // The family byte was never written by earlier implementations, so it reads 0 = EVM on
+            // every pre-existing universal slot — those keep routing exactly where they always did.
+            if (slot.vm == VmFamily.SVM) return _checkSvm(id, account, target, value, data);
         }
         return _checkUniversal(id, account, target, value, data);
     }
@@ -678,6 +975,338 @@ contract URP is IURP, Initializable {
     }
 
     /**
+     * @dev The SVM gauntlet — S1 to S18, then effects. Same discipline as the other two: it runs
+     *      BEFORE the session signature is verified, on unauthenticated calldata from an arbitrary
+     *      caller, so it makes no external call, applies all effects last, and reverts on every
+     *      failure.
+     *
+     *      S1-S10 are the universal gates 1-10 restated against `SvmConfig` — they are chain-
+     *      independent. S6b is Solana's u64 amount. S11 onwards replace gates 11-16:
+     *
+     *      S11  the recipient is a 32-byte, non-zero pubkey (the target program)
+     *      S12  the payload is non-empty and parses as the node's execute grammar, exactly
+     *      S13  instruction_id is 2 (execute); account count and ix_data length are within bounds
+     *      S14  the payload's target program equals the recipient
+     *      S15  the target is not a forbidden program
+     *      S16  a rule matches (program, tag) — first match — and its account count, if fixed, holds
+     *      S17  every account pin and every data pin of that rule holds
+     *      S18  every CEA-controlled account in the list sits only where that rule pins it
+     *
+     *      - A zero amount passes S6/S7 and writes nothing: on SVM that is a payload-only call
+     *        acting on capital already at the destination, the analogue of the EVM redeploy path.
+     *      - The forbidden-program check runs before the allow-list, as gate 14 runs before 15.
+     */
+    function _checkSvm(ConfigId id, address account, address target, uint256 value, bytes calldata data)
+        internal
+        returns (uint256)
+    {
+        SvmConfig storage cfg = $svm[id][msg.sender][account];
+
+        if (!cfg.initialized) revert NotInitialized(id, account);
+
+        if (block.timestamp > cfg.validUntil) revert MandateExpired(cfg.validUntil);
+
+        if (target != UNIVERSAL_GATEWAY_PC) revert InvalidTarget(target);
+
+        if (data.length < 4) revert CalldataTooShort(data.length);
+
+        if (bytes4(data[0:4]) != SEND_OUTBOUND_SELECTOR) revert InvalidSelector(bytes4(data[0:4]));
+
+        if (data.length < 4 + MIN_OUTBOUND_BODY_LEN) revert MalformedOutboundRequest(data.length);
+        UniversalOutboundTxRequest memory req = abi.decode(data[4:], (UniversalOutboundTxRequest));
+
+        if (req.token != cfg.asset) revert AssetMismatch(cfg.asset, req.token);
+
+        if (req.amount > cfg.maxAmountPerCall) revert AmountExceedsCap(req.amount, cfg.maxAmountPerCall);
+
+        if (req.amount > type(uint64).max) revert AmountExceedsU64(req.amount);
+
+        uint256 newSpent = cfg.spent + req.amount;
+        if (newSpent > cfg.maxAmountTotal) revert TotalSpendCapExceeded(newSpent, cfg.maxAmountTotal);
+
+        if (value > cfg.maxPCPerCall) revert PCValueExceedsCap(value, cfg.maxPCPerCall);
+
+        if (req.maxPCForGas == 0) revert UncappedGasSwapRejected();
+
+        if (req.revertRecipient != account) revert InvalidRevertRecipient(account, req.revertRecipient);
+
+        // S11 — a zero pubkey is reported with the length it has (32): the shape is right, the value
+        // is not, and both are "not a pubkey".
+        if (req.recipient.length != 32) revert RecipientNotPubkey(req.recipient.length);
+        bytes32 recipient = _loadWord(req.recipient, 0);
+        if (recipient == bytes32(0)) revert RecipientNotPubkey(32);
+
+        _checkSvmPayload(cfg, recipient, req.payload);
+
+        if (req.amount > 0) {
+            cfg.spent = newSpent;
+            emit OutboundMetered(id, msg.sender, account, req.amount);
+        }
+
+        return VALIDATION_SUCCESS;
+    }
+
+    /// @dev The parsed shape of an execute payload. Memory only; never stored.
+    struct SvmPayloadView {
+        uint256 count;
+        uint256 ixOff;
+        uint256 ixLen;
+        bytes32 target;
+    }
+
+    /**
+     * @dev S12 to S18. Split out for stack depth; makes no external call, writes no storage.
+     * @param cfg        Config to validate against.
+     * @param recipient  The request's recipient, already proven to be a non-zero pubkey.
+     * @param payload    The execute payload carried by the outbound request.
+     */
+    function _checkSvmPayload(SvmConfig storage cfg, bytes32 recipient, bytes memory payload) internal view {
+        SvmPayloadView memory v = _parseSvmPayload(payload);
+
+        if (v.target != recipient) revert RecipientTargetMismatch(recipient, v.target);
+
+        if (_isForbiddenProgram(v.target, cfg.gatewayProgram, cfg.expectedCEA)) {
+            revert ForbiddenTargetProgram(v.target);
+        }
+
+        uint256 rule = _matchSvmRule(cfg, payload, v);
+
+        _checkSvmAccountPins(cfg, payload, v, rule);
+        _checkSvmDataPins(cfg, payload, v, rule);
+        _checkCeaAccounts(cfg, payload, v, rule);
+    }
+
+    /**
+     * @dev S12/S13 — the node's `decodePayload` grammar, byte for byte, including "consumed exactly":
+     *      `[u32 BE count][count × (pubkey32 ‖ writable u8)][u32 BE len][ix_data][u8 id][target32]`.
+     *      Every length is checked before the read it guards. `is_writable` bytes are read past,
+     *      never judged — a wrong flag fails on Solana, not here.
+     */
+    function _parseSvmPayload(bytes memory p) internal pure returns (SvmPayloadView memory v) {
+        if (p.length == 0) revert SvmPayloadEmpty();
+        if (p.length < SVM_HEADER_LEN + SVM_LEN_FIELD + SVM_TRAILER_LEN) revert MalformedSvmPayload(1);
+
+        v.count = _u32be(p, 0);
+        if (v.count > MAX_SVM_ACCOUNTS) revert SvmAccountsOutOfRange(v.count);
+
+        uint256 lenOff = SVM_HEADER_LEN + v.count * SVM_ACCOUNT_LEN;
+        if (p.length < lenOff + SVM_LEN_FIELD) revert MalformedSvmPayload(2);
+
+        v.ixLen = _u32be(p, lenOff);
+        if (v.ixLen > MAX_SVM_IX_DATA) revert SvmIxDataTooLong(v.ixLen);
+        v.ixOff = lenOff + SVM_LEN_FIELD;
+
+        uint256 expected = v.ixOff + v.ixLen + SVM_TRAILER_LEN;
+        if (p.length < expected) revert MalformedSvmPayload(3);
+        if (p.length > expected) revert MalformedSvmPayload(4);
+
+        uint8 id = uint8(p[v.ixOff + v.ixLen]);
+        if (id != SVM_INSTRUCTION_EXECUTE) revert SvmInstructionNotExecute(id);
+
+        v.target = _loadWord(p, v.ixOff + v.ixLen + 1);
+    }
+
+    /**
+     * @dev S16 — first rule whose program equals the target and whose tag matches: a dataless rule
+     *      matches only empty ix_data; a tagged rule needs at least `discriminatorLen` bytes and a
+     *      prefix-equal tag. Init guarantees at most one rule can match, so first-match is exact.
+     *      Then the rule's fixed account count, if any.
+     */
+    function _matchSvmRule(SvmConfig storage cfg, bytes memory p, SvmPayloadView memory v)
+        internal
+        view
+        returns (uint256)
+    {
+        uint256 n = cfg.programs.length;
+        for (uint256 i; i < n;) {
+            AllowedProgram storage r = cfg.programs[i];
+            if (r.program == v.target && _tagMatches(r, p, v)) {
+                uint8 cap = r.maxAccounts;
+                if (cap != 0 && v.count != cap) revert SvmAccountCountMismatch(v.count, cap);
+                return i;
+            }
+            unchecked {
+                ++i;
+            }
+        }
+        uint256 shown = v.ixLen < 8 ? v.ixLen : 8;
+        revert ProgramNotAllowed(v.target, bytes8(_loadWord(p, v.ixOff)) & _prefixMask8(shown));
+    }
+
+    function _tagMatches(AllowedProgram storage r, bytes memory p, SvmPayloadView memory v)
+        internal
+        view
+        returns (bool)
+    {
+        if (r.dataless) return v.ixLen == 0;
+        uint8 len = r.discriminatorLen;
+        if (v.ixLen < len) return false;
+        bytes8 mask = _prefixMask8(len);
+        return (bytes8(_loadWord(p, v.ixOff)) & mask) == (r.discriminator & mask);
+    }
+
+    /// @dev S17, account half: every pin of the matched rule names an index that exists and holds
+    ///      the expected key.
+    function _checkSvmAccountPins(SvmConfig storage cfg, bytes memory p, SvmPayloadView memory v, uint256 rule)
+        internal
+        view
+    {
+        uint256 n = cfg.pins.length;
+        for (uint256 i; i < n;) {
+            SvmAccountPin storage pin = cfg.pins[i];
+            if (pin.ruleIndex == rule) {
+                if (v.count <= pin.accountIndex) revert SvmAccountCountBelowPin(i, v.count, pin.accountIndex);
+                bytes32 actual = _svmAccount(p, pin.accountIndex);
+                if (actual != pin.expected) revert SvmAccountPinMismatch(i, pin.accountIndex, pin.expected, actual);
+            }
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @dev S17, data half. Offsets resolve from the start or the end of ix_data; init proved the
+    ///      from-end shape reaches at least `len` back, so only the length floor is checked here.
+    ///      Integer reads are little-endian, `len` bytes; the ratio is computed in uint256 and cannot
+    ///      overflow (both operands are at most 64 bits wide).
+    function _checkSvmDataPins(SvmConfig storage cfg, bytes memory p, SvmPayloadView memory v, uint256 rule)
+        internal
+        view
+    {
+        uint256 n = cfg.dataPins.length;
+        for (uint256 i; i < n;) {
+            SvmDataPin storage dp = cfg.dataPins[i];
+            if (dp.ruleIndex == rule) _checkOneDataPin(dp, p, v, i);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    function _checkOneDataPin(SvmDataPin storage dp, bytes memory p, SvmPayloadView memory v, uint256 i) internal view {
+        uint256 off = _resolveOffset(dp.fromEnd, dp.offset, dp.len, v.ixLen, i);
+        uint256 at = v.ixOff + off;
+        SvmDataPinMode mode = dp.mode;
+
+        if (mode == SvmDataPinMode.EQ) {
+            bytes32 mask = _prefixMask32(dp.len);
+            bytes32 actual = _loadWord(p, at) & mask;
+            bytes32 want = dp.expected & mask;
+            if (actual != want) revert SvmDataPinMismatch(i, want, actual);
+            return;
+        }
+
+        uint256 a = _uintLE(p, at, dp.len);
+        if (mode == SvmDataPinMode.GTE_LE) {
+            if (a < uint256(dp.expected)) revert SvmDataFloorNotMet(i, a, uint256(dp.expected));
+        } else if (mode == SvmDataPinMode.LTE_LE) {
+            if (a > uint256(dp.expected)) revert SvmDataCeilingExceeded(i, a, uint256(dp.expected));
+        } else {
+            uint256 offB = _resolveOffset(dp.fromEnd, dp.offsetB, dp.len, v.ixLen, i);
+            uint256 b = _uintLE(p, v.ixOff + offB, dp.len);
+            if (a * dp.den < b * dp.num) revert SvmDataRatioNotMet(i, a, b, dp.num, dp.den);
+        }
+    }
+
+    /// @dev The field's start relative to ix_data, or `SvmDataTooShortForPin` if ix_data cannot hold it.
+    function _resolveOffset(bool fromEnd, uint16 offset, uint8 len, uint256 ixLen, uint256 pin)
+        internal
+        pure
+        returns (uint256)
+    {
+        if (fromEnd) {
+            if (ixLen < offset) revert SvmDataTooShortForPin(pin, ixLen);
+            return ixLen - offset;
+        }
+        if (ixLen < uint256(offset) + len) revert SvmDataTooShortForPin(pin, ixLen);
+        return offset;
+    }
+
+    /**
+     * @dev S18 — a CEA-controlled account may appear only where the matched rule pins it. Any other
+     *      occurrence hands a program, running with the CEA's signature, an account it was not
+     *      granted. Accounts absent from `ceaAccounts` are not judged: the list is the owner's
+     *      statement of what holds value. O(count × |ceaAccounts| × |pins|), all bounded.
+     */
+    function _checkCeaAccounts(SvmConfig storage cfg, bytes memory p, SvmPayloadView memory v, uint256 rule)
+        internal
+        view
+    {
+        // Never empty: init requires `expectedCEA` in the list (`_checkCeaAccountList`).
+        uint256 listed = cfg.ceaAccounts.length;
+        for (uint256 i; i < v.count;) {
+            bytes32 key = _svmAccount(p, i);
+            for (uint256 c; c < listed;) {
+                if (cfg.ceaAccounts[c] == key && !_pinnedAt(cfg, rule, i)) {
+                    revert CeaAccountAtUnpinnedIndex(i, key);
+                }
+                unchecked {
+                    ++c;
+                }
+            }
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @dev Whether the matched rule pins `index` at all. S17 has already proved that every pinned
+    ///      position holds its expected key, so "pinned" and "pinned to this key" are the same fact
+    ///      here and the key is not re-compared.
+    function _pinnedAt(SvmConfig storage cfg, uint256 rule, uint256 index) internal view returns (bool) {
+        uint256 n = cfg.pins.length;
+        for (uint256 i; i < n;) {
+            SvmAccountPin storage pin = cfg.pins[i];
+            if (pin.ruleIndex == rule && pin.accountIndex == index) return true;
+            unchecked {
+                ++i;
+            }
+        }
+        return false;
+    }
+
+    // ───────────────────────── svm byte helpers (pure, memory only) ─────────────────────────
+
+    /// @dev The pubkey of account `i` in a parsed payload. Callers bound `i` by the parsed count.
+    function _svmAccount(bytes memory p, uint256 i) internal pure returns (bytes32) {
+        return _loadWord(p, SVM_HEADER_LEN + i * SVM_ACCOUNT_LEN);
+    }
+
+    /// @dev Loads 32 bytes at `off`. Every caller has already proved the bytes it USES are inside
+    ///      `b`; bytes past the end are masked away by the caller, never compared.
+    function _loadWord(bytes memory b, uint256 off) internal pure returns (bytes32 w) {
+        // solhint-disable-next-line no-inline-assembly
+        assembly ("memory-safe") {
+            w := mload(add(add(b, 0x20), off))
+        }
+    }
+
+    function _u32be(bytes memory b, uint256 off) internal pure returns (uint256) {
+        return uint256(uint32(bytes4(_loadWord(b, off))));
+    }
+
+    /// @dev Little-endian unsigned integer of `len` bytes (1..8) starting at `off`.
+    function _uintLE(bytes memory b, uint256 off, uint256 len) internal pure returns (uint256 v) {
+        bytes32 w = _loadWord(b, off);
+        for (uint256 i; i < len;) {
+            v |= uint256(uint8(w[i])) << (8 * i);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @dev Keeps the top `len` bytes of a bytes8. `len` 8 keeps all (a shift by >= 64 is zero).
+    function _prefixMask8(uint256 len) internal pure returns (bytes8) {
+        return bytes8(~(type(uint64).max >> (8 * len)));
+    }
+
+    /// @dev Keeps the top `len` bytes of a bytes32. `len` 32 keeps all.
+    function _prefixMask32(uint256 len) internal pure returns (bytes32) {
+        return bytes32(~(type(uint256).max >> (8 * len)));
+    }
+
+    /**
      * @notice Exact-equality assertion on the spend counter; the change-flow race guard.
      *
      * @dev    - Intended as the first entry of the owner's atomic change batch: assert, revoke,
@@ -696,6 +1325,15 @@ contract URP is IURP, Initializable {
     function assertSpent(ConfigId id, address account, uint256 expectedSpent) external view {
         (bool init, MandateType mode) = _modeOf(id, SESSION_ENGINE, account);
         if (init && mode == MandateType.NATIVE) revert WrongModeForCall(MandateType.NATIVE);
+
+        // Both universal families keep ONE `spent` counter with one meaning, so one assertion serves
+        // both; only the slot it reads differs. An SVM family byte is only ever written together with
+        // an initialised `SvmConfig`, so the initialised check below is the EVM branch's alone.
+        if (_vmOf(id, SESSION_ENGINE, account) == VmFamily.SVM) {
+            uint256 svmSpent = $svm[id][SESSION_ENGINE][account].spent;
+            if (svmSpent != expectedSpent) revert SpentMismatch(expectedSpent, svmSpent);
+            return;
+        }
 
         Config storage cfg = $configs[id][SESSION_ENGINE][account];
 
@@ -767,6 +1405,23 @@ contract URP is IURP, Initializable {
     function creditRevert(ConfigId id, address account, bytes32 outboundTxId, uint256 amount) external {
         if (msg.sender != UNIVERSAL_EXECUTOR_MODULE) revert NotExecutorModule(msg.sender);
 
+        // The family decides which counter is credited; the idempotency set is shared, because an
+        // outbound id belongs to exactly one config whatever its family. An SVM family byte is only
+        // ever written together with an initialised `SvmConfig`, so no initialised check is needed
+        // on this branch.
+        if (_vmOf(id, SESSION_ENGINE, account) == VmFamily.SVM) {
+            SvmConfig storage svm = $svm[id][SESSION_ENGINE][account];
+
+            if ($credited[outboundTxId]) revert AlreadyCredited(outboundTxId);
+            $credited[outboundTxId] = true;
+
+            uint256 appliedSvm = svm.spent > amount ? amount : svm.spent;
+            svm.spent -= appliedSvm;
+
+            emit RevertCredited(outboundTxId, id, account, appliedSvm);
+            return;
+        }
+
         Config storage cfg = $configs[id][SESSION_ENGINE][account];
 
         if (!cfg.initialized) revert NotInitialized(id, account);
@@ -795,8 +1450,25 @@ contract URP is IURP, Initializable {
     function getConfig(ConfigId id, address account) external view returns (Config memory) {
         (bool init, MandateType mode) = _modeOf(id, SESSION_ENGINE, account);
         if (init && mode == MandateType.NATIVE) revert WrongModeForCall(MandateType.NATIVE);
+        if (init && _vmOf(id, SESSION_ENGINE, account) == VmFamily.SVM) revert WrongVmForCall(VmFamily.SVM);
 
         return $configs[id][SESSION_ENGINE][account];
+    }
+
+    /**
+     * @notice The full SVM config including its rules and pins, keyed on the session engine.
+     * @dev    Reverts `WrongModeForCall(NATIVE)` on a native slot and `WrongVmForCall(EVM)` on an EVM
+     *         universal slot; an empty slot returns the zeroed struct. See `getConfig`.
+     * @param  id       Config id identifying the mandate.
+     * @param  account  The wallet the mandate belongs to.
+     * @return The stored SVM config.
+     */
+    function getSvmConfig(ConfigId id, address account) external view returns (SvmConfig memory) {
+        (bool init, MandateType mode) = _modeOf(id, SESSION_ENGINE, account);
+        if (init && mode == MandateType.NATIVE) revert WrongModeForCall(MandateType.NATIVE);
+        if (init && _vmOf(id, SESSION_ENGINE, account) == VmFamily.EVM) revert WrongVmForCall(VmFamily.EVM);
+
+        return $svm[id][SESSION_ENGINE][account];
     }
 
     /**
@@ -841,7 +1513,8 @@ contract URP is IURP, Initializable {
      */
     function getMode(ConfigId id, address account) external view returns (ModeSlot memory) {
         (bool init, MandateType mode) = _modeOf(id, SESSION_ENGINE, account);
-        return ModeSlot({ initialized: init, mode: mode, chainHash: $mode[id][SESSION_ENGINE][account].chainHash });
+        ModeSlot storage slot = $mode[id][SESSION_ENGINE][account];
+        return ModeSlot({ initialized: init, mode: mode, vm: slot.vm, chainHash: slot.chainHash });
     }
 
     /**
@@ -866,7 +1539,7 @@ contract URP is IURP, Initializable {
      *         BUMP THIS IN THE SAME COMMIT AS ANY LOGIC CHANGE.
      */
     function version() external pure returns (string memory) {
-        return "1.0.0";
+        return "1.1.0";
     }
 
     /**
@@ -1012,6 +1685,60 @@ contract URP is IURP, Initializable {
         uint256 len = incoming.pins.length;
         for (uint256 i; i < len;) {
             cfg.pins.push(incoming.pins[i]);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
+     * @dev Copies decoded SVM wire terms into storage. The SVM counterpart of `_store`.
+     *      - Forces `spent` to zero; URP owns it.
+     *      - Every dynamic member is copied ELEMENT BY ELEMENT, same shape and same reason as
+     *        `allowedCalls` and `pins`.
+     *      - Does not set `initialized`; the caller does, immediately after this returns.
+     */
+    function _storeSvm(SvmConfig storage cfg, SvmTerms memory incoming) internal {
+        cfg.validUntil = incoming.validUntil;
+        cfg.expectedCEA = incoming.expectedCEA;
+        cfg.gatewayProgram = incoming.gatewayProgram;
+        cfg.asset = incoming.asset;
+        cfg.maxAmountPerCall = incoming.maxAmountPerCall;
+        cfg.maxAmountTotal = incoming.maxAmountTotal;
+        cfg.maxPCPerCall = incoming.maxPCPerCall;
+        cfg.spent = 0;
+
+        delete cfg.ceaAccounts;
+        uint256 len = incoming.ceaAccounts.length;
+        for (uint256 i; i < len;) {
+            cfg.ceaAccounts.push(incoming.ceaAccounts[i]);
+            unchecked {
+                ++i;
+            }
+        }
+
+        delete cfg.programs;
+        len = incoming.programs.length;
+        for (uint256 i; i < len;) {
+            cfg.programs.push(incoming.programs[i]);
+            unchecked {
+                ++i;
+            }
+        }
+
+        delete cfg.pins;
+        len = incoming.pins.length;
+        for (uint256 i; i < len;) {
+            cfg.pins.push(incoming.pins[i]);
+            unchecked {
+                ++i;
+            }
+        }
+
+        delete cfg.dataPins;
+        len = incoming.dataPins.length;
+        for (uint256 i; i < len;) {
+            cfg.dataPins.push(incoming.dataPins[i]);
             unchecked {
                 ++i;
             }
