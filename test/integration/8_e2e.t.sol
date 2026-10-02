@@ -18,10 +18,12 @@ import {
 import { MockUniversalGateway, MockPRC20 } from "../mocks/MockUniversalGateway.sol";
 import { StakeDummy } from "../mocks/StakeDummy.sol";
 import { MockERC20 } from "../mocks/MockERC20.sol";
+import { MockUEA } from "../mocks/MockUEA.sol";
 
 import { AGW } from "../../src/AGW.sol";
 import { IAGW } from "../../src/interfaces/IAGW.sol";
 import { IUniversalRulesPolicy } from "../../src/interfaces/IUniversalRulesPolicy.sol";
+import { AGWErrors } from "../../src/libraries/Errors.sol";
 import { ModeLib, ModeCode } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib } from "../../src/libraries/ExecutionLib.sol";
 import { Multicall } from "../../src/libraries/Types.sol";
@@ -29,7 +31,6 @@ import { Multicall } from "../../src/libraries/Types.sol";
 import {
     PermissionId,
     ConfigId,
-    SmartSessionMode,
     Session,
     ActionData,
     PolicyData,
@@ -37,7 +38,6 @@ import {
     ERC7739Context
 } from "smartsessions/DataTypes.sol";
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
-import { ISmartSession } from "smartsessions/ISmartSession.sol";
 
 /**
  * @notice E2E — Bob lends 100 USDC. The flow document's stages 3, 5, 7 and 7b, end to end, against
@@ -79,8 +79,8 @@ contract E2ETest is BaseTest {
 
     uint256 internal constant HUNDRED_USDC = 100e6;
 
+    /// @dev The agent's Push address — an EOA here; `test_BobFlow_UEAAgent` uses a UEA instead.
     address internal agentAddr;
-    uint256 internal agentPk;
 
     bytes32 internal permissionId;
 
@@ -96,7 +96,7 @@ contract E2ETest is BaseTest {
         BOB_UEA = makeAddr("0xbobuea");
         BOB_AGW_CEA = makeAddr("0xbobagwcea");
         MORPHO_BLUE = makeAddr("morphoBlue");
-        (agentAddr, agentPk) = ecdsaKey("0xagentkey");
+        agentAddr = makeAddr("0xagent");
 
         vm.warp(1_700_000_000);
     }
@@ -151,28 +151,6 @@ contract E2ETest is BaseTest {
         return ModeCode.unwrap(ModeLib.encodeSimpleSingle());
     }
 
-    /// @dev The ten-field hash, rebuilt independently of the contract.
-    function _opHash(bytes memory ecd, uint192 key, uint64 seq, uint48 expiry, bytes32 pid)
-        internal
-        view
-        returns (bytes32)
-    {
-        return keccak256(
-            abi.encode(
-                keccak256("AGW.Op.v3"),
-                block.chainid,
-                address(bobAgw),
-                address(engine),
-                pid,
-                _singleMode(),
-                keccak256(ecd),
-                key,
-                seq,
-                expiry
-            )
-        );
-    }
-
     function _configId(bytes32 pid) internal view returns (ConfigId) {
         bytes32 actionId = keccak256(abi.encodePacked(GATEWAY, SEND_OUTBOUND_SELECTOR));
         return ConfigId.wrap(keccak256(abi.encodePacked(address(bobAgw), keccak256(abi.encodePacked(pid, actionId)))));
@@ -184,26 +162,34 @@ contract E2ETest is BaseTest {
 
     // ═══════════════════════════════ THE BOB FLOW ═══════════════════════════════
 
-    /// The full flow with an ECDSA agent key — the signature really is verified.
-    function test_BobFlow_ECDSA() public {
-        _runBobFlow(false);
+    /// The full flow with an EOA agent: the agent's own address calls the agent door.
+    function test_BobFlow_EOAAgent() public {
+        _runBobFlow(agentAddr, agentAddr);
     }
 
     /**
-     * The same flow with an Ed25519-scheme mandate and the USV observer etched at the precompile.
-     *
-     * THIS RUN PROVES THE ROUTING, NOT THE CRYPTOGRAPHY. The observer answers a fixed `true`, so
-     * what is demonstrated is that a scheme-1 mandate grants, that the wallet reaches the validator,
-     * that the validator reaches USV, and that the whole gauntlet and dispatch behave identically —
-     * NOT that any Ed25519 signature was checked. Correctness and liveness of that branch are proven
-     * only by P-03 against the real precompile; P-04 proves it fails closed when USV has no code.
+     * The same flow with an external-key agent: the rules set names the key's UEA, and every agent
+     * action is the origin key driving its UEA, which calls the wallet. The UEA verifies the external
+     * key (here `MockUEA`, with the real UEA's "only the origin key may drive me" rule); the wallet
+     * verifies no signature, only that the sender is the agent. The origin key calling the wallet
+     * directly is refused like any other stranger.
      */
-    function test_BobFlow_Ed25519Routing() public {
-        etchUSVObserver();
-        _runBobFlow(true);
+    function test_BobFlow_UEAAgent() public {
+        (address originKey,) = ecdsaKey("0xexternalkey");
+        MockUEA ua = new MockUEA(originKey);
+
+        bytes32 livePid = _runBobFlow(address(ua), originKey);
+
+        bytes memory ecd = _executionCalldata(0, 0.01 ether);
+        vm.prank(originKey);
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, livePid, originKey));
+        bobAgw.executeAsAgent(livePid, _singleMode(), ecd);
     }
 
-    function _runBobFlow(bool ed25519) internal {
+    /// @dev Runs stages 3, 5, 7b and 7 with `agent` named in the rules set and `caller` submitting:
+    ///      `caller == agent` is an EOA agent calling the door itself; otherwise `agent` is a MockUEA
+    ///      driven by `caller`, its origin key. Returns the regranted rules set's id, still live.
+    function _runBobFlow(address agent, address caller) internal returns (bytes32 newPid) {
         // ── STAGE 3 · the inbound multicall: deploy, grant, fund ──
         // Step 1 of the flow's multicall table. `deployWallet` calls `initializeAccount` itself, so
         // SmartSession is installed atomically — there is no uninitialised window.
@@ -214,12 +200,11 @@ contract E2ETest is BaseTest {
         assertEq(factory.ownerOf(address(bobAgw)), BOB_UEA, "the registry is the root of trust");
         assertTrue(bobAgw.isModuleInstalled(1, address(engine), ""), "engine installed atomically");
 
-        // Step 2: the mandate. Scheme 1 names an Ed25519 key; scheme 0 names the ECDSA address.
-        bytes memory keyConfig = ed25519 ? ed25519Config(bytes32(uint256(uint160(agentAddr)))) : ecdsaConfig(agentAddr);
-
+        // Step 2: the rules set, naming the agent's Push address.
         vm.prank(BOB_UEA);
-        permissionId = bobAgw.grantRules(canonicalSession(keyConfig, _urpConfig()));
-        assertTrue(engine.isPermissionEnabled(PermissionId.wrap(permissionId), address(bobAgw)), "mandate live");
+        permissionId = bobAgw.grantRules(canonicalSession(agentConfig(agent), _urpConfig()));
+        assertTrue(engine.isPermissionEnabled(PermissionId.wrap(permissionId), address(bobAgw)), "rules set live");
+        assertEq(bobAgw.agentOf(permissionId), agent, "the rules set names the agent");
 
         // Steps 3 and 4: funds and gas reach the wallet.
         pUSDC.mint(address(bobAgw), HUNDRED_USDC);
@@ -232,20 +217,16 @@ contract E2ETest is BaseTest {
 
         // ── STAGE 5 · execution through the agent door ──
         bytes memory ecd = _executionCalldata(HUNDRED_USDC, 0.05 ether);
-        bytes32 opHash = _opHash(ecd, 0, 0, 0, permissionId);
-        bytes memory sig = _sessionSig(opHash, permissionId, ed25519);
 
         vm.expectEmit(true, true, true, true, address(urp));
         emit IUniversalRulesPolicy.OutboundMetered(
             _configId(permissionId), address(engine), address(bobAgw), HUNDRED_USDC
         );
 
-        vm.expectEmit(true, true, true, true, address(bobAgw));
-        emit IAGW.RulesActionAuthorized(permissionId, 0, 0, opHash);
+        vm.expectEmit(true, true, false, true, address(bobAgw));
+        emit IAGW.RulesActionAuthorized(permissionId, agent, keccak256(ecd));
 
-        // ANYONE may relay — the caller is not the authority, the signature is.
-        vm.prank(RELAYER);
-        bobAgw.executeWithSession(address(engine), _singleMode(), ecd, sig, 0, 0, 0);
+        _act(agent, caller, permissionId, ecd);
 
         // The gateway received THE EXACT VALIDATED BYTES, from the WALLET.
         assertEq(gateway.callCount(), 1, "stage 5: one outbound");
@@ -254,7 +235,7 @@ contract E2ETest is BaseTest {
         assertEq(got.value, 0.05 ether, "the PC gas-swap value arrived");
 
         // The dispatched payload is everything after the 52-byte SINGLE header
-        // (target 20 + value 32), taken from the calldata the AGENT SIGNED.
+        // (target 20 + value 32), taken from the calldata the AGENT SUBMITTED.
         bytes memory dispatched = new bytes(ecd.length - 52);
         for (uint256 i; i < dispatched.length; ++i) {
             dispatched[i] = ecd[52 + i];
@@ -268,75 +249,65 @@ contract E2ETest is BaseTest {
         // ── LEDGER after stage 5 ──
         assertEq(pUSDC.balanceOf(address(bobAgw)), 0, "stage 5: 100 pUSDC left the wallet");
         assertEq(_spent(permissionId), HUNDRED_USDC, "stage 5: URP.spent == 100e6");
-        assertEq(bobAgw.getNonce(0), 1, "stage 5: the replay lane advanced");
 
         // ── STAGE 7b · the redeploy path — amount 0, and `spent` does NOT move ──
         // The capital is already at the CEA; moving it between protocols bridges nothing. The
         // lifetime cap counts what is BRIDGED, not what is REDEPLOYED — so with the cap already
         // fully consumed, this must still pass.
-        _submitRequest(_executionCalldata(0, 0.01 ether), 1, permissionId, ed25519);
+        _act(agent, caller, permissionId, _executionCalldata(0, 0.01 ether));
 
         assertEq(gateway.callCount(), 2, "stage 7b: the redeploy dispatched");
         assertEq(_spent(permissionId), HUNDRED_USDC, "stage 7b: spent UNCHANGED - it counts bridged, not redeployed");
 
-        // ── STAGE 7 · revoke, and the banked request dies ──
-        // The agent banks a signed request BEFORE the revocation.
+        newPid = _revokeAndRegrant(agent, caller);
+    }
+
+    /// @dev Stage 7 · revoke, and a request built for the revoked rules set dies — including after a
+    ///      byte-identical regrant, whose id is new. Split out for stack depth with the optimizer off.
+    function _revokeAndRegrant(address agent, address caller) internal returns (bytes32 newPid) {
         bytes memory bankedEcd = _executionCalldata(0, 0.01 ether);
-        bytes32 bankedHash = _opHash(bankedEcd, 0, 2, 0, permissionId);
-        bytes memory bankedSig = _sessionSig(bankedHash, permissionId, ed25519);
 
         vm.prank(BOB_UEA);
         bobAgw.revokeRules(permissionId);
         assertFalse(engine.isPermissionEnabled(PermissionId.wrap(permissionId), address(bobAgw)), "revoked");
 
-        vm.prank(RELAYER);
-        vm.expectRevert(
-            abi.encodeWithSelector(ISmartSession.InvalidPermissionId.selector, PermissionId.wrap(permissionId))
-        );
-        bobAgw.executeWithSession(address(engine), _singleMode(), bankedEcd, bankedSig, 0, 2, 0);
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, permissionId, agent));
+        _act(agent, caller, permissionId, bankedEcd);
 
-        // REGRANT with byte-identical terms — and the banked request STILL fails, because the
-        // wallet's monotonic grantNonce gave the replacement a different permissionId, which is
-        // bound into op-hash field 5.
+        // REGRANT with byte-identical terms — and the request for the old id STILL fails, because the
+        // wallet's monotonic grantNonce gave the replacement a different id.
         vm.prank(BOB_UEA);
-        bytes32 newPid = bobAgw.grantRules(canonicalSession(keyConfig, _urpConfig()));
-        assertTrue(newPid != permissionId, "the regranted mandate has a NEW id");
+        newPid = bobAgw.grantRules(canonicalSession(agentConfig(agent), _urpConfig()));
+        assertTrue(newPid != permissionId, "the regranted rules set has a NEW id");
 
-        vm.prank(RELAYER);
-        vm.expectRevert(
-            abi.encodeWithSelector(ISmartSession.InvalidPermissionId.selector, PermissionId.wrap(permissionId))
-        );
-        bobAgw.executeWithSession(address(engine), _singleMode(), bankedEcd, bankedSig, 0, 2, 0);
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, permissionId, agent));
+        _act(agent, caller, permissionId, bankedEcd);
 
-        // and the replacement's counters start at zero
-        assertEq(_spent(newPid), 0, "stage 7: the new mandate's budget is untouched");
-        assertEq(gateway.callCount(), 2, "stage 7: nothing further dispatched");
+        assertEq(_spent(newPid), 0, "stage 7: the new rules set's budget is untouched");
+        assertEq(gateway.callCount(), 2, "stage 7: nothing dispatched under the old id");
+
+        // and the same request under the NEW id works
+        _act(agent, caller, newPid, bankedEcd);
+        assertEq(gateway.callCount(), 3, "stage 7: the new id acts");
     }
 
-    /**
-     * @dev USE-mode wire format: mode byte ‖ permissionId ‖ sessionSig.
-     *
-     *      For the ECDSA run the inner signature is a REAL secp256k1 signature over the op hash, so
-     *      the validator genuinely verifies it. For the Ed25519 run it is 64 arbitrary bytes: the
-     *      USV observer answers a fixed `true`, so that run proves ROUTING, not cryptography.
-     */
-    /// @dev Sign and relay one request. Extracted so no single frame in `_runBobFlow` holds every
-    ///      local at once — with the optimizer off (the configuration `forge coverage` uses) the
-    ///      inlined version does not compile.
-    function _submitRequest(bytes memory ecd, uint64 seq, bytes32 pid, bool ed25519) internal {
-        bytes memory sig = _sessionSig(_opHash(ecd, 0, seq, 0, pid), pid, ed25519);
-        vm.prank(RELAYER);
-        bobAgw.executeWithSession(address(engine), _singleMode(), ecd, sig, 0, seq, 0);
-    }
-
-    function _sessionSig(bytes32 opHash, bytes32 pid, bool ed25519) internal view returns (bytes memory) {
-        if (ed25519) {
-            bytes memory edSig =
-                abi.encodePacked(keccak256(abi.encode(opHash, "ed-hi")), keccak256(abi.encode(opHash, "ed-lo")));
-            return abi.encodePacked(uint8(SmartSessionMode.USE), pid, edSig);
+    /// @dev One agent action: an EOA agent calls the door itself; a UEA agent is driven by its
+    ///      origin key, and the UEA is the sender the wallet sees.
+    function _act(address agent, address caller, bytes32 pid, bytes memory ecd) internal {
+        if (caller == agent) {
+            vm.prank(agent);
+            bobAgw.executeAsAgent(pid, _singleMode(), ecd);
+        } else {
+            vm.prank(caller);
+            MockUEA(payable(agent))
+                .exec(address(bobAgw), 0, abi.encodeCall(AGW.executeAsAgent, (pid, _singleMode(), ecd)));
         }
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(agentPk, opHash);
-        return abi.encodePacked(uint8(SmartSessionMode.USE), pid, abi.encodePacked(r, s, v));
+    }
+
+    /// @dev The EOA agent acts under the suite's rules set.
+    function _submitRequest(bytes memory ecd) internal {
+        vm.prank(agentAddr);
+        bobAgw.executeAsAgent(permissionId, _singleMode(), ecd);
     }
 
     // ═══════════════════ the caps still bind at system level ═══════════════════
@@ -346,18 +317,12 @@ contract E2ETest is BaseTest {
     function test_LifetimeCap_BindsEndToEnd() public {
         _deployAndGrant();
 
-        bytes memory ecd = _executionCalldata(HUNDRED_USDC, 0);
-        vm.prank(RELAYER);
-        bobAgw.executeWithSession(
-            address(engine), _singleMode(), ecd, _signEcdsa(_opHash(ecd, 0, 0, 0, permissionId)), 0, 0, 0
-        );
+        _submitRequest(_executionCalldata(HUNDRED_USDC, 0));
         assertEq(_spent(permissionId), HUNDRED_USDC, "cap consumed");
 
         // one more wei over the lifetime cap
         bytes memory over = _executionCalldata(1, 0);
-        bytes32 h = _opHash(over, 0, 1, 0, permissionId);
 
-        vm.prank(RELAYER);
         expectUrpGate(
             abi.encodeWithSelector(
                 UniversalRulesPolicyErrors.TotalSpendCapExceeded.selector,
@@ -365,7 +330,7 @@ contract E2ETest is BaseTest {
                 uint256(HUNDRED_USDC)
             )
         );
-        bobAgw.executeWithSession(address(engine), _singleMode(), over, _signEcdsa(h), 0, 1, 0);
+        _submitRequest(over);
     }
 
     /// The beneficiary pin is real end to end: an agent trading honestly but for ITSELF is refused
@@ -383,41 +348,35 @@ contract E2ETest is BaseTest {
         bytes memory ecd = ExecutionLib.encodeSingle(
             GATEWAY, 0, outboundRequest(address(pUSDC), HUNDRED_USDC, 0.01 ether, address(bobAgw), selfish)
         );
-        bytes32 h = _opHash(ecd, 0, 0, 0, permissionId);
-
-        vm.prank(RELAYER);
         expectUrpGate(
             abi.encodeWithSelector(UniversalRulesPolicyErrors.BeneficiaryMismatch.selector, BOB_AGW_CEA, agentAddr)
         );
-        bobAgw.executeWithSession(address(engine), _singleMode(), ecd, _signEcdsa(h), 0, 0, 0);
+        _submitRequest(ecd);
 
         assertEq(gateway.callCount(), 0, "nothing dispatched");
         assertEq(_spent(permissionId), 0, "nothing metered");
     }
 
-    /// Failure atomicity at system level: the gateway reverts, and the nonce, URP's counter and
-    /// the metering event all unwind (W-18 / U-18, end to end).
+    /// Failure atomicity at system level: the gateway reverts, and URP's counter and the metering
+    /// event unwind (W-18 / U-18, end to end).
     function test_GatewayRevert_UnwindsEverything() public {
         _deployAndGrant();
 
         gateway.setShouldRevert(true);
 
         bytes memory ecd = _executionCalldata(HUNDRED_USDC, 0);
-        bytes32 h = _opHash(ecd, 0, 0, 0, permissionId);
 
-        vm.prank(RELAYER);
         vm.expectRevert(MockUniversalGateway.GatewayRejected.selector);
-        bobAgw.executeWithSession(address(engine), _singleMode(), ecd, _signEcdsa(h), 0, 0, 0);
+        _submitRequest(ecd);
 
-        assertEq(bobAgw.getNonce(0), 0, "the nonce unwound");
         assertEq(_spent(permissionId), 0, "URP's counter unwound");
         assertEq(pUSDC.balanceOf(address(bobAgw)), HUNDRED_USDC, "the funds are untouched");
 
-        // and it works once the gateway recovers — the lane was never burned
+        // and the identical request works once the gateway recovers
         gateway.setShouldRevert(false);
-        vm.prank(RELAYER);
-        bobAgw.executeWithSession(address(engine), _singleMode(), ecd, _signEcdsa(h), 0, 0, 0);
-        assertEq(bobAgw.getNonce(0), 1, "the retry succeeded on the same lane position");
+        _submitRequest(ecd);
+        assertEq(gateway.callCount(), 1, "the retry dispatched");
+        assertEq(_spent(permissionId), HUNDRED_USDC, "and metered exactly once");
     }
 
     /// The owner door is unconditional even mid-mandate: Bob withdraws everything, with a live
@@ -447,15 +406,10 @@ contract E2ETest is BaseTest {
         bobAgw = AGW(payable(factory.deployWallet("lending")));
 
         vm.prank(BOB_UEA);
-        permissionId = bobAgw.grantRules(canonicalSession(ecdsaConfig(agentAddr), _urpConfig()));
+        permissionId = bobAgw.grantRules(canonicalSession(agentConfig(agentAddr), _urpConfig()));
 
         pUSDC.mint(address(bobAgw), HUNDRED_USDC);
         vm.deal(address(bobAgw), 1 ether);
-    }
-
-    function _signEcdsa(bytes32 opHash) internal view returns (bytes memory) {
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(agentPk, opHash);
-        return abi.encodePacked(uint8(SmartSessionMode.USE), permissionId, abi.encodePacked(r, s, v));
     }
 
     // ═══════════════════════════════════════════════════════════════════════════
@@ -468,7 +422,7 @@ contract E2ETest is BaseTest {
     // implementation, one URP proxy, one engine, one validator, one factory.
 
     /**
-     * The native counterpart of `test_BobFlow_ECDSA`: grant, act, meter, revoke — end to end,
+     * The native counterpart of `test_BobFlow_EOAAgent`: grant, act, meter, revoke — end to end,
      * against the same contracts the universal flow just used.
      *
      * WHAT IS REAL HERE: the engine routes by action id, URP's native gates run on unauthenticated
@@ -481,7 +435,7 @@ contract E2ETest is BaseTest {
         // ── stage 1: the agent stakes, with the beneficiary pinned to the wallet ──
         bytes memory cd =
             ExecutionLib.encodeSingle(address(stake), 0, abi.encodeCall(StakeDummy.stakeFor, (address(w), 40e6)));
-        _submitNative(w, cd, 0, pid);
+        _submitNative(w, cd, pid);
 
         assertEq(stake.totalBalance(address(w)), 40e6, "the stake landed on the wallet, not the agent");
         assertEq(tok.balanceOf(address(w)), 60e6, "and the tokens left the wallet");
@@ -500,11 +454,10 @@ contract E2ETest is BaseTest {
 
         bytes memory after_ =
             ExecutionLib.encodeSingle(address(stake), 0, abi.encodeCall(StakeDummy.stakeFor, (address(w), 1e6)));
-        vm.prank(RELAYER);
-        // NAMED, not bare: the engine no longer knows this permission, and it says so. The universal
-        // flow asserts exactly this at its own revoke stage — see `_runBobFlow` stage 7.
-        vm.expectRevert(abi.encodeWithSelector(ISmartSession.InvalidPermissionId.selector, PermissionId.wrap(pid)));
-        w.executeWithSession(address(engine), _singleMode(), after_, _signNative(w, after_, 0, 1, pid), 0, 1, 0);
+        // NAMED, not bare: removal cleared the agent, so the wallet refuses before the engine runs. The
+        // universal flow asserts exactly this at its own revoke stage — see `_revokeAndRegrant`.
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, pid, agentAddr));
+        _submitNative(w, after_, pid);
     }
 
     /**
@@ -517,7 +470,7 @@ contract E2ETest is BaseTest {
      * config still routes to the universal gauntlet, and its mode slot reports UNIVERSAL.
      */
     function test_UniversalFlow_UnchangedByNativeMode() public {
-        _runBobFlow(false);
+        _runBobFlow(agentAddr, agentAddr);
 
         ConfigId cid = _configId(permissionId);
 
@@ -547,8 +500,7 @@ contract E2ETest is BaseTest {
         // both mandates are live at the same time, which is the claim under test.
         _deployAndGrant();
 
-        bytes memory universalCd = _executionCalldata(HUNDRED_USDC, 0);
-        _submitRequest(universalCd, 0, permissionId, false);
+        _submitRequest(_executionCalldata(HUNDRED_USDC, 0));
 
         uint256 universalSpent = _spent(permissionId);
         assertGt(universalSpent, 0, "the universal mandate has metered");
@@ -569,14 +521,10 @@ contract E2ETest is BaseTest {
         vm.prank(BOB_UEA);
         bytes32 nativePid = bobAgw.grantRules(_nativeSessionFor(stake, address(bobAgw)));
 
-        // A SEPARATE NONCE LANE — the SDK convention is one lane per mandate (register N-42), and
-        // this is why: lane 0 was consumed by the universal flow above, so reusing it would collide
-        // on sequence rather than on anything about the mandate. Lanes are independent, so a native
-        // mandate on lane 1 starts at sequence 0 regardless of what lane 0 has done.
         bytes memory cd = ExecutionLib.encodeSingle(
             address(stake), 0, abi.encodeCall(StakeDummy.stakeFor, (address(bobAgw), 25e6))
         );
-        _submitNativeOnLane(bobAgw, cd, 1, 0, nativePid);
+        _submitNative(bobAgw, cd, nativePid);
 
         assertEq(stake.totalBalance(address(bobAgw)), 25e6, "the native mandate executed");
 
@@ -676,7 +624,7 @@ contract E2ETest is BaseTest {
 
         return Session({
             sessionValidator: ISessionValidator(address(validator)),
-            sessionValidatorInitData: ecdsaConfig(agentAddr),
+            sessionValidatorInitData: agentConfig(agentAddr),
             salt: bytes32(0),
             userOpPolicies: new PolicyData[](0),
             erc7739Policies: ERC7739Data({
@@ -716,44 +664,9 @@ contract E2ETest is BaseTest {
         return ConfigId.wrap(keccak256(abi.encodePacked(account, keccak256(abi.encodePacked(pid, actionId)))));
     }
 
-    function _opHashNative(AGW w, bytes memory ecd, uint192 key, uint64 seq, bytes32 pid)
-        internal
-        view
-        returns (bytes32)
-    {
-        return keccak256(
-            abi.encode(
-                keccak256("AGW.Op.v3"),
-                block.chainid,
-                address(w),
-                address(engine),
-                pid,
-                _singleMode(),
-                keccak256(ecd),
-                key,
-                seq,
-                uint48(0)
-            )
-        );
-    }
-
-    function _signNative(AGW w, bytes memory ecd, uint192 key, uint64 seq, bytes32 pid)
-        internal
-        view
-        returns (bytes memory)
-    {
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(agentPk, _opHashNative(w, ecd, key, seq, pid));
-        return abi.encodePacked(uint8(SmartSessionMode.USE), pid, abi.encodePacked(r, s, v));
-    }
-
-    function _submitNative(AGW w, bytes memory ecd, uint64 seq, bytes32 pid) internal {
-        _submitNativeOnLane(w, ecd, 0, seq, pid);
-    }
-
-    /// @dev Lanes are independent replay counters, so a second mandate on the same wallet takes its
-    ///      own lane and starts at sequence 0 (SDK convention, register N-42).
-    function _submitNativeOnLane(AGW w, bytes memory ecd, uint192 key, uint64 seq, bytes32 pid) internal {
-        vm.prank(RELAYER);
-        w.executeWithSession(address(engine), _singleMode(), ecd, _signNative(w, ecd, key, seq, pid), key, seq, 0);
+    /// @dev The agent itself calls the agent door of `w`.
+    function _submitNative(AGW w, bytes memory ecd, bytes32 pid) internal {
+        vm.prank(agentAddr);
+        w.executeAsAgent(pid, _singleMode(), ecd);
     }
 }

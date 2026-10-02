@@ -28,6 +28,7 @@ import {
     PermissionId,
     ConfigId,
     SmartSessionMode,
+    ValidationData,
     ActionData,
     PolicyData,
     ERC7739Context
@@ -69,7 +70,6 @@ contract EngineTest is BaseTest {
     uint256 internal constant CAP = 100e6;
 
     address internal agentAddr;
-    uint256 internal agentPk;
 
     function setUp() public override {
         super.setUp();
@@ -81,7 +81,7 @@ contract EngineTest is BaseTest {
         WALLET_OWNER = makeAddr("engineOwner");
         CEA = makeAddr("cea");
         PROTOCOL = makeAddr("protocol");
-        (agentAddr, agentPk) = ecdsaKey("engineAgent");
+        agentAddr = makeAddr("engineAgent");
 
         vm.warp(1_700_000_000);
 
@@ -136,31 +136,15 @@ contract EngineTest is BaseTest {
         return ModeCode.unwrap(ModeLib.encodeSimpleSingle());
     }
 
-    function _opHash(bytes memory ecd, uint64 seq, bytes32 pid) internal view returns (bytes32) {
-        return keccak256(
-            abi.encode(
-                keccak256("AGW.Op.v3"),
-                block.chainid,
-                address(wallet),
-                address(engine),
-                pid,
-                _mode(),
-                keccak256(ecd),
-                uint192(0),
-                seq,
-                uint48(0)
-            )
-        );
+    /// @dev The agent itself calls the agent door.
+    function _act(address agent, bytes32 pid, bytes memory ecd) internal {
+        vm.prank(agent);
+        wallet.executeAsAgent(pid, _mode(), ecd);
     }
 
-    function _sig(bytes32 opHash, bytes32 pid, uint256 pk) internal pure returns (bytes memory) {
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, opHash);
-        return abi.encodePacked(uint8(SmartSessionMode.USE), pid, abi.encodePacked(r, s, v));
-    }
-
-    function _grant(address signer) internal returns (bytes32) {
+    function _grant(address agent) internal returns (bytes32) {
         vm.prank(WALLET_OWNER);
-        return wallet.grantRules(canonicalSession(ecdsaConfig(signer), _urpConfig()));
+        return wallet.grantRules(canonicalSession(agentConfig(agent), _urpConfig()));
     }
 
     // ═══════════════════════════════════ S-01 ═══════════════════════════════════
@@ -178,10 +162,11 @@ contract EngineTest is BaseTest {
      * `ENABLE || UNSAFE_ENABLE`, so they route through the same gate — and it is the one whose name
      * invites worry that an earlier draft left unpinned.
      *
-     * PAIRING WITH W-28, stated so neither is deleted as redundant: W-28 proves the WALLET rejects
-     * both modes BEFORE the engine is called (zero calls reach it). S-01 proves that IF one reached
-     * the engine anyway, the 1271 gate would refuse it. Two independent layers, two tests. This one
-     * deliberately BYPASSES the wallet's check by calling the engine directly as the wallet.
+     * PAIRING WITH W-28 (`test_W28_AgentDoor_AlwaysBuildsUseMode`), stated so neither is deleted as
+     * redundant: W-28 proves the WALLET always builds a USE-mode operation — the agent door takes no
+     * signature input, so no caller can choose an enable mode. S-01 proves that IF an enable-mode
+     * operation reached the engine anyway, the 1271 gate would refuse it. Two independent layers,
+     * two tests. This one deliberately BYPASSES the wallet by calling the engine directly as it.
      */
     function test_S01_EnableMode_DeadOnV3Wallets() public {
         _grant(agentAddr);
@@ -198,19 +183,15 @@ contract EngineTest is BaseTest {
 
         for (uint256 i; i < modes.length; ++i) {
             // A well-formed ENABLE-mode signature body. The engine derives the permission id from
-            // the session data rather than reading bytes [1:33] — which is exactly why the wallet
-            // checks the mode byte first (W-28).
+            // the session data rather than reading bytes [1:33] — which is why the wallet never lets
+            // a caller choose the mode (W-28).
             op.signature = abi.encodePacked(uint8(modes[i]), _enableBody(modes[i]));
 
             // Called AS THE WALLET, so the engine's `userOp.sender == msg.sender` check passes and
             // the request reaches the enable path.
             vm.prank(address(wallet));
             (bool ok, bytes memory ret) = address(engine)
-                .call(
-                    abi.encodeWithSelector(
-                        ISmartSession.validateUserOp.selector, op, _opHash(_ecd(CAP, CEA), 0, bytes32(0))
-                    )
-                );
+                .call(abi.encodeWithSelector(ISmartSession.validateUserOp.selector, op, bytes32(uint256(1))));
             assertFalse(ok, "the ENABLE path is refused - the salt-bypassing grant cannot open");
 
             // AND IT IS REFUSED AT THE 1271 GATE SPECIFICALLY. Naming the error is the whole point:
@@ -236,7 +217,7 @@ contract EngineTest is BaseTest {
      *      the ENABLE-path refusal rather than a malformed-input refusal.
      */
     function _enableBody(SmartSessionMode mode) internal view returns (bytes memory) {
-        Session memory toEnable = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
+        Session memory toEnable = canonicalSession(agentConfig(agentAddr), _urpConfig());
         toEnable.salt = bytes32(uint256(0x5001));
 
         // The REAL digest for this session, from the engine itself. A zero digest fails the
@@ -270,13 +251,13 @@ contract EngineTest is BaseTest {
         assertTrue(engine.isPermissionEnabled(PermissionId.wrap(pid), address(wallet)), "canonical grants");
 
         // RULE 2 — nothing in the zero-floor policy class
-        Session memory s1 = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
+        Session memory s1 = canonicalSession(agentConfig(agentAddr), _urpConfig());
         s1.userOpPolicies = new PolicyData[](1);
         s1.userOpPolicies[0] = PolicyData({ policy: address(urp), initData: "" });
         _expectShape(s1);
 
         // RULE 1 — no wildcard/fallback action: exactly one action
-        Session memory s2 = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
+        Session memory s2 = canonicalSession(agentConfig(agentAddr), _urpConfig());
         ActionData[] memory two = new ActionData[](2);
         two[0] = s2.actions[0];
         two[1] = s2.actions[0];
@@ -284,27 +265,27 @@ contract EngineTest is BaseTest {
         _expectShape(s2);
 
         // RULE 4 — URP is the SOLE action policy (the fail-closed anchor)
-        Session memory s3 = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
+        Session memory s3 = canonicalSession(agentConfig(agentAddr), _urpConfig());
         s3.actions[0].actionPolicies = new PolicyData[](0);
         _expectShape(s3);
 
         // Only its ADDRESS matters — the shape check rejects a non-canonical policy without
         // calling it, so this needs no proxy and no initialisation.
         UniversalRulesPolicy other = new UniversalRulesPolicy();
-        _expectShape(sessionWithPolicy(address(other), ecdsaConfig(agentAddr), _urpConfig()));
+        _expectShape(sessionWithPolicy(address(other), agentConfig(agentAddr), _urpConfig()));
 
         // RULE 5 — the paymaster flag is always false
-        Session memory s4 = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
+        Session memory s4 = canonicalSession(agentConfig(agentAddr), _urpConfig());
         s4.permitERC4337Paymaster = true;
         _expectShape(s4);
 
         // the 7739 path stays walled
-        Session memory s5 = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
+        Session memory s5 = canonicalSession(agentConfig(agentAddr), _urpConfig());
         s5.erc7739Policies.allowedERC7739Content = new ERC7739Context[](1);
         _expectShape(s5);
 
         // and the validator is pinned
-        Session memory s6 = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
+        Session memory s6 = canonicalSession(agentConfig(agentAddr), _urpConfig());
         s6.sessionValidator = ISessionValidator(makeAddr("notOurValidator"));
         _expectShape(s6);
     }
@@ -318,39 +299,52 @@ contract EngineTest is BaseTest {
     // ═══════════════════════════════════ S-03 ═══════════════════════════════════
 
     /**
-     * S-03 — THE SIGNATURE IS VERIFIED LAST, and policies therefore observe unauthenticated calldata.
+     * S-03 — THE SESSION VALIDATOR IS CONSULTED LAST, and policies therefore observe calldata the
+     * engine has not yet authenticated.
      *
-     * This is the ordering regression guard for constraint H21. The proof: a request carrying BOTH
-     * an invalid signature AND a policy-violating payload fails at the POLICY, not at the signature.
-     * If the order were reversed the signature error would surface instead.
+     * The ordering regression guard for constraint H21, pinned on the engine itself by calling it
+     * directly as the wallet, with an operation whose signature field names a NON-agent sender:
+     *   (a) with a policy-violating payload, the POLICY error surfaces — the gauntlet ran before the
+     *       validator was asked about the sender;
+     *   (b) with a valid payload, the engine returns a failed verdict (authorizer `address(1)`) — the
+     *       validator ran last and refused the sender.
      *
-     * The consequence every future policy inherits: policies run on calldata from an arbitrary
-     * caller that has not been authenticated. URP is safe by construction — no external calls,
-     * effects last, revert on every failure.
+     * In production the wallet's own pre-check (`CallerIsNotAgent`) means a non-agent never reaches
+     * the engine, so (b) is unreachable through the wallet. This test pins the engine's ordering
+     * anyway, because URP's safety argument — no external calls, effects last, revert on every
+     * failure — still rests on policies running before authentication completes.
      */
     function test_S03_SignatureVerifiedLast() public {
         bytes32 pid = _grant(agentAddr);
+        address stranger = makeAddr("notTheAgent");
 
-        // A payload that violates URP gate 15 (beneficiary is the agent, not the CEA)...
-        bytes memory badPayload = _ecd(CAP, agentAddr);
-
-        // ...signed by a key that is NOT the mandate's signer, so the signature is invalid too.
-        (, uint256 strangerPk) = ecdsaKey("notTheAgent");
-        bytes memory badSig = _sig(_opHash(badPayload, 0, pid), pid, strangerPk);
-
-        // The POLICY error surfaces — proving the gauntlet ran BEFORE the signature was checked.
-        vm.prank(RELAYER);
+        // (a) A payload that violates URP gate 15 (beneficiary is the agent, not the CEA).
+        PackedUserOperation memory op = _opFrom(stranger, pid, _ecd(CAP, agentAddr));
+        vm.prank(address(wallet));
         expectUrpGate(abi.encodeWithSelector(UniversalRulesPolicyErrors.BeneficiaryMismatch.selector, CEA, agentAddr));
-        wallet.executeWithSession(address(engine), _mode(), badPayload, badSig, 0, 0, 0);
+        engine.validateUserOp(op, bytes32(uint256(1)));
 
-        // CONTROL: with a VALID payload, the same invalid signature is what fails — so the policy
-        // error above really was the policy, not an artefact of the signature being wrong.
-        bytes memory goodPayload = _ecd(CAP, CEA);
-        bytes memory stillBadSig = _sig(_opHash(goodPayload, 0, pid), pid, strangerPk);
+        // (b) CONTROL: with a VALID payload, the non-agent sender is what fails — so the policy error
+        // above really was the policy, not an artefact of the sender being wrong.
+        op = _opFrom(stranger, pid, _ecd(CAP, CEA));
+        vm.prank(address(wallet));
+        uint256 vd = ValidationData.unwrap(engine.validateUserOp(op, bytes32(uint256(1))));
+        // forge-lint: disable-next-line(unsafe-typecast)
+        address authorizer = address(uint160(vd)); // ERC-4337 packing: the low 160 bits are the authorizer
+        assertEq(authorizer, address(1), "the validator refused the non-agent sender, last");
+    }
 
-        vm.prank(RELAYER);
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.ValidationFailed.selector, address(1)));
-        wallet.executeWithSession(address(engine), _mode(), goodPayload, stillBadSig, 0, 0, 0);
+    /// @dev The operation the wallet builds, with `sender` written into the signature field — here
+    ///      deliberately a non-agent, which the wallet itself would never write.
+    function _opFrom(address sender, bytes32 pid, bytes memory ecd)
+        internal
+        view
+        returns (PackedUserOperation memory op)
+    {
+        op.sender = address(wallet);
+        op.callData = abi.encodeWithSelector(AGW.execute.selector, _mode(), ecd);
+        op.paymasterAndData = "";
+        op.signature = abi.encodePacked(SmartSessionMode.USE, pid, sender);
     }
 
     // ═══════════════════════════════════ S-04 ═══════════════════════════════════
@@ -364,7 +358,7 @@ contract EngineTest is BaseTest {
      */
     function test_S04_EngineFloors() public {
         // The wallet's shape check refuses a zero-policy grant outright...
-        Session memory stripped = canonicalSession(ecdsaConfig(agentAddr), _urpConfig());
+        Session memory stripped = canonicalSession(agentConfig(agentAddr), _urpConfig());
         stripped.actions[0].actionPolicies = new PolicyData[](0);
         _expectShape(stripped);
 
@@ -378,9 +372,8 @@ contract EngineTest is BaseTest {
         bytes32 pid = PermissionId.unwrap(engine.enableSessions(arr)[0]);
 
         bytes memory ecd = _ecd(CAP, CEA);
-        vm.prank(RELAYER);
         vm.expectRevert(abi.encodeWithSelector(ISmartSession.NoPoliciesSet.selector, PermissionId.wrap(pid)));
-        wallet.executeWithSession(address(engine), _mode(), ecd, _sig(_opHash(ecd, 0, pid), pid, agentPk), 0, 0, 0);
+        _act(agentAddr, pid, ecd);
 
         // enableSessions with an EMPTY array reverts.
         Session[] memory empty = new Session[](0);
@@ -429,10 +422,7 @@ contract EngineTest is BaseTest {
         // A SUBSEQUENT GRANT SUCCEEDS and validates a request END TO END. This is the half that
         // proves there is no desync: the engine has no install precondition on either path.
         bytes32 pid = _grant(agentAddr);
-        bytes memory ecd = _ecd(CAP, CEA);
-
-        vm.prank(RELAYER);
-        wallet.executeWithSession(address(engine), _mode(), ecd, _sig(_opHash(ecd, 0, pid), pid, agentPk), 0, 0, 0);
+        _act(agentAddr, pid, _ecd(CAP, CEA));
 
         assertEq(gateway.callCount(), 1, "a full request validated and dispatched after the direct uninstall");
     }
@@ -440,72 +430,35 @@ contract EngineTest is BaseTest {
     // ═══════════════════════════════════ S-08 ═══════════════════════════════════
 
     /**
-     * S-08 — THREE MANDATES, ONE WALLET, FULLY INDEPENDENT.
+     * S-08 — THREE RULES SETS, ONE WALLET, FULLY INDEPENDENT.
      *
-     * `permissionId = keccak256(sessionValidator, initData, salt)` — the signer configuration is an
-     * INPUT to the mandate's identity, so two mandates naming different keys are different mandates
-     * BY ARITHMETIC. There is no wallet-level agent slot and no way to reassign a key inside a
-     * mandate: a different key is a different mandate (P3-D1).
+     * `permissionId = keccak256(sessionValidator, initData, salt)` — the agent configuration is an
+     * INPUT to the rules set's identity, so two rules sets naming different agents are different
+     * rules sets BY ARITHMETIC. There is no wallet-level agent slot and no way to reassign an agent
+     * inside a rules set: a different agent is a different rules set (P3-D1).
      */
     function test_S08_MultiAgent_Independence() public {
-        address[3] memory signers;
-        uint256[3] memory keys;
+        address[3] memory agents = [makeAddr("agentAlpha"), makeAddr("agentBravo"), makeAddr("agentCharlie")];
         bytes32[3] memory pids;
 
-        (signers[0], keys[0]) = ecdsaKey("agentAlpha");
-        (signers[1], keys[1]) = ecdsaKey("agentBravo");
-        (signers[2], keys[2]) = ecdsaKey("agentCharlie");
-
         for (uint256 i; i < 3; ++i) {
-            pids[i] = _grant(signers[i]);
+            pids[i] = _grant(agents[i]);
         }
 
         // pairwise distinct
         assertTrue(pids[0] != pids[1] && pids[1] != pids[2] && pids[0] != pids[2], "three distinct ids");
-        assertEq(engine.getPermissionIDs(address(wallet)).length, 3, "three live mandates");
+        assertEq(engine.getPermissionIDs(address(wallet)).length, 3, "three live rules sets");
 
-        // each validates INDEPENDENTLY, on its own lane
+        // each acts INDEPENDENTLY, under its own id
         for (uint256 i; i < 3; ++i) {
-            bytes memory ecd = _ecd(0, CEA); // amount 0 so the shared cap is not consumed
-            bytes32 h = keccak256(
-                abi.encode(
-                    keccak256("AGW.Op.v3"),
-                    block.chainid,
-                    address(wallet),
-                    address(engine),
-                    pids[i],
-                    _mode(),
-                    keccak256(ecd),
-                    uint192(i),
-                    uint64(0),
-                    uint48(0)
-                )
-            );
-            vm.prank(RELAYER);
-            wallet.executeWithSession(address(engine), _mode(), ecd, _sig(h, pids[i], keys[i]), uint192(i), 0, 0);
+            _act(agents[i], pids[i], _ecd(0, CEA)); // amount 0 so the shared cap is not consumed
         }
         assertEq(gateway.callCount(), 3, "all three dispatched");
 
-        // A SIGNATURE FOR ONE FAILS AGAINST ANOTHER — the keys are not interchangeable.
-        bytes memory ecd2 = _ecd(0, CEA);
-        bytes32 h2 = keccak256(
-            abi.encode(
-                keccak256("AGW.Op.v3"),
-                block.chainid,
-                address(wallet),
-                address(engine),
-                pids[0],
-                _mode(),
-                keccak256(ecd2),
-                uint192(0),
-                uint64(1),
-                uint48(0)
-            )
-        );
-        // signed by BRAVO's key, submitted against ALPHA's mandate
-        vm.prank(RELAYER);
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.ValidationFailed.selector, address(1)));
-        wallet.executeWithSession(address(engine), _mode(), ecd2, _sig(h2, pids[0], keys[1]), 0, 1, 0);
+        // ONE AGENT CANNOT ACT UNDER ANOTHER'S RULES SET — the agents are not interchangeable.
+        bytes memory ecd = _ecd(0, CEA);
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, pids[0], agents[1]));
+        _act(agents[1], pids[0], ecd);
 
         // REVOKING ONE LEAVES THE OTHERS LIVE
         vm.prank(WALLET_OWNER);
@@ -516,24 +469,12 @@ contract EngineTest is BaseTest {
         assertTrue(engine.isPermissionEnabled(PermissionId.wrap(pids[2]), address(wallet)), "charlie still live");
         assertEq(engine.getPermissionIDs(address(wallet)).length, 2, "two remain");
 
-        // and alpha still validates after bravo's revocation
-        bytes memory ecd3 = _ecd(0, CEA);
-        bytes32 h3 = keccak256(
-            abi.encode(
-                keccak256("AGW.Op.v3"),
-                block.chainid,
-                address(wallet),
-                address(engine),
-                pids[0],
-                _mode(),
-                keccak256(ecd3),
-                uint192(0),
-                uint64(1),
-                uint48(0)
-            )
-        );
-        vm.prank(RELAYER);
-        wallet.executeWithSession(address(engine), _mode(), ecd3, _sig(h3, pids[0], keys[0]), 0, 1, 0);
-        assertEq(gateway.callCount(), 4, "alpha unaffected by bravo's revocation");
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, pids[1], agents[1]));
+        _act(agents[1], pids[1], ecd);
+
+        // and alpha and charlie still act after bravo's revocation
+        _act(agents[0], pids[0], ecd);
+        _act(agents[2], pids[2], ecd);
+        assertEq(gateway.callCount(), 5, "alpha and charlie unaffected by bravo's revocation");
     }
 }

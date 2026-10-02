@@ -5,13 +5,13 @@ import { BaseTest } from "../Base.t.sol";
 
 import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
 
-import { AllowedCall, Config, OwnerIntent, RulesType } from "../../src/libraries/Types.sol";
+import { AllowedCall, Config, OWNER_LANE_FLAG, OwnerIntent, RulesType } from "../../src/libraries/Types.sol";
 
 import { AGW } from "../../src/AGW.sol";
 
 import { IAGW } from "../../src/interfaces/IAGW.sol";
 
-import { AGWErrors } from "../../src/libraries/Errors.sol";
+import { AGWErrors, UniversalRulesPolicyErrors } from "../../src/libraries/Errors.sol";
 
 import {
     ModeLib,
@@ -37,7 +37,7 @@ import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 /**
  * @notice AGW — Phase 3a: skeleton, owner door, initialisation, views.
  *
- * @dev    grantRules / revokeRules / revokeAllRules / executeWithSession are placeholders in this
+ * @dev    grantRules / revokeRules / revokeAllRules / executeAsAgent are placeholders in this
  *         sub-phase; their tests arrive in 3b and 3c. Where a test here needs mandate STATE it
  *         builds it directly through the engine (`vm.prank(wallet) -> engine.enableSessions`),
  *         which is exactly what grantRules will do minus the salt and shape check.
@@ -89,7 +89,7 @@ contract PushAgentWalletTest is BaseTest {
     ///      engine because grantRules was a placeholder; 3b switched it, per the instruction.)
     function _grant(AGW w, address agentKey) internal returns (bytes32 pid) {
         vm.prank(WALLET_OWNER);
-        return w.grantRules(canonicalSession(ecdsaConfig(agentKey), _urpInitData()));
+        return w.grantRules(canonicalSession(agentConfig(agentKey), _urpInitData()));
     }
 
     function _grant(AGW w) internal returns (bytes32) {
@@ -590,11 +590,11 @@ contract PushAgentWalletTest is BaseTest {
 
         assertEq(engine.getPermissionIDs(address(fresh)).length, 0, "no mandates");
 
-        // the agent door is closed — refused at its FIRST guard, the step-4 USE-mode/length check,
-        // which also confirms no engine call precedes it
+        // the agent door is closed — no id names an agent on an empty wallet, so the wallet's own
+        // agent check refuses before any policy runs
         vm.prank(AGENT);
-        vm.expectRevert(AGWErrors.InvalidSessionSignature.selector);
-        fresh.executeWithSession(address(engine), _singleMode(), "", "", 0, 0, 0);
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, bytes32(0), AGENT));
+        fresh.executeAsAgent(bytes32(0), _singleMode(), "");
 
         // the owner door is fully live
         address sink = makeAddr("freshSink");
@@ -642,7 +642,7 @@ contract PushAgentWalletTest is BaseTest {
      * test fails and a human decides whether the ABI change was intended.
      */
     function test_W25_Clone_NoUpgradeSurface_ExactSelectorSet() public view {
-        bytes4[] memory expected = new bytes4[](28);
+        bytes4[] memory expected = new bytes4[](29);
         uint256 i;
 
         // one-shot initialisation
@@ -657,7 +657,8 @@ contract PushAgentWalletTest is BaseTest {
         expected[i++] = AGW.revokeRules.selector;
         expected[i++] = AGW.revokeAllRules.selector;
         // agent door
-        expected[i++] = AGW.executeWithSession.selector;
+        expected[i++] = AGW.executeAsAgent.selector;
+        expected[i++] = AGW.agentOf.selector;
         // module manager
         expected[i++] = AGW.installModule.selector;
         expected[i++] = AGW.uninstallModule.selector;
@@ -681,7 +682,7 @@ contract PushAgentWalletTest is BaseTest {
         expected[i++] = AGW.supportsInterface.selector;
         expected[i++] = AGW.isValidSignature.selector;
 
-        assertEq(i, 28, "the hard-coded list must be complete");
+        assertEq(i, 29, "the hard-coded list must be complete");
         assertSelectorSet("AGW", expected);
     }
 
@@ -886,17 +887,24 @@ contract PushAgentWalletTest is BaseTest {
     }
 
     function test_NonceViews_StartAtZero() public view {
-        assertEq(wallet.getNonce(0), 0, "lane 0");
-        assertEq(wallet.getNonce(type(uint192).max), 0, "an arbitrary lane");
+        assertEq(wallet.getNonce(OWNER_LANE_FLAG), 0, "the first owner lane");
+        assertEq(wallet.getNonce(type(uint192).max), 0, "an arbitrary owner lane");
         assertEq(wallet.grantNonce(), 0, "grant nonce starts at zero");
     }
 
-    /// The agent door is live as of 3c. A malformed request is refused at its FIRST guard — here,
-    /// the USE-mode/length check at step 4 — which also confirms no engine call precedes it.
+    /// The agent door is live. A caller that is not the agent is refused by the wallet itself; the
+    /// agent of a real grant gets through to the policy, which refuses a malformed request by gate.
     function test_AgentDoor_IsLive_AndRefusesMalformedRequests() public {
+        bytes32 pid = _grant(wallet);
+        bytes memory malformed = _gatewayShapedCalldata(); // selector + an empty `bytes`: 68 bytes
+
+        vm.prank(RELAYER);
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, pid, RELAYER));
+        wallet.executeAsAgent(pid, _singleMode(), malformed);
+
         vm.prank(AGENT);
-        vm.expectRevert(AGWErrors.InvalidSessionSignature.selector);
-        wallet.executeWithSession(address(engine), _singleMode(), "", "", 0, 0, 0);
+        expectUrpGate(abi.encodeWithSelector(UniversalRulesPolicyErrors.MalformedOutboundRequest.selector, uint256(68)));
+        wallet.executeAsAgent(pid, _singleMode(), malformed);
     }
 
     // ═══════════════════ execute() is untouched (UniversalMarketplace PRD, D5) ═══════════════════

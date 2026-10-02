@@ -17,13 +17,13 @@
 | `0xbob` | Bob's EOA — holds USDC | Ethereum |
 | `0xbobuea` | Bob's Universal Executor Account — his identity | Push Chain |
 | `0xbobagw` | Bob's **agent wallet** — holds the budgeted funds, owned by `0xbobuea`. **One of several Bob may own** | Push Chain |
-| `0xagentkey` | The agent's signing key (ECDSA **or** Ed25519) — **a key, not an account** | off-chain |
+| `0xagent` | The agent's **Push address** — its own EOA, or the UEA of an external key (EVM, Solana, …). It calls the agent door itself | Push Chain |
 | `0xpushstake` | **The Push-native protocol** — a staking vault on Push Chain. Any contract Bob chooses to name; nothing about it is built, adopted or trusted | Push Chain |
 | `pUSDC` | Bob's USDC, as it exists on Push Chain | Push Chain |
 | `AGWFactory` | Deploys agent wallets at predictable addresses; the registry of record | Push Chain |
 | `SmartSession` | The adopted permission engine — the wallet's only installed module | Push Chain |
 | `URP` | Universal Rules Policy — **the only contract that checks how the agent calls a Push contract: which arguments, how much value, how many times.** Its native rulebook runs here | Push Chain |
-| `AgentValidator` | Stateless signature checker (secp256k1 / Ed25519). **Never installed** — named inside each permission | Push Chain |
+| `AgentValidator` | Stateless sender validator — confirms the sender is the agent. **Never installed** — named inside each permission | Push Chain |
 
 **Deliberately absent from this cast, and from every stage below:** `UniversalGatewayPC` and `0xbobagwcea`. A native rules set may never name the gateway — the wallet refuses it at grant and URP refuses it again at validation — and without the gateway there is no outbound, no TSS, no destination account and no far side. **Everything in this document happens on Push Chain, and every agent action is one Push transaction, start to finish.**
 
@@ -60,7 +60,7 @@
   | Revoke | instantly, one signature, unblockable |
 
 - **Argument pins — the position and the exact 32-byte word — are generated from `0xpushstake`'s ABI by tooling, never hand-typed.** A wrong position fails closed (the word will never match); a *missing* pin fails open (that argument is the agent's to choose). Note what is **not** granted: `pUSDC.approve`. Bob approves the vault himself, once, through the owner door in Stage 3. Had the agent needed an approval, the SDK would have insisted on pinning the spender — an unpinned approval is the native form of allow-listing `approve` on the far chain.
-- The tooling calls `AgentValidator.validateConfig` on the key config, and shows Bob the five actions in human terms — contract, function, every pin, every cap, and that **a call limit is consumed by any successful call, even one that moves nothing**.
+- The tooling calls `AgentValidator.validateConfig` on the agent config, and shows Bob the five actions in human terms — contract, function, every pin, every cap, and that **a call limit is consumed by any successful call, even one that moves nothing**.
 - Bob reviews and approves. **This is the last human decision point.**
 
 ---
@@ -112,7 +112,7 @@ It then does exactly three things: it **overwrites the salt** with the wallet's 
 
 ```
 sessionValidator         = AgentValidator
-sessionValidatorInitData = abi.encode(scheme, 0xagentkey)   ← ECDSA or Ed25519
+sessionValidatorInitData = abi.encode(0xagent)              ← the agent's Push address
 salt                     = bytes32(grantNonce++)             ← WALLET-SUPPLIED, never the caller's
 
 userOpPolicies:          [ ]        ← ALWAYS EMPTY (that class has a floor of zero)
@@ -145,9 +145,9 @@ actions: [ ONE TO EIGHT — the NATIVE shape; five here ]
 
 **What URP refuses at initialisation.** A native config may not name the gateway as its target (the mirror of the wallet's check, one layer down). A value-only config may carry neither pins nor an amount rule — it could never authorise anything, so it is a misconfiguration Bob believes he granted, not a valid strict one. More than eight pins, a zero target, a zero or past expiry: refused, each by name.
 
-**The rules set identity.** `permissionId = keccak256(sessionValidator, initData, salt)`. Because the wallet supplies the salt, granting byte-identical terms twice yields two independent rules sets. Because the signer config is in the hash, **the agent key cannot be swapped inside a rules set — a different key is a different rules set** (Rule 4). Each of the five actions has its own action id under that one permission id, and its own URP record under that action id.
+**The rules set identity.** `permissionId = keccak256(sessionValidator, initData, salt)`. Because the wallet supplies the salt, granting byte-identical terms twice yields two independent rules sets. Because the agent config is in the hash, **the agent cannot be swapped inside a rules set — a different agent is a different rules set** (Rule 4). Each of the five actions has its own action id under that one permission id, and its own URP record under that action id.
 
-**What the agent key can do:** five functions, on exactly one Push contract, with the beneficiary forced to Bob's own wallet wherever there is one, up to two amount ceilings and two value ceilings, at most two unstakes, until the expiry.
+**What the agent can do:** five functions, on exactly one Push contract, with the beneficiary forced to Bob's own wallet wherever there is one, up to two amount ceilings and two value ceilings, at most two unstakes, until the expiry.
 
 **What it cannot do:** call any other contract · call any sixth function · stake for anyone but the wallet · deposit for anyone but the wallet · exceed any cap · unstake a third time · act after expiry · call `approve` at all · install or remove modules · call the wallet, the engine, URP, the validator, the factory, **or the gateway** · touch `0xbobuea` · grant or extend anything.
 
@@ -170,34 +170,32 @@ URP.stakeFor: amountSpent 0 · callsUsed 0     (and four more records, all at ze
 - It composes the request as **one flat call** — there are no nested layers, no instruction list and no gateway envelope in the native workflow:
 
 ```
-Layer 1  the wallet operation   mode = single · executionCalldata = (0xpushstake, value 0, stakeFor(0xbobagw, 40e6))
-                                lane + position · requestExpiry
+Layer 1  the execution payload  mode = single · executionCalldata = (0xpushstake, value 0, stakeFor(0xbobagw, 40e6))
 ```
 
-- It signs the **ten-field operation hash** — the same ten fields, in the same order, as the universal workflow. The fingerprint does not know or care what kind of rules set it serves. **It composes a call; it does not move money.**
+- **It composes a call; it does not move money.** It signs nothing for the wallet — exactly as in the universal workflow, its authority is being the sender.
 
 ---
 
 ## STAGE 5 — Execution via the agent door
 
-**🔑 THE AGENT KEY IS USED — the only time it is used in the entire lifecycle**
+**🔑 THE AGENT ACTS — the only time it acts in the entire lifecycle**
 
 - The agent **cannot** call `0xpushstake` itself. If it did, `msg.sender` would be the agent, `stakeFor` would pull pUSDC from the *agent's* balance — it has none — and any position would be the agent's. Structurally pointless and structurally blocked.
-- Instead it calls **Bob's wallet** — or hands the signed request to any relayer.
+- Instead it calls **Bob's wallet** itself — from `0xagent`, or, for an external key, by driving its UEA, which verifies that key and then calls the wallet.
 
-> **The caller does not matter — the signature does.**
-> `executeWithSession` has no caller check. **Anyone can submit.** Authorisation lives inside the function: the transaction is inert without a signature over the op hash from the key Bob named. The relayer pays the Push transaction gas from its own balance; the wallet pays only the `value` URP allowed.
+> **The caller is the authority.**
+> `executeAsAgent` admits only the agent the named rules set records. Anyone else — Bob included — is refused `CallerIsNotAgent` before the engine runs. There is no signature and no relayer: the agent pays the Push transaction gas itself; the wallet pays only the `value` URP allowed.
 
 ```
-0xagentkey signs opHash (10 bound fields)
-  └─▶ 0xbobagw.executeWithSession(validator, mode, execCalldata, sig, nonceKey, nonceSeq, requestExpiry)
+0xagent
+  └─▶ 0xbobagw.executeAsAgent(rulesId, mode, execCalldata)
         │
         │  ── THE WALLET DOES THE ENTRYPOINT'S JOBS ITSELF (Push Chain has none) ──
-        ├─ 1. requestExpiry passed?            revert   (0 = no expiry; no ceiling either)
-        ├─ 2. validator installed?             ✓
-        ├─ 3. consume nonce lane BEFORE validation — nothing can run twice
-        ├─ 4. recompute the ten-field opHash from what arrived
-        ├─ 5. build PackedUserOperation in memory (ABI shape only)
+        ├─ 1. session engine still installed?                       ✓
+        ├─ 2. msg.sender == agentOf(rulesId)?   else CallerIsNotAgent — before the engine runs
+        ├─ 3. build PackedUserOperation in memory (ABI shape only)
+        │       signature = USE ‖ rulesId ‖ msg.sender   ← written by the wallet, never supplied
         │
         └─▶ SmartSession.validateUserOp
               ├─ permission enabled?
@@ -216,21 +214,22 @@ Layer 1  the wallet operation   mode = single · executionCalldata = (0xpushstak
               │                   emit NativeCallMetered(id, …, value 0, amount 40e6)
               │
               └─ AgentValidator.validateSignatureWithData   ← LAST, after every policy
-                    ECDSA: ecrecover      Ed25519: raw staticcall to the USV precompile
+                    the 20 bytes the wallet wrote == the agent stored in the rules set?
         │
-        ├─ 6. the wallet enforces the verdict itself (authorizer, validAfter/validUntil)
-        ├─ 7. the wallet refuses ITSELF and THE ENGINE as target, whatever the verdict
-        └─▶ 8. dispatch THE EXACT VALIDATED BYTES ──▶ 0xpushstake.stakeFor(0xbobagw, 40e6)
-                                                            ▲
-                                                  msg.sender == 0xbobagw
-                                                  ← the vault pulls pUSDC from the WALLET
-                                                    and credits the WALLET
+        ├─ 4. the wallet enforces the verdict itself (authorizer, validAfter/validUntil)
+        ├─ 5. the wallet refuses ITSELF and THE ENGINE as target, whatever the verdict
+        ├─▶ 6. dispatch THE EXACT VALIDATED BYTES ──▶ 0xpushstake.stakeFor(0xbobagw, 40e6)
+        │                                                   ▲
+        │                                         msg.sender == 0xbobagw
+        │                                         ← the vault pulls pUSDC from the WALLET
+        │                                           and credits the WALLET
+        └─ 7. emit RulesActionAuthorized(rulesId, 0xagent, keccak256(execCalldata))
 ```
 
-- **Any single gate failing reverts the whole transaction** — nonce, counters, everything. A failed action costs the relayer gas and changes nothing else. The agent's runtime is never trusted; URP is the trust boundary.
+- **Any single gate failing reverts the whole transaction** — counters, everything. A failed action costs the agent gas and changes nothing else. The agent's runtime is never trusted; URP is the trust boundary.
 - **The engine does half the work here that URP does in the universal flow.** Because the call is flat, its target and function are the engine's own action identity: a request to `0xpushstake.withdrawAll()` or to any other contract never reaches URP at all — it dies at the engine with `NoPoliciesSet`. URP's job is what the engine cannot see: the arguments, the value, the count.
-- **Ordering note that looks wrong and is not:** the signature is verified **after** the policies. URP's native gates run on calldata that has not yet been authenticated — so, like the universal gauntlet, they make no external calls, write every counter last, and revert on every failure. Every pin and the metered amount are read straight out of the calldata at a frozen position, bounds-checked in 256-bit arithmetic; nothing is decoded as a structure.
-- **Step 7 is the last of four refusals of a self-call.** The wallet and the engine were refused at grant (Stage 3); the engine's own minimum-one-policy floor refuses them a second way; and here the wallet refuses them a fourth time, **after** validation, whatever the engine concluded. This one exists for a session the owner enabled on the engine *directly*, bypassing `grantRules` — a thing the owner door permits. Two permanent tests pin it, one of them reaching the engine as a target through the engine's own wildcard. Do not move it before validation.
+- **Ordering note that looks wrong and is not:** the engine consults the session validator **after** the policies. The wallet has already checked the caller, but URP's native gates still treat the calldata as unauthenticated — so, like the universal gauntlet, they make no external calls, write every counter last, and revert on every failure. Every pin and the metered amount are read straight out of the calldata at a frozen position, bounds-checked in 256-bit arithmetic; nothing is decoded as a structure.
+- **Step 5 is the last of four refusals of a self-call.** The wallet and the engine were refused at grant (Stage 3); the engine's own minimum-one-policy floor refuses them a second way; and here the wallet refuses them a fourth time, **after** validation, whatever the engine concluded. This one exists for a session the owner enabled on the engine *directly*, bypassing `grantRules` — a thing the owner door permits. Two permanent tests pin it, one of them reaching the engine as a target through the engine's own wildcard. Do not move it before validation.
 - **How a failure surfaces.** The engine re-wraps a policy's revert as `PolicyCheckReverted(bytes32)` and keeps only 32 bytes — the URP error's selector and the first 28 bytes of its first argument. That is why every native error leads with the value you debug with: `ArgPinMismatch(actual, index, expected)` shows you the word that did not match; `NativeAmountExceedsCap(amount, cap)` shows you the amount.
 
 ### 💰 FUND MOVEMENT #3 — 40 pUSDC moves from the wallet into the vault
@@ -251,7 +250,7 @@ URP.stakeFor: amountSpent 0 → 40e6 · callsUsed 0 → 1       emit NativeCallM
 | After Stage 5 | a burn, an event, and a pending outbound | **the position exists, credited to the wallet** |
 | Something in flight? | yes — bridge latency | **no** |
 | A far side that can fail? | yes — funds return, spend credited back (designed, not yet functional) | **no** — the call either succeeded inside the transaction or the whole transaction reverted, counters included |
-| Gas on failure | consumed, never credited | consumed by the relayer, never credited |
+| Gas on failure | consumed, never credited | consumed by the agent, never credited |
 | Revocation window | bridge latency | **zero** — the next request is refused |
 
 ### 🎯 What `0xpushstake` sees
@@ -264,7 +263,7 @@ msg.sender = 0xbobagw · beneficiary = 0xbobagw · stake credited → 0xbobagw
 
 ### If the call fails
 
-- `stakeFor` reverts inside the vault — insufficient allowance, a paused vault, anything — and **the whole wallet transaction reverts with it**: the nonce position, all three counters, the metering event, everything. Nothing to credit back, because nothing was recorded. The relayer paid gas; that is the entire consequence.
+- `stakeFor` reverts inside the vault — insufficient allowance, a paused vault, anything — and **the whole wallet transaction reverts with it**: all three counters, the metering event, everything. Nothing to credit back, because nothing was recorded. The agent paid gas; that is the entire consequence.
 
 ---
 
@@ -278,20 +277,20 @@ msg.sender = 0xbobagw · beneficiary = 0xbobagw · stake credited → 0xbobagw
 ```
 
 - **The UEA cannot command the vault directly** — it is not the staker. To unstake, `0xbobuea` calls `0xbobagw.execute(0xpushstake.unstake())` through the owner door, with no policy in the path, and the pUSDC lands back in the wallet. Always one hop, always the wallet.
-- **The agent key can unstake, twice, to the wallet only** — `unstake()` is granted with a call limit of two, and it pays `msg.sender`, which is the wallet. It cannot redirect the proceeds because there is no argument to redirect.
+- **The agent can unstake, twice, to the wallet only** — `unstake()` is granted with a call limit of two, and it pays `msg.sender`, which is the wallet. It cannot redirect the proceeds because there is no argument to redirect.
 - **The vault has no idea a rules set exists.** It sees an ordinary contract calling it. All of the enforcement is behind that call, in the wallet, the engine and URP.
 
 | Actor | Can do | Cannot do |
 | --- | --- | --- |
 | **`0xbobuea`** (Bob) | anything, unconditionally — unstake, withdraw anywhere, revoke, replace a rules set, install/uninstall a validator | — |
-| **`0xagentkey`** | exactly the five actions, under their pins, caps and limits, until expiry | everything else — including a sixth function on the same contract |
+| **`0xagent`** | exactly the five actions, under their pins, caps and limits, until expiry | everything else — including a sixth function on the same contract |
 | **`0xpushstake`** | credit and pay whoever calls it | tell the agent from the owner — both arrive as `0xbobagw` |
 
 ### The owner's three operations, in full
 
 - **Withdraw** — `execute([...])`. **There is no `withdraw()` function**; the owner path *is* withdrawal. `execute(0xpushstake.unstake())` then `execute(pUSDC.transfer(anywhere, …))`, with no destination restriction and no policy in the path. It must succeed in every degraded state — zero rules sets, engine uninstalled, hostile validator installed.
 - **Revoke** — `revokeRules(pid)` (existence-checked, so a typo reverts loudly instead of silently "succeeding") or `revokeAllRules()`. Immediate, unblockable, no callbacks on the path. Removing the permission removes all five action records' standing at once. **There is no in-flight window** — a native rules set has nothing in flight.
-- **Change a rules set** — **it cannot be edited.** A change is one owner transaction batching: `URP.assertSpent(id, wallet, valueSpent, amountSpent, calls)` → `revokeRules(old)` → `grantRules(new)`. The native assertion names **all three counters** of the action being replaced and every one must match exactly; it refuses to run against a universal record or a ghost, so a stale belief can never pass by reading zeros from the wrong place. If the agent acted in the composition window, the assertion reverts the whole change. **Counters restart at zero on the new rules set**, and any request the agent signed against the old id is dead, because the op hash binds the permission id.
+- **Change a rules set** — **it cannot be edited.** A change is one owner transaction batching: `URP.assertSpent(id, wallet, valueSpent, amountSpent, calls)` → `revokeRules(old)` → `grantRules(new)`. The native assertion names **all three counters** of the action being replaced and every one must match exactly; it refuses to run against a universal record or a ghost, so a stale belief can never pass by reading zeros from the wrong place. If the agent acted in the composition window, the assertion reverts the whole change. **Counters restart at zero on the new rules set**, and any request for the old id is dead: removal cleared its agent, and the new rules set has a new id.
 
 ### STAGE 7b — the second action, and why it still counts
 
@@ -300,13 +299,13 @@ msg.sender = 0xbobagw · beneficiary = 0xbobagw · stake credited → 0xbobagw
 
 ### STAGE 7c — the six requests that fail, and where
 
-| The agent tries | Dies at | Error, as the relayer sees it |
+| The agent tries | Dies at | Error, as the agent sees it |
 | --- | --- | --- |
-| `stakeFor(0xagentkey, 10e6)` — stake for itself | URP, gate **N7** | `ArgPinMismatch(0xagentkey…, 0, …)` — the pin is what stops the agent staking to itself |
+| `stakeFor(0xagent, 10e6)` — stake for itself | URP, gate **N7** | `ArgPinMismatch(0xagent…, 0, …)` — the pin is what stops the agent staking to itself |
 | `stakeFor(0xbobagw, 25e6)` after 40 already staked | URP, gate **N8** | `TotalNativeAmountExceeded(65e6, 60e6)` — the lifetime amount cap |
 | a third `unstake()` | URP, gate **N9** | `CallLimitReached(2, 2)` |
 | `0xpushstake.withdrawAll()` — a function Bob never granted | **the engine**, before URP | `NoPoliciesSet(pid)` — no action id, no policy, nothing to run |
-| `pUSDC.approve(0xagentkey, …)` — a contract Bob never granted | **the engine**, before URP | the same |
+| `pUSDC.approve(0xagent, …)` — a contract Bob never granted | **the engine**, before URP | the same |
 | `0xbobagw.grantRules(…)` — the wallet itself | **the wallet, at grant** — it was never grantable; and again at dispatch if it were somehow enabled | `ForbiddenActionTarget(0xbobagw)` · `ForbiddenDispatchTarget(0xbobagw)` |
 
 ---
@@ -321,7 +320,7 @@ msg.sender = 0xbobagw · beneficiary = 0xbobagw · stake credited → 0xbobagw
 | 4 | 5 | `0xbobagw` → `0xpushstake`, **credited to `0xbobagw`** | 40 pUSDC |
 | 5 | 7b | `0xpushstake` → `0xbobagw` | rewards |
 
-**The agent never appears as a holder in any row. Rows 1–3 are Bob funding himself; rows 4–5 are the wallet moving its own money in and out of a Push contract, on the agent's signature, under Bob's pins.**
+**The agent never appears as a holder in any row. Rows 1–3 are Bob funding himself; rows 4–5 are the wallet moving its own money in and out of a Push contract, on the agent's call, under Bob's pins.**
 
 ---
 
@@ -363,14 +362,14 @@ msg.sender = 0xbobagw · beneficiary = 0xbobagw · stake credited → 0xbobagw
                         ├──4─▶ ⛽ PC ──▶ 0xbobagw   (for the two payable actions)
                         └──5─▶ 🔓 OWNER DOOR: pUSDC.approve(0xpushstake)   ← Bob's, not the agent's
 
-  STAGE 4        agent decides · composes ONE FLAT CALL · signs opHash (same 10 fields)
+  STAGE 4        agent decides · composes ONE FLAT CALL
                                 │
   STAGE 5                       ▼
-     anyone relays ──▶ 0xbobagw.executeWithSession(...)
+     0xagent calls ──▶ 0xbobagw.executeAsAgent(rulesId, …)
                                 │
                     ┌───────────┴────────────────────────┐
-                    │ WALLET: expiry · validator · nonce │
-                    │         · opHash · build userOp    │
+                    │ WALLET: engine installed ·         │
+                    │   caller == the agent · userOp     │
                     ├────────────────────────────────────┤
                     │ ENGINE: actionId = (0xpushstake,   │
                     │   stakeFor) — ungranted pair dies  │
@@ -382,7 +381,7 @@ msg.sender = 0xbobagw · beneficiary = 0xbobagw · stake credited → 0xbobagw
                     │  amount caps · call limit          │
                     │  EFFECTS LAST: 3 counters          │
                     ├────────────────────────────────────┤
-                    │ SIGNATURE CHECKED LAST             │
+                    │ SENDER CHECKED AGAIN, LAST         │
                     ├────────────────────────────────────┤
                     │ WALLET: not itself, not the engine │
                     └───────────┬────────────────────────┘
@@ -405,15 +404,15 @@ msg.sender = 0xbobagw · beneficiary = 0xbobagw · stake credited → 0xbobagw
 
 ## Both kinds on one wallet
 
-Bob may hold this native rules set and the universal one from `3_Universal_Flow.md` on the **same** wallet, granted by the same owner, signed for by the same or different agent keys. They meter in disjoint storage — a native call moves no universal counter, and the reverse — and revoking one leaves the other enabled. The only thing they share is the wallet's balance, which is exactly the blast-radius boundary Bob chose in Stage 1.
+Bob may hold this native rules set and the universal one from `3_Universal_Flow.md` on the **same** wallet, granted by the same owner, naming the same agent or different ones. They meter in disjoint storage — a native call moves no universal counter, and the reverse — and revoking one leaves the other enabled. The only thing they share is the wallet's balance, which is exactly the blast-radius boundary Bob chose in Stage 1.
 
 ---
 
 ## The five things to remember
 
 1. **One signature — and the wallet is Bob's forever.** Identity, wallet, rules set, funding and the owner's approval land atomically. The wallet's owner is baked into its bytecode at creation and can never be reassigned.
-2. **The agent key authorises; it never holds.** It triggers five named functions on one named contract, under nine simultaneous gates each. Funds move only from Bob's own wallet, only into positions credited to Bob's own wallet.
-3. **The caller is irrelevant; the signature is everything.** `executeWithSession` is open to anyone and inert without the right signature. That is also why relaying is a service concern, not a security one.
+2. **The agent authorises; it never holds.** It triggers five named functions on one named contract, under nine simultaneous gates each. Funds move only from Bob's own wallet, only into positions credited to Bob's own wallet.
+3. **The caller is the authority.** `executeAsAgent` admits only the agent the rules set names; an external key acts through its UEA, which verifies the key. There is no bearer request and no relayer.
 4. **`msg.sender` at the protocol decides everything.** Because `0xbobagw` makes the call, the vault credits `0xbobagw`. Had the agent called the vault, the position would have been the agent's — and it has nothing to stake. **That single fact is the design, one hop shorter than universal.**
 5. **The engine sees the door; URP sees what walks through it.** The engine already knows which contract and which function — that is its action identity, and an ungranted pair never reaches URP. What the engine cannot see is *how* the function is called: URP's native rulebook pins the arguments, caps the value and the amount, and counts the calls. Remove URP from an action and that action enforces nothing.
 

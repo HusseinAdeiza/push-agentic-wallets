@@ -514,8 +514,8 @@ contract AGWFactoryTest is BaseTest {
 
         // and it rejects any agent request — structurally, with no permission to name
         vm.prank(AGENT);
-        vm.expectRevert(AGWErrors.InvalidSessionSignature.selector);
-        wallet.executeWithSession(address(engine), ModeCode.unwrap(ModeLib.encodeSimpleSingle()), "", "", 0, 0, 0);
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, bytes32(0), AGENT));
+        wallet.executeAsAgent(bytes32(0), ModeCode.unwrap(ModeLib.encodeSimpleSingle()), "");
     }
 
     // ═══════════════════════════════════ T-11 ═══════════════════════════════════

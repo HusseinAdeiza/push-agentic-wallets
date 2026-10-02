@@ -52,10 +52,12 @@ library AGWErrors {
 
     // ──────────────────── the agent door ────────────────────
 
-    /// @dev Signature too short to carry the mode byte followed by a permission id, or a mode byte
-    ///      that is not USE.
-    error InvalidSessionSignature();
-    error RequestExpired();
+    /// @dev `executeAsAgent`: the caller is not the agent named by `rulesId` on this wallet —
+    ///      including when the id is unknown, revoked, or names a session validator other than the
+    ///      canonical one (all of which have no agent). Carries both values: this error is raised by
+    ///      the wallet directly and is never truncated.
+    error CallerIsNotAgent(bytes32 rulesId, address caller);
+    /// @dev `executeWithSig`: the intent's sequence number is not the owner lane's next one.
     error InvalidNonce(uint192 nonceKey, uint64 expected, uint64 provided);
     error ValidationFailed(address authorizer);
     error OutsideTimeWindow(uint48 validAfter, uint48 validUntil);
@@ -152,8 +154,6 @@ library AGWErrors {
     error IntentExecMismatch(bytes32 actualCalldataHash);
     /// @dev `executeWithSig` on a nonce key without `OWNER_LANE_FLAG`.
     error OwnerLaneRequired(uint192 nonceKey);
-    /// @dev `executeWithSession` on a nonce key with `OWNER_LANE_FLAG` — an owner lane.
-    error OwnerLaneForbidden(uint192 nonceKey);
 
     // ──────────────────── used by ExecutionLib ────────────────────
 
@@ -379,9 +379,8 @@ library UniversalRulesPolicyErrors {
 /// @title AgentValidatorErrors
 /// @notice Custom errors of the session validator.
 library AgentValidatorErrors {
-    /// @dev Thrown when the scheme byte is neither of the two supported values.
-    error UnsupportedScheme(uint8 scheme);
-
-    /// @dev Thrown when the key length does not match the scheme it is paired with.
+    /// @dev The stored config is not exactly `abi.encode(address agent)` with a non-zero agent.
+    ///      Unreachable through the wallet's grant path, which runs `validateConfig` first; reachable
+    ///      only for a session the owner enabled on the engine directly.
     error MalformedConfig();
 }

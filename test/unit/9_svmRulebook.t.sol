@@ -28,7 +28,7 @@ import {
     SvmTerms,
     VmFamily
 } from "../../src/libraries/Types.sol";
-import { ConfigId, Session, SmartSessionMode } from "smartsessions/DataTypes.sol";
+import { ConfigId, Session } from "smartsessions/DataTypes.sol";
 import { IPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { VALIDATION_SUCCESS } from "erc7579/interfaces/IERC7579Module.sol";
 import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
@@ -1612,16 +1612,15 @@ contract URPSvmTest is BaseTest {
         AGW wallet;
         address owner;
         address signer;
-        uint256 pk;
         bytes32 pid;
     }
 
     function _agentWithSolanaMandate() internal returns (Agent memory ag) {
         ag.owner = makeAddr("solanaWalletOwner");
-        (ag.signer, ag.pk) = ecdsaKey("solanaAgentSigner");
+        (ag.signer,) = ecdsaKey("solanaAgentSigner");
         ag.wallet = newWallet(ag.owner);
         vm.deal(address(ag.wallet), 100 ether);
-        Session memory session = canonicalSession(ecdsaConfig(ag.signer), svmInitData(CHAIN_SOLANA_DEVNET, _terms()));
+        Session memory session = canonicalSession(agentConfig(ag.signer), svmInitData(CHAIN_SOLANA_DEVNET, _terms()));
         vm.prank(ag.owner);
         ag.pid = ag.wallet.grantRules(session);
     }
@@ -1643,33 +1642,10 @@ contract URPSvmTest is BaseTest {
         return ExecutionLib.encodeSingle(GATEWAY, 0, req);
     }
 
-    function _signedOp(Agent memory ag, bytes memory executionCalldata) internal view returns (bytes memory) {
-        bytes32 mode = ModeCode.unwrap(ModeLib.encodeSimpleSingle());
-        bytes32 h = keccak256(
-            abi.encode(
-                keccak256("AGW.Op.v3"),
-                block.chainid,
-                address(ag.wallet),
-                address(engine),
-                ag.pid,
-                mode,
-                keccak256(executionCalldata),
-                uint192(0),
-                uint64(0),
-                uint48(0)
-            )
-        );
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(ag.pk, h);
-        return abi.encodePacked(uint8(SmartSessionMode.USE), ag.pid, abi.encodePacked(r, s, v));
-    }
-
+    /// @dev The agent itself calls the agent door: it is the sender the wallet checks.
     function _submit(Agent memory ag, bytes memory executionCalldata) internal {
-        bytes memory sig = _signedOp(ag, executionCalldata);
-        vm.prank(RELAYER);
-        ag.wallet
-            .executeWithSession(
-                address(engine), ModeCode.unwrap(ModeLib.encodeSimpleSingle()), executionCalldata, sig, 0, 0, 0
-            );
+        vm.prank(ag.signer);
+        ag.wallet.executeAsAgent(ag.pid, ModeCode.unwrap(ModeLib.encodeSimpleSingle()), executionCalldata);
     }
 
     function test_svm_wallet_grantLandsAsSvmConfigWithNoWalletChange() public {
@@ -1687,7 +1663,7 @@ contract URPSvmTest is BaseTest {
         (address signer,) = ecdsaKey("cosmosSigner");
         AGW w = newWallet(owner_);
         string memory chain = "cosmos:cosmoshub-4";
-        Session memory session = canonicalSession(ecdsaConfig(signer), svmInitData(chain, _terms()));
+        Session memory session = canonicalSession(agentConfig(signer), svmInitData(chain, _terms()));
         vm.prank(owner_);
         vm.expectRevert(abi.encodeWithSelector(PushChainLib.UnsupportedNamespace.selector, keccak256(bytes(chain))));
         w.grantRules(session);

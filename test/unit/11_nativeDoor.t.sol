@@ -39,7 +39,7 @@ import {
     ERC7739Data,
     ERC7739Context,
     PermissionId,
-    SmartSessionMode
+    ConfigId
 } from "smartsessions/DataTypes.sol";
 
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
@@ -60,7 +60,6 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
     MockERC20 internal token;
 
     address internal agentAddr;
-    uint256 internal agentPk;
 
     bytes32 internal permissionId;
 
@@ -78,7 +77,7 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
         wallet = newWallet(WALLET_OWNER);
         vm.deal(address(wallet), 100 ether);
 
-        (agentAddr, agentPk) = makeAddrAndKey("nativeAgent");
+        agentAddr = makeAddr("nativeAgent");
 
         token = new MockERC20();
         stakeDummy = new StakeDummy(token);
@@ -183,7 +182,7 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
     function _nativeSession(ActionData[] memory actions) internal view returns (Session memory) {
         return Session({
             sessionValidator: ISessionValidator(address(validator)),
-            sessionValidatorInitData: ecdsaConfig(agentAddr),
+            sessionValidatorInitData: agentConfig(agentAddr),
             salt: bytes32(0),
             userOpPolicies: new PolicyData[](0),
             erc7739Policies: ERC7739Data({
@@ -213,31 +212,10 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
         return ModeCode.unwrap(ModeLib.encodeSimpleSingle());
     }
 
-    function _opHash(bytes memory execCd, uint192 key, uint64 seq, bytes32 pid) internal view returns (bytes32) {
-        return keccak256(
-            abi.encode(
-                keccak256("AGW.Op.v3"),
-                block.chainid,
-                address(wallet),
-                address(engine),
-                pid,
-                _singleMode(),
-                keccak256(execCd),
-                key,
-                seq,
-                uint48(0)
-            )
-        );
-    }
-
-    function _sign(bytes memory execCd, uint192 key, uint64 seq, bytes32 pid) internal view returns (bytes memory) {
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(agentPk, _opHash(execCd, key, seq, pid));
-        return abi.encodePacked(uint8(SmartSessionMode.USE), pid, abi.encodePacked(r, s, v));
-    }
-
-    function _submit(bytes memory execCd, uint192 key, uint64 seq, bytes32 pid) internal {
-        vm.prank(RELAYER);
-        wallet.executeWithSession(address(engine), _singleMode(), execCd, _sign(execCd, key, seq, pid), key, seq, 0);
+    /// @dev The agent itself calls the agent door: it is the sender the wallet checks.
+    function _submit(bytes memory execCd, bytes32 pid) internal {
+        vm.prank(agentAddr);
+        wallet.executeAsAgent(pid, _singleMode(), execCd);
     }
 
     function _stakeCd(address beneficiary, uint256 amount) internal view returns (bytes memory) {
@@ -252,42 +230,29 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
     /// stake -> unstake -> claim -> depositFor -> bare value transfer, all under ONE mandate.
     function test_native_endToEnd_allFiveActions() public {
         permissionId = _grantFullMandate();
-        uint192 lane;
 
         // 1. stake, beneficiary pinned to the wallet
-        _submit(_stakeCd(address(wallet), 40e6), lane, 0, permissionId);
+        _submit(_stakeCd(address(wallet), 40e6), permissionId);
         assertEq(stakeDummy.totalBalance(address(wallet)), 40e6, "staked");
 
         // 2. unstake — four bytes of selector, no arguments
-        _submit(
-            ExecutionLib.encodeSingle(address(stakeDummy), 0, abi.encodeCall(StakeDummy.unstake, ())),
-            lane,
-            1,
-            permissionId
-        );
+        _submit(ExecutionLib.encodeSingle(address(stakeDummy), 0, abi.encodeCall(StakeDummy.unstake, ())), permissionId);
         assertEq(stakeDummy.totalBalance(address(wallet)), 0, "unstaked");
 
         // 3. claim — the ascetic shape
-        _submit(
-            ExecutionLib.encodeSingle(address(stakeDummy), 0, abi.encodeCall(StakeDummy.claim, ())),
-            lane,
-            2,
-            permissionId
-        );
+        _submit(ExecutionLib.encodeSingle(address(stakeDummy), 0, abi.encodeCall(StakeDummy.claim, ())), permissionId);
 
         // 4. depositFor — pin AND native value
         _submit(
             ExecutionLib.encodeSingle(
                 address(stakeDummy), 3 ether, abi.encodeCall(StakeDummy.depositFor, (address(wallet)))
             ),
-            lane,
-            3,
             permissionId
         );
         assertEq(stakeDummy.pcBalance(address(wallet)), 3 ether, "deposited");
 
         // 5. THE TRUE VALUE-ONLY PATH — empty calldata, so the engine derives VALUE_SELECTOR.
-        _submit(ExecutionLib.encodeSingle(address(stakeDummy), 2 ether, ""), lane, 4, permissionId);
+        _submit(ExecutionLib.encodeSingle(address(stakeDummy), 2 ether, ""), permissionId);
         assertEq(stakeDummy.pcBalance(address(wallet)), 3 ether + 2 ether, "bare value transfer landed");
     }
 
@@ -306,7 +271,7 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
                 bytes32(uint256(uint160(address(wallet))))
             )
         );
-        _submit(cd, 0, 0, permissionId);
+        _submit(cd, permissionId);
     }
 
     function test_native_gauntlet_amountExceedsPerCallCap() public {
@@ -316,19 +281,19 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
                 UniversalRulesPolicyErrors.NativeAmountExceedsCap.selector, uint256(51e6), uint256(50e6)
             )
         );
-        _submit(_stakeCd(address(wallet), 51e6), 0, 0, permissionId);
+        _submit(_stakeCd(address(wallet), 51e6), permissionId);
     }
 
     function test_native_gauntlet_lifetimeAmountCap() public {
         permissionId = _grantFullMandate();
-        _submit(_stakeCd(address(wallet), 40e6), 0, 0, permissionId);
+        _submit(_stakeCd(address(wallet), 40e6), permissionId);
 
         expectUrpGate(
             abi.encodeWithSelector(
                 UniversalRulesPolicyErrors.TotalNativeAmountExceeded.selector, uint256(80e6), uint256(60e6)
             )
         );
-        _submit(_stakeCd(address(wallet), 40e6), 0, 1, permissionId);
+        _submit(_stakeCd(address(wallet), 40e6), permissionId);
     }
 
     function test_native_gauntlet_valueExceedsCap() public {
@@ -341,41 +306,54 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
                 UniversalRulesPolicyErrors.ValueExceedsCap.selector, uint256(6 ether), uint256(5 ether)
             )
         );
-        _submit(cd, 0, 0, permissionId);
+        _submit(cd, permissionId);
     }
 
     function test_native_gauntlet_callLimitReached() public {
         permissionId = _grantFullMandate();
-        _submit(_stakeCd(address(wallet), 10e6), 0, 0, permissionId);
+        _submit(_stakeCd(address(wallet), 10e6), permissionId);
 
         bytes memory unstakeCd =
             ExecutionLib.encodeSingle(address(stakeDummy), 0, abi.encodeCall(StakeDummy.unstake, ()));
-        _submit(unstakeCd, 0, 1, permissionId);
+        _submit(unstakeCd, permissionId);
 
         // maxCalls == 2 on unstake; the second consumed it, and StakeDummy would revert anyway, so
         // stake again first to keep the failure attributable to the POLICY.
-        _submit(_stakeCd(address(wallet), 10e6), 0, 2, permissionId);
-        _submit(unstakeCd, 0, 3, permissionId);
+        _submit(_stakeCd(address(wallet), 10e6), permissionId);
+        _submit(unstakeCd, permissionId);
 
-        _submit(_stakeCd(address(wallet), 10e6), 0, 4, permissionId);
+        _submit(_stakeCd(address(wallet), 10e6), permissionId);
         expectUrpGate(
             abi.encodeWithSelector(UniversalRulesPolicyErrors.CallLimitReached.selector, uint32(2), uint32(2))
         );
-        _submit(unstakeCd, 0, 5, permissionId);
+        _submit(unstakeCd, permissionId);
     }
 
-    /// A replayed signature dies at the wallet's nonce gate, before the policy ever runs.
-    function test_native_gauntlet_replayDiesAtNonce() public {
+    /// Only the agent the rules set names may submit: a valid native request from anyone else is
+    /// refused by the wallet before the engine runs, and nothing moves.
+    function test_native_nonAgentCannotSubmit() public {
         permissionId = _grantFullMandate();
+        address stranger = makeAddr("stranger");
         bytes memory cd = _stakeCd(address(wallet), 10e6);
-        bytes memory sig = _sign(cd, 0, 0, permissionId);
 
-        vm.prank(RELAYER);
-        wallet.executeWithSession(address(engine), _singleMode(), cd, sig, 0, 0, 0);
+        bytes32 actionId = keccak256(abi.encodePacked(address(stakeDummy), STAKE_FOR));
+        ConfigId cfgId = ConfigId.wrap(
+            keccak256(abi.encodePacked(address(wallet), keccak256(abi.encodePacked(permissionId, actionId))))
+        );
+        NativeConfig memory before = urp.getNativeConfig(cfgId, address(wallet));
 
-        vm.prank(RELAYER);
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.InvalidNonce.selector, uint192(0), uint64(1), uint64(0)));
-        wallet.executeWithSession(address(engine), _singleMode(), cd, sig, 0, 0, 0);
+        vm.prank(stranger);
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, permissionId, stranger));
+        wallet.executeAsAgent(permissionId, _singleMode(), cd);
+
+        NativeConfig memory afterCfg = urp.getNativeConfig(cfgId, address(wallet));
+        assertEq(stakeDummy.totalBalance(address(wallet)), 0, "nothing staked");
+        assertEq(afterCfg.valueSpent, before.valueSpent, "value counter unchanged");
+        assertEq(afterCfg.amountSpent, before.amountSpent, "amount counter unchanged");
+        assertEq(afterCfg.callsUsed, before.callsUsed, "call counter unchanged");
+
+        _submit(cd, permissionId);
+        assertEq(stakeDummy.totalBalance(address(wallet)), 10e6, "the agent itself succeeds");
     }
 
     // ═══════════════════ the SDK obligation, made concrete ═══════════════════
@@ -417,7 +395,7 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
                 bytes32(uint256(uint160(address(stakeDummy))))
             )
         );
-        _submit(evil, 0, 0, pid);
+        _submit(evil, pid);
     }
 
     /// @dev Half two: the UNPINNED mandate lets exactly the same call through. This is the SDK
@@ -431,8 +409,8 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
 
         bytes32 pid = _grantApprove(w2, unpinned);
 
-        vm.prank(RELAYER);
-        w2.executeWithSession(address(engine), _singleMode(), evil, _signFor(w2, evil, 0, 0, pid), 0, 0, 0);
+        vm.prank(agentAddr);
+        w2.executeAsAgent(pid, _singleMode(), evil);
 
         assertEq(
             token.allowance(address(w2), attacker),
@@ -453,31 +431,6 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
 
         vm.prank(WALLET_OWNER);
         return w.grantRules(_nativeSession(a));
-    }
-
-    /// @dev The ten-field op hash and USE-mode envelope for an ARBITRARY wallet, so the second half
-    ///      above can sign against `w2` rather than the suite's default wallet.
-    function _signFor(AGW w, bytes memory ecd, uint192 key, uint64 seq, bytes32 pid)
-        internal
-        view
-        returns (bytes memory)
-    {
-        bytes32 h = keccak256(
-            abi.encode(
-                keccak256("AGW.Op.v3"),
-                block.chainid,
-                address(w),
-                address(engine),
-                pid,
-                _singleMode(),
-                keccak256(ecd),
-                key,
-                seq,
-                uint48(0)
-            )
-        );
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(agentPk, h);
-        return abi.encodePacked(uint8(SmartSessionMode.USE), pid, abi.encodePacked(r, s, v));
     }
 
     // ══════════════════════════ never-delete tests ══════════════════════════
@@ -525,9 +478,8 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
             address(wallet), 0, abi.encodeCall(AGW.grantRules, (_nativeSession(new ActionData[](1))))
         );
 
-        vm.prank(RELAYER);
         vm.expectRevert(abi.encodeWithSelector(AGWErrors.ForbiddenDispatchTarget.selector, address(wallet)));
-        wallet.executeWithSession(address(engine), _singleMode(), cd, _sign(cd, 0, 0, pid), 0, 0, 0);
+        _submit(cd, pid);
     }
 
     /**
@@ -567,9 +519,8 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
             address(engine), 0, abi.encodeCall(ISmartSession.isInitialized, (address(wallet)))
         );
 
-        vm.prank(RELAYER);
         vm.expectRevert(abi.encodeWithSelector(AGWErrors.ForbiddenDispatchTarget.selector, address(engine)));
-        wallet.executeWithSession(address(engine), _singleMode(), cd, _sign(cd, 0, 0, pid), 0, 0, 0);
+        _submit(cd, pid);
     }
 
     /// ⚠️ NEVER-DELETE. A gateway action declared NATIVE is refused, naming the index and target.
@@ -682,9 +633,8 @@ contract PushAgentWalletNativeDoorTest is BaseTest {
         // finds no matching action and the engine refuses it before the guard is even needed.
         bytes memory cd = ExecutionLib.encodeSingle(address(wallet), 0, abi.encodeCall(AGW.revokeAllRules, ()));
 
-        vm.prank(RELAYER);
         vm.expectRevert(abi.encodeWithSelector(ISmartSession.NoPoliciesSet.selector, PermissionId.wrap(pid)));
-        wallet.executeWithSession(address(engine), _singleMode(), cd, _sign(cd, 0, 0, pid), 0, 0, 0);
+        _submit(cd, pid);
     }
 
     // ───────────────────── the owner-door bypass helper ─────────────────────

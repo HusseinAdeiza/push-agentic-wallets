@@ -91,7 +91,7 @@ contract PushAgentWalletNativeGrantTest is BaseTest {
     function _session(ActionData[] memory actions, bytes32 saltSeed) internal view returns (Session memory) {
         return Session({
             sessionValidator: ISessionValidator(address(validator)),
-            sessionValidatorInitData: ecdsaConfig(address(uint160(uint256(saltSeed)))),
+            sessionValidatorInitData: agentConfig(address(uint160(uint256(saltSeed)))),
             salt: bytes32(0),
             userOpPolicies: new PolicyData[](0),
             erc7739Policies: ERC7739Data({

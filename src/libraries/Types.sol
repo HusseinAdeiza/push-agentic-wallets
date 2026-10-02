@@ -107,16 +107,6 @@ bytes4 constant SEND_OUTBOUND_SELECTOR =
     bytes4(keccak256("sendUniversalTxOutbound((bytes,address,uint256,uint256,uint256,uint256,bytes,address))"));
 
 /**
- * @dev Domain separator for the wallet's operation hash — distinct from every other protocol's, so
- *      a signature produced for this system can never be replayed as one for another.
- *
- *      The `v3` is the ARCHITECTURE GENERATION and is frozen: it is mixed into every agent
- *      signature, so changing the string invalidates every outstanding signed request. It is
- *      deliberately not tied to the wallet contract's own semver, which advances with releases.
- */
-bytes32 constant OP_HASH_DOMAIN = keccak256("AGW.Op.v3");
-
-/**
  * @dev The owner's signed authorisation for up to three actions: deploy, grant, execute.
  *
  *      SIGNED ONCE under the FACTORY's EIP-712 domain and verified by the factory and by every wallet
@@ -169,9 +159,9 @@ bytes32 constant OWNER_INTENT_DOMAIN_NAME_HASH = keccak256("AGWFactory");
 bytes32 constant OWNER_INTENT_DOMAIN_VERSION_HASH = keccak256("1");
 
 /**
- * @dev Top bit of a uint192 nonce key. SET = an owner lane, consumable only by `executeWithSig`; CLEAR =
- *      an agent lane, consumable only by `executeWithSession`. A pure calldata partition of `_nonces`:
- *      no new storage, and neither door can ever consume the other's replay position.
+ * @dev Top bit of a uint192 nonce key. `executeWithSig` requires it SET: only owner lanes are ever
+ *      consumed, and keys with it CLEAR are never touched. The agent door uses no nonce lanes at all —
+ *      its replay protection is the sender's own transaction nonce.
  */
 uint192 constant OWNER_LANE_FLAG = uint192(1) << 191;
 

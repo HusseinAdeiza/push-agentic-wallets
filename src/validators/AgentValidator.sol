@@ -3,113 +3,76 @@ pragma solidity 0.8.26;
 
 import { AgentValidatorErrors } from "../libraries/Errors.sol";
 
-import { ECDSA } from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
-import { IUSigVerifier } from "../interfaces/IUSigVerifier.sol";
 import { IAgentValidator } from "../interfaces/IAgentValidator.sol";
+import { AgentConfigLib } from "../libraries/AgentConfigLib.sol";
 
 /**
  * @title  AgentValidator
- * @notice A stateless ISessionValidator (ERC-7579 module type 7) that answers
- *         exactly one question for SmartSession: did the session key sign this hash?
- *         Supports secp256k1 (ECDSA) and Ed25519 via the signature-verification precompile.
+ * @notice A stateless ISessionValidator (ERC-7579 module type 7) that authorises a rules set's agent by
+ *         WHO SENT THE TRANSACTION, not by a signature. The rules set's config is the agent's Push
+ *         address — an EOA, or the UEA of an external key — and the "signature" the engine hands this
+ *         contract is the 20-byte sender the wallet wrote into it.
  *
- * @dev    - Makes a Solana-keyed agent a first-class operator on an EVM account.
- *         - Holds no storage, so one deployment serves every account.
- *         - Every parameter arrives as calldata.
+ * @dev    WHY THIS IS SOUND. The engine calls this only from `validateUserOp`, which reverts unless
+ *         `userOp.sender == msg.sender == account` — so only the wallet can obtain a verdict for its
+ *         own account. The wallet's agent door builds the operation itself and always writes
+ *         `USE ‖ rulesId ‖ msg.sender` into the signature field; no caller-supplied bytes reach it.
+ *         The wallet also refuses a non-agent sender BEFORE the engine runs (`CallerIsNotAgent`); this
+ *         contract is the second, independent layer, and the one the engine requires.
+ *
+ *         WHY IT STILL EXISTS. SmartSession always ends policy enforcement by calling the permission's
+ *         session validator and reverts `SignerNotFound` without one, and a validator never sees the
+ *         transaction sender. Removing this contract would mean forking the engine.
+ *
+ *         External-key verification (secp256k1, Ed25519) is NOT done here. It happens inside the
+ *         agent's UEA before the UEA ever calls the wallet.
+ *
+ *         Holds no storage and calls nothing, so one deployment serves every account.
  */
 contract AgentValidator is ISessionValidator, IAgentValidator {
-    /// @notice Push Chain signature-verification precompile (fixed, chain-level).
-    address public constant USV = 0xEC00000000000000000000000000000000000001;
-
-    /// @notice Scheme byte selecting secp256k1 signatures.
-    uint8 public constant SCHEME_ECDSA = 0;
-
-    /// @notice Scheme byte selecting Ed25519 signatures.
-    uint8 public constant SCHEME_ED25519 = 1;
-
     /// @dev ERC-7579 stateless-validator module type.
     uint256 internal constant MODULE_TYPE_STATELESS_VALIDATOR = 7;
 
     /**
-     * @notice Validate a session signature.
+     * @notice Whether `sig` is the configured agent.
      *
-     * @dev    - ECDSA: reverts `MalformedConfig` on a key that is not 20 bytes; returns false on a
-     *           signature that is not 65 bytes or that fails to recover.
-     *         - Ed25519: reverts `MalformedConfig` on a key that is not 32 bytes; returns false on a
-     *           signature that is not 64 bytes or on a failed precompile call.
-     *         - Reverts `UnsupportedScheme` on anything else.
-     *         - Recovery uses `tryRecover` rather than `recover`, so a malformed signature returns
-     *           false instead of reverting: a revert inside validation is indistinguishable from a
-     *           policy failure and degrades error reporting. The Ed25519 branch fails closed for the
-     *           same reason.
+     * @dev    - Reverts `MalformedConfig` if `data` is not a well-formed agent config. Unreachable
+     *           through the wallet's grant path, which runs `validateConfig` first; reachable only for
+     *           a session the owner enabled on the engine directly.
+     *         - Returns false unless `sig` is exactly 20 bytes.
+     *         - Returns whether those 20 bytes equal the configured agent.
+     *         - `hash` is ignored: there is no signature to check it against.
      *
-     * @param hash The opHash produced by AGW._computeOpHash
-     * @param sig  ECDSA: 65 bytes (r,s,v).  Ed25519: 64 bytes.
-     * @param data abi.encode(uint8 scheme, bytes key)
-     *             scheme 0 → key is abi.encodePacked(address signer)   — 20 bytes
-     *             scheme 1 → key is the raw Ed25519 public key         — 32 bytes
-     * @return validSig Whether the signature is valid for the configured key.
+     * @param sig  The 20-byte sender written by the wallet.
+     * @param data The rules set's config, `abi.encode(address agent)`.
+     * @return validSig True iff the sender is the agent.
      */
-    function validateSignatureWithData(bytes32 hash, bytes calldata sig, bytes calldata data)
+    function validateSignatureWithData(bytes32, bytes calldata sig, bytes calldata data)
         external
-        view
+        pure
         override
         returns (bool validSig)
     {
-        (uint8 scheme, bytes memory key) = abi.decode(data, (uint8, bytes));
-
-        if (scheme == SCHEME_ECDSA) {
-            if (key.length != 20) revert AgentValidatorErrors.MalformedConfig();
-            if (sig.length != 65) return false;
-            (address recovered, ECDSA.RecoverError err,) = ECDSA.tryRecover(hash, sig);
-            if (err != ECDSA.RecoverError.NoError) return false;
-            // forge-lint: disable-next-line(unsafe-typecast)
-            return recovered == address(bytes20(key));
-        }
-
-        if (scheme == SCHEME_ED25519) {
-            if (key.length != 32) revert AgentValidatorErrors.MalformedConfig();
-            if (sig.length != 64) return false;
-            // Raw-message variant: the message is the 32 bytes of hash. Not verifyEd25519, which
-            // verifies over the ASCII of a hex string that a standard signing library will not
-            // produce.
-            //
-            // Must be a raw staticcall. Solidity inserts an extcodesize check before any high-level
-            // call that ABI-decodes return data, and precompiles have no code, so an interface call
-            // would revert on-chain. IUSigVerifier is documentation only.
-            (bool ok, bytes memory ret) = USV.staticcall(
-                abi.encodeWithSignature("verifyEd25519RawMessage(bytes,bytes,bytes)", key, abi.encodePacked(hash), sig)
-            );
-            if (!ok || ret.length < 32) return false;
-            return abi.decode(ret, (bool));
-        }
-
-        revert AgentValidatorErrors.UnsupportedScheme(scheme);
+        address agent = AgentConfigLib.decode(data);
+        if (agent == address(0)) revert AgentValidatorErrors.MalformedConfig();
+        if (sig.length != 20) return false;
+        // forge-lint: disable-next-line(unsafe-typecast)
+        return address(bytes20(sig)) == agent; // `sig` is exactly 20 bytes, checked above
     }
 
     /**
-     * @notice Pure config sanity check, for grant screens and the SDK.
+     * @notice Grant-time config check, used by the wallet's grant path and by tooling.
      *
-     * @dev    - Closes a gap in the engine's grant path, which checks only the module type and never
-     *           inspects the key config. Without this, an owner can grant a permission with a
-     *           19-byte key: the grant succeeds and every later agent request reverts forever.
-     *         - Returns true only for scheme 0 with a 20-byte key, or scheme 1 with a 32-byte key.
-     *         - Three-valued, and must stay consistent with `validateSignatureWithData`: true means
-     *           the runtime call will not revert, though it may still return false, which is a
-     *           signature failure and a different thing; false means the runtime call reverts with a
-     *           named error; a revert here means the runtime call also reverts, at the same decode
-     *           step, not necessarily with a named error.
-     *         - Callers must treat a revert as an invalid config.
+     * @dev    Two-valued and never reverts: true iff `data` is exactly one ABI word holding a non-zero
+     *         address with clean upper bytes. True means `validateSignatureWithData` will not revert on
+     *         this config; false means it reverts `MalformedConfig`.
      *
-     * @param  data abi.encode(uint8 scheme, bytes key) — the frozen encoding.
-     * @return Whether the config is a supported scheme and key-length pair.
+     * @param  data Candidate `sessionValidatorInitData`.
+     * @return True iff `data` is a well-formed agent config.
      */
     function validateConfig(bytes calldata data) external pure returns (bool) {
-        (uint8 scheme, bytes memory key) = abi.decode(data, (uint8, bytes));
-        if (scheme == SCHEME_ECDSA) return key.length == 20;
-        if (scheme == SCHEME_ED25519) return key.length == 32;
-        return false;
+        return AgentConfigLib.decode(data) != address(0);
     }
 
     // --- IERC7579Module ---

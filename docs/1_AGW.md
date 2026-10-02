@@ -10,16 +10,16 @@
 - All of this runs on Push Chain, which reaches other blockchains through its own cross-chain gateway. Push Chain has no shared "transaction entry point" contract of the kind other chains use for smart accounts — so our wallet must do that job itself.
 ## The shape of the answer
 - The user gets a **dedicated agent wallet** — a small, cheap contract created just for one purpose. It is not the user's main account. It only ever holds the money the user chooses to put at risk.
-- The user grants the wallet a **permission**: a fixed bundle of limits binding one agent key. A permission is one of **two kinds**, and the user never states which: they name the **chain** the permission is for, and the kind follows from it — Push Chain itself means native, anywhere else means universal. It is fixed at grant and never changes. A **universal** permission bounds cross-chain actions: which token, which destination protocol and functions, how much per action, how much in total, and until when. The far chain may be an EVM chain or Solana; the chain's namespace decides which, and with it the format in which the far-chain action is written and checked. A **native** permission bounds actions on Push Chain itself: which Push contracts and functions, which arguments are pinned to which values, how much native value, how many calls, and until when.
+- The user grants the wallet a **permission**: a fixed bundle of limits binding one agent. A permission is one of **two kinds**, and the user never states which: they name the **chain** the permission is for, and the kind follows from it — Push Chain itself means native, anywhere else means universal. It is fixed at grant and never changes. A **universal** permission bounds cross-chain actions: which token, which destination protocol and functions, how much per action, how much in total, and until when. The far chain may be an EVM chain or Solana; the chain's namespace decides which, and with it the format in which the far-chain action is written and checked. A **native** permission bounds actions on Push Chain itself: which Push contracts and functions, which arguments are pinned to which values, how much native value, how many calls, and until when.
 - Every action the agent takes is checked against that permission **by contracts, at execution time**. The agent's honesty is never assumed and never needed.
 - The single most important contract in the system is **URP — the Universal Rules Policy**. It carries three rulebooks: two for universal permissions — one for EVM destination chains, one for Solana, because the far-chain action inside the call is written in that chain's own format — and one for native permissions. For a universal permission, every agent action, whatever it claims to be, is one and the same kind of call on Push Chain — the wallet calling the cross-chain gateway — and only URP looks inside that call to check what the agent is *really* doing on the far chain. For a native permission the target and function are already visible to the engine, and URP checks the three things the engine cannot see: the arguments, the value, and the count. `2_UniversalRulesPolicy.md` is devoted to it.
 ## What we build, and what we adopt
 | Piece                                        | Build or adopt                                | What it is                                                                                                                                                          |
 | -------------------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Wallet factory** (AGWFactory)              | Build                                         | Creates agent wallets at predictable addresses                                                                                                                      |
-| **Agent wallet** (AGW)           | Build                                         | The account itself: holds funds, verifies agent requests, executes                                                                                                  |
+| **Agent wallet** (AGW)           | Build                                         | The account itself: holds funds, admits only the permission's agent, executes                                                                                       |
 | **URP**                                      | **Build — the only genuinely novel contract** | The policy that inspects and limits every agent action — cross-chain through its universal rulebooks (EVM chains, Solana), Push-native through its native rulebook |
-| **Session validator** (AgentValidator) | Carry forward and verify                      | Checks the agent's signature (two schemes: standard ECDSA, and Ed25519)                                                                                             |
+| **Session validator** (AgentValidator) | Carry forward — stateless sender validator    | Confirms the caller the wallet names is the permission's agent. Verifies no signature                                                                              |
 | **SmartSession**                             | Adopt, unmodified                             | An existing open-source permission engine that stores permissions and runs policies                                                                                 |
 | **Cross-chain gateway**                      | Adopt (Push Chain's)                          | The contract that carries value and instructions to other chains                                                                                                    |
 | **Destination account**                      | Adopt (Push Chain's)                          | The user's account on the far chain, controlled from Push Chain. Universal permissions only                                                                         |
@@ -29,17 +29,17 @@ Read this list before reading anything else. None of these is an oversight.
 - **No editing of a granted permission.** A permission is frozen at grant. Any change means revoking it and granting a new one — in one combined step.
 - **No upgrade of a deployed wallet.** A wallet's code is fixed forever at creation. A new wallet version means creating a fresh wallet.
 - **No guardian, no recovery contact, and no pause on any wallet.** Nobody but the owner can act on a wallet, and nobody at all can freeze one. *(The **factory** has an operational pause that can stop **new wallets being created**. It cannot touch a wallet that exists, its funds, or its rules sets — see chapter 9, item 22.)*
-- **No paymaster and no gas sponsorship.** The agent's service relays its own requests and pays its own gas.
+- **No paymaster and no gas sponsorship.** The agent calls the wallet itself and pays its own gas — an EOA agent from its own balance, a UEA agent through its UEA's gas path.
 - **No deny-list.** The permission names what is allowed; everything else is refused. There is no list of specially forbidden functions. *(The fixed targets URP refuses even when allow-listed — the loopbacks of gate 14, and on Solana the programs of gate S15 — are not a deny-list of functions: each is a target that would hand the agent the destination account itself.)*
-- **No limit on how far in the future a permission or request may expire.** The user's choice of expiry is respected as given.
+- **No limit on how far in the future a permission may expire.** The user's choice of expiry is respected as given.
 - **No mixed permission.** A permission is universal or native, never both. An owner who wants an agent to do both grants two permissions on the same wallet — they coexist, meter independently, and are revoked independently.
 ## Glossary
 | Term                     | Meaning                                                                                                                                                                                  |
 | ------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Owner**                | The user's own key. Created the wallet, controls it absolutely.                                                                                                                          |
-| **Agent**                | An automated service holding an ordinary signing key. It signs requests; it never holds funds.                                                                                           |
+| **Agent**                | An automated service identified by a Push address — its own EOA, or the UEA of an external key. It calls the agent door itself; it never holds the user's funds.                          |
 | **Agent wallet**         | The contract this document is about. Holds the budgeted funds on Push Chain.                                                                                                             |
-| **Permission**           | One frozen bundle of limits binding one agent key, of one **kind** — universal or native. A wallet can hold several, of either kind.                                                     |
+| **Permission**           | One frozen bundle of limits binding one agent, of one **kind** — universal or native. A wallet can hold several, of either kind.                                                         |
 | **Universal permission** | A permission whose every action travels through the gateway to a far chain. One token, one destination chain, an allow-list of far-chain calls, one destination account. The far chain is an EVM chain or Solana. |
 | **Destination family**   | Which kind of far chain a universal permission targets — EVM or Solana. Derived from the chain's namespace (`eip155:` or `solana:`); any other namespace is refused at grant. It decides which universal rulebook runs.       |
 | **Account pin**          | A Solana limit: the account at a fixed position in an instruction's account list must equal a key frozen at grant. The Solana counterpart of the beneficiary check — how a source, a destination or an authority is locked. |
@@ -51,7 +51,6 @@ Read this list before reading anything else. None of these is an oversight.
 | **SmartSession**         | The adopted engine that stores permissions and calls each policy in turn.                                                                                                                |
 | **Gateway**              | Push Chain's cross-chain transport. The only thing a **universal** action is ever allowed to call — and the one thing a **native** action never may.                                     |
 | **Destination account**  | The user's account on the far chain. Its address is known in advance: on an EVM chain Push Chain computes it; on Solana it is a program-derived address of the gateway program, derived by tooling. |
-| **Relayer**              | Whoever submits the agent's signed request to Push Chain and pays that gas.                                                                                                              |
 | **PC**                   | Push Chain's native token, used for gas.                                                                                                                                                 |
 ---
 # 2 · The pieces
@@ -67,22 +66,22 @@ Six things make up the system. This chapter says what each one is, what it store
 - It is a modular smart account following an existing standard (ERC-7579), reduced to the minimum: it supports exactly **one kind of module — a validator** (a contract that checks signatures and permissions). Attempts to install any other module kind (executors, hooks, fallbacks) are refused by the wallet itself.
 - It has two doors:
 \t- **The owner door.** The owner can make the wallet do anything, send anything anywhere, with no checks at all. This is deliberate and is covered in chapter 3.
-\t- **The agent door** — a function called `executeWithSession`. Anyone may knock on this door with a signed agent request; the request only passes if every check in chapters 5 and 6 passes.
-- What the wallet stores: a replay-protection table (chapter 5), and a grant counter used to make every permission unique (chapter 4).
+\t- **The agent door** — a function called `executeAsAgent`. Only the permission's agent may call it, and the call only passes if every check in chapters 5 and 6 passes.
+- What the wallet stores: a grant counter used to make every permission unique (chapter 4), and replay counters used only by the owner's own relayable signed-intent door. The agent door keeps no state of its own.
 - What it holds: the budgeted funds — the tokens the owner has decided to put under agent management, plus a little PC for gas on cross-chain calls.
 ## 2.3 The permission
 - A permission is **not a single record in one place**. It is written across three storage locations in one grant transaction:
-\t- **SmartSession's storage** holds: that the permission exists, which agent key may sign for it, and the list of policy contracts to run.
+\t- **SmartSession's storage** holds: that the permission exists, which agent may act under it — the agent's Push address — and the list of policy contracts to run.
 \t- **URP's storage** holds everything about what the agent may actually do, in one of three shapes chosen by the permission's kind and, for a universal permission, its destination family. For a universal permission to an EVM chain: the allowed protocol functions on the far chain, the token, the caps, the counters, and the destination account address. For a universal permission to Solana: the same token, caps and counters, the destination account and the gateway program, the allowed (program, instruction) rules with their account and data pins, and the list of destination-side accounts that hold value. For a native permission, one record **per action**: the Push contract and function, the argument pins, the value and amount caps, the call limit, and the counters. `2_UniversalRulesPolicy.md` lists every field of all three.
 \t- **URP also records the kind itself**, in a small mode record written in the same transaction — and, for a universal permission, the destination family beside it. On every later request URP consults that record — not the shape of the data — to choose which rulebook runs.
 \t- *(There is no separate time-window policy in v3: the expiry lives inside URP, so URP is the sole action policy — see `2_UniversalRulesPolicy.md` §1.1.)*
 - A permission is identified by a unique id computed from its contents plus a salt the wallet supplies from its own grant counter. Granting the same terms twice therefore produces two distinct permissions — they never collide, and revoking one never touches the other.
 - A permission is **immutable**. Nothing in the system can modify one after grant. The only operations that exist are: create one, and remove one.
 ## 2.4 The agent
-- An agent is an ordinary externally-owned account — a plain signing key. Smart-contract agents (multisigs and the like) are not supported in v3.
-- Two signature schemes are accepted: standard ECDSA, and Ed25519 (verified through a precompiled contract on Push Chain at a settled, canonical address; what remains before testnet is one fork test of the live call path).
-- **An agent key is attached to one permission, not to the wallet.** A wallet with three permissions can have three different agent keys, each locked to its own limits. There is no wallet-level "the agent" and no way to swap the key inside an existing permission — a new key means a new permission.
-- The agent holds no funds of the user's and has no standing power. Its only ability is to produce signatures that the wallet may or may not accept.
+- An agent is a **Push address**. A Push-native key is its own EOA; any external key — EVM, Solana, anything Push Chain supports — acts through its UEA, the account Push Chain derives for that key, which verifies the key's signature before it ever calls the wallet. The wallet itself verifies no signature: it checks only who the caller is.
+- Any address may be an agent, including a smart contract such as a multisig.
+- **An agent is attached to one permission, not to the wallet.** A wallet with three permissions can have three different agents, each locked to its own limits. There is no wallet-level "the agent" and no way to swap the agent inside an existing permission — a new agent means a new permission.
+- The agent holds no funds of the user's and has no standing power. Its only ability is to call the agent door, naming one of its permissions, and have the wallet check that call.
 ## 2.5 URP — introduced
 - URP is the contract where the user's real intent is enforced: *this protocol, these functions, this token, this much, for me, until then*.
 - It exists because of a structural blind spot in the adopted engine, explained fully in `2_UniversalRulesPolicy.md`: from Push Chain's point of view, every agent action looks identical — a call to the gateway. URP is the contract that opens that call up and inspects what is inside — an EVM instruction list for an EVM chain, a single program instruction for Solana.
@@ -117,7 +116,7 @@ owner door + agent door"]
 (the limits — 2_UniversalRulesPolicy.md)\
 upgradeable behind a proxy"]
     VAL["Session validator\
-(checks the agent's signature)"]
+(confirms the caller is the agent)"]
     GW["Cross-chain gateway\
 (adopted transport)"]
     NP["Push-native protocol\
@@ -130,16 +129,14 @@ upgradeable behind a proxy"]
 (e.g. a market, a lending pool)"]
   end
   AGENT["Agent\
-(a signing key, off-chain)"]
-  RELAY["Relayer\
-(submits and pays Push gas)"]
+(a Push address: an EOA,\
+or the UEA of an external key)"]
 
   OWNER -- "creates, one call" --> FACTORY
   FACTORY -- "deploys" --> WALLET
   OWNER -- "grants / revokes permissions\
 and can execute anything" --> WALLET
-  AGENT -- "signs a request" --> RELAY
-  RELAY -- "submits to the agent door" --> WALLET
+  AGENT -- "calls the agent door itself" --> WALLET
   WALLET -- "asks: is this allowed?" --> SS
   SS --> URP
   SS --> VAL
@@ -155,7 +152,7 @@ and can execute anything" --> WALLET
 There is exactly one chain of control in this system, and it starts and ends with the user.
 - **The user's key owns the wallet.** Ownership is fixed at creation, inside the wallet's own bytecode. It cannot be transferred, stolen by code, or reassigned by any function — no function to do so exists.
 - **The wallet owns its permissions.** Only the owner, through the wallet, can create or remove a permission. An agent cannot grant itself anything, extend anything, or remove anything.
-- **A permission bounds one agent key.** The key can sign requests inside the permission's limits. That is the entirety of its power.
+- **A permission bounds one agent.** The agent can call the agent door within the permission's limits. That is the entirety of its power.
 - **The wallet's Push-side identity owns the destination account.** The far-chain account obeys instructions that arrive through Push Chain's gateway from the wallet. The agent never controls the destination account; it can only cause the wallet to send it instructions that URP has already approved.
 - **For a native permission the same rule holds one hop shorter.** The wallet calls the Push contract as itself, so the position, the shares, the claim — whatever the call produces — is credited to the wallet. The agent never controls the target contract; it can only cause the wallet to call it in exactly the way URP has already approved, with the arguments the owner pinned.
 ## The owner door has no checks — on purpose
@@ -163,10 +160,10 @@ There is exactly one chain of control in this system, and it starts and ends wit
 - **No policy, no cap, no expiry, no destination rule applies to the owner.** All of `2_UniversalRulesPolicy.md` applies to the agent door only.
 - Why: every safety mechanism on the owner's own exit is also a way for the owner to be locked out of their own money. The design refuses that trade. The wallet must remain drainable *by its owner* in every degraded state the rest of the system could ever reach — engine misconfigured, policy bricked, permission wedged, bridge down. A standing test executes an owner withdrawal in each of these states and must always pass.
 - The cost of this choice is stated plainly: **a stolen owner key drains the wallet completely.** There is no guardian and no delay to stop it. Defence against key theft belongs to the layer that holds keys — the user's identity and key-management setup — not to this wallet. This is the first entry in chapter 9's list of accepted limits.
-## What an agent's signature is — and is not
-- A signed agent request is a **bearer instruction**: whoever holds it may submit it to the wallet. The wallet checks *the signature and the limits*, not *who delivered it*. (A possible future tightening — binding requests to a named submitter — is recorded in chapter 11.)
-- A signature grants nothing durable. Each request spends from the permission's remaining budget exactly once (the replay protection in chapter 5 guarantees the "once").
-- The agent key never touches custody. At no point in any flow do funds sit in an account the agent controls. Universally, they move from the wallet, through the gateway, to the user's own destination account, and anything bought lands in that same account. Natively, they move from the wallet straight into a Push contract as the wallet's own position, and come back to the wallet.
+## What the agent's call is — and is not
+- The agent's authority is **being the sender**. The wallet admits a call only from the address the named permission records as its agent, so there is no bearer request: nothing the agent produces can be submitted by anyone else.
+- A call grants nothing durable. Each one spends from the permission's remaining budget once, as the transaction it is; replay is prevented by the sender's own nonce (chapter 5).
+- The agent never touches custody. At no point in any flow do funds sit in an account the agent controls. Universally, they move from the wallet, through the gateway, to the user's own destination account, and anything bought lands in that same account. Natively, they move from the wallet straight into a Push contract as the wallet's own position, and come back to the wallet.
 ## Diagram — the chain of ownership
 ```mermaid
 flowchart TB
@@ -175,16 +172,16 @@ absolute control, no checks on its path"]
   W["Agent wallet on Push Chain\
 owner fixed at creation, forever"]
   P1["Permission 1\
-agent key A · its own limits"]
+agent A · its own limits"]
   P2["Permission 2\
-agent key B · its own limits"]
+agent B · its own limits"]
   CEA["Destination account on the far chain\
 obeys the wallet, via the gateway"]
   NP["Push-native protocol\
 credits whoever calls it — the wallet"]
-  A1["Agent A — may only sign\
+  A1["Agent A — may only act\
 within Permission 1"]
-  A2["Agent B — may only sign\
+  A2["Agent B — may only act\
 within Permission 2"]
 
   KEY -- "owns, unconditionally" --> W
@@ -204,7 +201,7 @@ credited to the wallet only" .-> NP
 # 4 · The life of a permission
 ## 4.1 Birth — the grant
 - The owner (or the tooling acting for the owner, with the owner signing) composes the terms. **The first term is the chain** — a CAIP-2 identifier such as `eip155:11155111` or `solana:EtWTRABZaYq6iMfeYKouRu166VU2xqa1` — and it decides the kind and, for a universal permission, the destination family, which together decide the shape of everything after it. Common to both kinds:
-\t- the agent's public key and its signature scheme;
+\t- the agent's Push address — its own EOA, or the UEA of its external key;
 \t- the expiry — one value, held inside URP.
 - **For a universal permission to an EVM chain:**
 \t- the far-chain protocol: each allowed contract address and function, and — for each function — where in its arguments the *beneficiary* sits, so URP can later check that the beneficiary is the user's destination account. These argument positions are **generated from the protocol's interface by tooling, never typed by hand** (a promise the contracts cannot check — chapter 10);
@@ -244,7 +241,7 @@ credited to the wallet only" .-> NP
 - **Revocation is one owner call, effective immediately on Push Chain.** The permission's storage is removed; the very next agent request against it fails. Nothing the agent does can delay or contest this. Removal performs pure storage deletion — it calls out to nothing, so no external contract can make revocation fail (`SmartSessionBase.sol:329-355`, `ConfigLib.sol:274-284`).
 - **One honest limit:** revocation stops new instructions. An instruction that already left through the gateway — already in flight across the bridge — still completes on the far chain. The window is bridge latency. The revoke screen must say this (chapter 10).
 - **Expiry needs no transaction.** Past the expiry, URP's expiry gate — the second gate of every rulebook (2, N2, S2) — fails every request. The permission's storage still exists until removed, but it is inert.
-- Removing a permission also removes the standing power of anything signed under it: a request the agent signed but never submitted — a *banked* signature — dies with the permission, because the permission's id is bound into what was signed (chapter 5) and that id no longer exists. A regrant produces a new id, and the banked request fails against it. A permanent test pins this.
+- Removing a permission also ends its agent's power under it: removal clears the agent the permission named, so the very next call under that id is refused before any policy runs. A regrant produces a new id — the wallet's grant counter salts it — so a request built for the old id fails against the new permission too. A permanent test pins this.
 ## Diagram — the permission lifecycle
 ```mermaid
 stateDiagram-v2
@@ -262,65 +259,55 @@ immediate, unconditional
   Active --> Replaced: CHANGE = revoke + regrant\
 one atomic transaction,\
 gated by the spent-amount assertion
-  Replaced --> [*]: old id dead — banked signatures die with it\
+  Replaced --> [*]: old id dead — requests for it die with it\
 new permission starts at zero
   Expired --> Removed: cleanup, optional
   Removed --> [*]
 ```
 ---
 # 5 · One action, end to end
-This chapter walks a single agent action from signature to funds moving. It is the spine of the whole system; `2_UniversalRulesPolicy.md` then zooms into the deepest step.
+This chapter walks a single agent action from the agent's call to funds moving. It is the spine of the whole system; `2_UniversalRulesPolicy.md` then zooms into the deepest step.
 ## 5.1 Why the wallet does so much itself
-- On chains that follow the account-abstraction standard, a shared system contract (the "EntryPoint") receives signed account operations, checks replay protection, and dispatches them. **Push Chain has no such contract.** So our wallet performs those jobs itself, inside one function — the agent door, `executeWithSession`.
-- The wallet keeps the standard's *packaging* (the operation format), because the adopted permission engine speaks it. But the packaging is just a shape; there is no shared dispatcher behind it. The wallet is its own dispatcher and never leaves the call stack — which has one important consequence used later: **when the wallet finally calls the gateway, the gateway sees the wallet itself as the caller**, not a relayer, not the agent.
-## 5.2 The request the agent signs
-What the agent signs depends on the permission's kind — but only in the innermost part. The wallet operation around it, and the fingerprint over it, are identical for both.
-**A universal request has nested layers.** The agent's service composes the action innermost first:
+- On chains that follow the account-abstraction standard, a shared system contract (the "EntryPoint") receives signed account operations, checks replay protection, and dispatches them. **Push Chain has no such contract.** So our wallet performs those jobs itself, inside one function — the agent door, `executeAsAgent`.
+- The wallet keeps the standard's *packaging* (the operation format), because the adopted permission engine speaks it. But the packaging is just a shape; there is no shared dispatcher behind it. The wallet is its own dispatcher and never leaves the call stack — which has one important consequence used later: **when the wallet finally calls the gateway, the gateway sees the wallet itself as the caller**, not the agent.
+## 5.2 The request the agent sends
+What the agent sends depends on the permission's kind — but only in the innermost part. The call around it is identical for both.
+**A universal request has nested layers.** The agent composes the action innermost first:
 - **Innermost — the far-chain call.** The actual thing the user wanted: for example, *buy these shares, for this much of the token, with the user's destination account as beneficiary*.
 - **Around it — the instruction list.** The far-chain calls are packed as an instruction list for the destination account, between one and **ten** entries — ten is a fixed contract constant. Each entry is: a target address, a native-value amount, and call data.
 - **Around that — the gateway request.** The message to Push Chain's gateway: which token and how much to bridge, the instruction list as payload, and two routing fields URP will pin (`2_UniversalRulesPolicy.md`): the bridged-funds recipient field, and the refund destination.
-- **Outermost — the wallet operation.** The whole thing packaged as an operation on the wallet, plus the replay-protection pair described next.
+- **Outermost — the execution payload.** The gateway request as the single call the wallet will make: the gateway as target, the PC for far-side gas as value.
 **A universal request to Solana has the same layers, with a different middle.** There is no instruction list: the gateway makes exactly one call into one program per request, so the payload is a **single Solana instruction** — the account list (each a key and a writable flag), the instruction data, and the target program — in the byte format Push Chain's validators decode, not ABI. The gateway request's recipient field, which must be empty for an EVM chain, carries the **target program** here, and must equal the program named inside the payload. A flow that needs two instructions is two requests, the later ones bridging nothing.
-**A native request has one layer.** There is no far-chain call, no instruction list and no gateway request. The agent names a Push contract, a native-value amount, and the call data — and that flat call *is* the execution payload. Around it sits the same wallet operation and the same replay-protection pair. Three nested envelopes become one call; nothing else changes.
-Then the agent computes the operation's **fingerprint** — a hash the wallet will independently recompute — and signs it.
-## 5.3 The fingerprint — what the signature actually covers
-The wallet computes the fingerprint itself, from what actually arrived — never trusting a hash supplied from outside. It binds **ten fields**:
-1. a fixed domain label (so the signature cannot mean anything in any other protocol);
-2. the chain id (no replay on another chain);
-3. the wallet's own address (no replay on another wallet);
-4. the validator's address;
-5. **the permission's id** — this is why one agent key serving several permissions can never have a request meant for one budget charged to another, and why a banked signature dies when its permission is replaced;
-6. the execution mode;
-7. the hash of the full execution payload — every nested layer above, down to the last argument;
-8. the replay lane (next section);
-9. the position in that lane;
-10. **the request's expiry** — a per-request deadline, so a relayer cannot extend or trim a request's lifetime. **A stamp of zero means no expiry**, matching the account-abstraction convention; the SDK's default sets a real, short one.
-**Honesty note for the builder: fields 5 and 10 are designed, not yet shipped.** The existing v2 code binds eight fields (`opHash` in the shipped wallet). Adding the permission id and the request expiry is a v3 requirement, not an error in this document. Do not "correct" the ten back to eight.
-## 5.4 Replay protection — independent lanes
-- The wallet keeps a table of counters, not a single counter. A request names a **lane** (any 192-bit key the agent picks) and a **position** in that lane. Each lane advances independently: position n in a lane can only be used once, and only after n-1.
-- Why lanes instead of one counter: an agent running several strategies can proceed in parallel. A stalled or abandoned request in one lane never blocks another lane.
-- The consumed position is written **before** validation runs, so a request can never run twice, even re-entrantly. And if execution later reverts, the whole transaction unwinds — counter, position, everything — leaving no half-spent state. A failed action costs the relayer gas and changes nothing else.
-- Two honest notes: a request that can never succeed wedges *its own lane* permanently — the agent just abandons that lane; and if two relayers race the same signed request, one wins and the other wastes its own gas. Both are accepted, both are agent-side problems only.
+**A native request has one layer.** There is no far-chain call, no instruction list and no gateway request. The agent names a Push contract, a native-value amount, and the call data — and that flat call *is* the execution payload. Three nested envelopes become one call; nothing else changes.
+Then the agent calls the agent door itself with three things: **the permission's id, the execution mode, and the execution payload.** There is no signature to attach — the agent's authority is being the sender.
+## 5.3 Who may call — the sender check
+- The wallet looks up the agent the named permission records — the address stored in it at grant — and compares it with the caller. Anyone else is refused, by name, before the engine is ever called: the owner, a stranger, another permission's agent. An id that is unknown, revoked, or names a session validator other than the canonical one records no agent, so a call under it is refused the same way.
+- **An external key acts through its UEA.** The UEA verifies the key — secp256k1, Ed25519 or whatever that chain uses — and then calls the wallet; the UEA is the agent the permission names. The external key calling the wallet directly is just another stranger.
+- The wallet then writes the caller's address into the operation it hands the engine, in the field the engine treats as the signature. Nobody outside the wallet can supply that field: the engine accepts an operation only from the account it is for, so only the wallet can obtain a verdict for the wallet. At the end of validation the session validator compares that address with the agent stored in the permission — a second, independent check behind the first.
+## 5.4 Replay protection — the sender's own
+- Each agent action is a transaction of the agent's own. An EOA agent's transaction carries its nonce; a UEA agent's action is a UEA payload with its own nonce and deadline. A transaction that has been mined cannot be mined again, so no request runs twice — and the wallet keeps no replay state for agents at all.
+- The same call submitted twice is two actions: each is checked against the permission and each is metered.
+- If execution reverts, the whole transaction unwinds — every counter, everything — leaving no half-spent state. A failed action costs the agent gas and changes nothing else.
+- Expiry is the permission's own, checked inside URP. There is no separate per-request deadline at the wallet; a UEA payload carries one, an EOA transaction does not.
+- One honest note: an EOA agent has a single sequential nonce, so a stuck transaction blocks that agent's next one until it is mined or replaced. Accepted, and an agent-side problem only.
 ## 5.5 The walk, in order
-What happens when the relayer submits, step by step. Every step is on Push Chain, inside one transaction, until the bridge.
-1. **Anyone submits** the signed operation to the wallet's agent door. **The wallet's first act is to check the request's own expiry stamp**, before anything else costs gas. The door is permissionless by design — the agent's service is expected to relay its own requests and pay Push gas from its own PC balance (an operational duty, chapter 10), but the wallet does not check who submits.
-2. **The wallet consumes the replay position** — lane and position, checked and advanced first.
-3. **The wallet computes the ten-field fingerprint** from the arrived payload.
-4. **The wallet asks the permission engine to validate.** SmartSession looks up the permission by its id: does it exist on this wallet? Which policies are attached?
-5. **The engine runs every attached policy, in order, on the raw request.** First it identifies the action by the call's target and function; a native request naming any pair the permission did not grant dies here, at the engine, before any policy runs. Then, for this system, exactly one policy: **URP — the whole of `2_UniversalRulesPolicy.md`**, which reads the permission's kind and runs the matching rulebook, and which carries the expiry check itself. Every policy must pass; any failure ends everything with nothing spent. Two engine facts matter here:
+What happens when the agent calls, step by step. Every step is on Push Chain, inside one transaction, until the bridge.
+1. **The agent calls the agent door**, naming the permission. **The wallet's first acts are to confirm the engine is still installed — the owner switches the agent door off entirely by revoking everything and uninstalling it — and that the caller is the agent the permission names.** Both are checked before anything else costs gas; a wrong caller is refused by name.
+2. **The wallet builds the operation**: the execution as an `execute` call, and in the signature field the use-mode marker, the permission's id and the caller's address — written by the wallet, never supplied from outside.
+3. **The wallet asks the permission engine to validate.** SmartSession looks up the permission by its id: does it exist on this wallet? Which policies are attached?
+4. **The engine runs every attached policy, in order, on the raw request.** First it identifies the action by the call's target and function; a native request naming any pair the permission did not grant dies here, at the engine, before any policy runs. Then, for this system, exactly one policy: **URP — the whole of `2_UniversalRulesPolicy.md`**, which reads the permission's kind and runs the matching rulebook, and which carries the expiry check itself. Every policy must pass; any failure ends everything with nothing spent. Two engine facts matter here:
 \t- **Action policies have a minimum count of one, but the engine's other policy class (checks on the outer operation) has a minimum of zero** (`SmartSession.sol:237-247, 285-299`). Rule for this system: **no mandatory guarantee may live only in that zero-minimum class**, because a configuration with none of them is legal. Everything mandatory lives in URP.
-\t- **Policies run before the signature is checked** — an engine ordering we adopt, not choose (`SmartSession.sol:340-352`). Consequence: every policy must be safe to run on arbitrary, not-yet-authenticated calldata from anyone. URP holds no state that validation mutates, so a forged request can waste gas and nothing else.
-6. **The signature is verified last.** The session validator recovers the signer from the fingerprint — ECDSA directly, or Ed25519 through the precompile — and compares it to the key stored in the permission. Wrong key, no execution.
-7. **The wallet enforces the verdict explicitly.** Because there is no EntryPoint to do it, the wallet itself unpacks the engine's answer and enforces both the pass/fail result and the validity window it returns. *(The request's own expiry was already checked at step 1. The wallet rejects **expired** requests but places no ceiling on how far ahead an expiry may sit — and a stamp of **zero means no expiry at all**.)*
-8. **The wallet refuses two targets whatever the engine said.** After validation and before dispatch, if the approved call targets the wallet itself or the engine, the wallet reverts. Neither can ever be granted (chapter 4.1), so on a permission the wallet created this never fires — it exists for a permission the owner enabled on the engine *directly*, bypassing the wallet's grant check, which the owner door permits. It is the last of four independent refusals of a self-call, it runs deliberately **after** validation and not before (chapter 11), and two permanent tests pin it — one of them reaching the engine as a target through the engine's own wildcard.
-9. **The wallet makes the approved call, with the exact validated bytes.** For a universal permission that is **the gateway**: it sees the wallet as the caller, pulls the bridged token amount from the wallet's balance, takes the PC provided for far-side gas, and emits the cross-chain message. For a native permission it is **the named Push contract**, called by the wallet as itself, carrying the approved value and call data: the contract sees the wallet as the caller, and whatever the call produces is the wallet's. **A native action is complete here** — one Push transaction, no bridge, nothing in flight. The two steps below are universal only.
-10. **On the far chain**, the destination account receives the message and runs the instruction list, entry by entry, each call made *by the user's own account* — which is why anything bought lands as the user's. **On Solana** the gateway moves the bridged funds to the destination account and makes the one approved call into the target program, with the destination account as signer; whatever the instruction produces lands in the token accounts the pins named.
-11. **If the far side fails**, the funds return through Push Chain's infrastructure, and the credit path of chapter 4.2 applies (designed — not yet functional). Gas is never refunded: it was genuinely consumed. **A refund credit must not move any gas counter** — a permanent rule.
+\t- **Policies run before the session validator is consulted** — an engine ordering we adopt, not choose (`SmartSession.sol:340-352`). The wallet has already checked the caller at step 1, but the rule stands for every policy: it must be safe to run on arbitrary calldata the engine has not yet authenticated. URP holds no state that validation mutates, so a bad request can waste gas and nothing else.
+5. **The session validator is consulted last.** It compares the address the wallet wrote into the signature field with the agent stored in the permission. Wrong address, no execution.
+6. **The wallet enforces the verdict explicitly.** Because there is no EntryPoint to do it, the wallet itself unpacks the engine's answer and enforces both the pass/fail result and the validity window it returns.
+7. **The wallet refuses two targets whatever the engine said.** After validation and before dispatch, if the approved call targets the wallet itself or the engine, the wallet reverts. Neither can ever be granted (chapter 4.1), so on a permission the wallet created this never fires — it exists for a permission the owner enabled on the engine *directly*, bypassing the wallet's grant check, which the owner door permits. It is the last of four independent refusals of a self-call, it runs deliberately **after** validation and not before (chapter 11), and two permanent tests pin it — one of them reaching the engine as a target through the engine's own wildcard.
+8. **The wallet makes the approved call, with the exact validated bytes.** For a universal permission that is **the gateway**: it sees the wallet as the caller, pulls the bridged token amount from the wallet's balance, takes the PC provided for far-side gas, and emits the cross-chain message. For a native permission it is **the named Push contract**, called by the wallet as itself, carrying the approved value and call data: the contract sees the wallet as the caller, and whatever the call produces is the wallet's. **A native action is complete here** — one Push transaction, no bridge, nothing in flight. The two steps below are universal only.
+9. **On the far chain**, the destination account receives the message and runs the instruction list, entry by entry, each call made *by the user's own account* — which is why anything bought lands as the user's. **On Solana** the gateway moves the bridged funds to the destination account and makes the one approved call into the target program, with the destination account as signer; whatever the instruction produces lands in the token accounts the pins named.
+10. **If the far side fails**, the funds return through Push Chain's infrastructure, and the credit path of chapter 4.2 applies (designed — not yet functional). Gas is never refunded: it was genuinely consumed. **A refund credit must not move any gas counter** — a permanent rule.
 ## Diagram — one agent action
 ```mermaid
 sequenceDiagram
-  participant AG as Agent (off-chain key)
-  participant RL as Relayer
+  participant AG as Agent (EOA, or UEA of an external key)
   participant W as Agent wallet
   participant SS as SmartSession (engine)
   participant U as URP
@@ -329,28 +316,26 @@ sequenceDiagram
   participant DA as Destination account (far chain)
   participant NP as Push-native protocol
 
-  AG->>AG: universal (EVM): build nested layers:<br/>far-chain call → instruction list (≤10) → gateway request → operation<br/>universal (Solana): one program instruction → gateway request → operation<br/>native: one flat call (contract, value, data) → operation
-  AG->>AG: sign the ten-field fingerprint
-  AG->>RL: hand over the signed operation
-  RL->>W: submit at the agent door (permissionless)
-  W->>W: 1. consume replay lane + position
-  W->>W: 2. recompute the fingerprint from what arrived
+  AG->>AG: universal (EVM): build nested layers:<br/>far-chain call → instruction list (≤10) → gateway request → payload<br/>universal (Solana): one program instruction → gateway request → payload<br/>native: one flat call (contract, value, data) = payload
+  AG->>W: executeAsAgent(permission id, mode, payload) — the agent is the sender
+  W->>W: 1. engine still installed? caller == the permission's agent?<br/>(refused by name otherwise, before the engine runs)
+  W->>W: 2. build the operation; write USE ‖ id ‖ caller into the signature field
   W->>SS: 3. validate against the named permission
   SS->>SS: identify the action by (target, function);<br/>an ungranted pair dies here
-  SS->>U: the whole of 2_UniversalRulesPolicy.md —<br/>read the kind, run its rulebook, check every limit
+  SS->>U: 4. the whole of 2_UniversalRulesPolicy.md —<br/>read the kind, run its rulebook, check every limit
   U-->>SS: pass / fail (nothing spent on fail)
-  SS->>V: 4. LAST: does the signature match the permission's key?
-  V-->>SS: signer confirmed / rejected
+  SS->>V: 5. LAST: is the address in the signature field the permission's agent?
+  V-->>SS: agent confirmed / rejected
   SS-->>W: verdict
-  W->>W: 5. enforce verdict + request expiry itself
-  W->>W: 5b. refuse the wallet or the engine as target, whatever the verdict
+  W->>W: 6. enforce the verdict and its validity window itself
+  W->>W: 7. refuse the wallet or the engine as target, whatever the verdict
   alt universal permission
-    W->>GW: 6. call with the exact approved payload<br/>(gateway sees the WALLET as caller)
+    W->>GW: 8. call with the exact approved payload<br/>(gateway sees the WALLET as caller)
     GW->>DA: bridge token + instruction list
     DA->>DA: EVM: run each instruction as the user's own account<br/>Solana: one call into the target program, the user's account signing
     Note over U,DA: far-side failure → funds return, spend credited back<br/>(designed — not yet functional) · gas never refunded
   else native permission
-    W->>NP: 6. call the named Push contract with the exact approved bytes<br/>(the WALLET is the caller)
+    W->>NP: 8. call the named Push contract with the exact approved bytes<br/>(the WALLET is the caller)
     NP-->>W: whatever the call produced is the wallet's — done, one transaction
   end
 ```
@@ -361,10 +346,10 @@ URP — the Universal Rules Policy (`UniversalRulesPolicy`) — has its own docu
 # 7 · What we adopted, and what that costs
 Four external systems are load-bearing. For each: what we rely on it for, and the exact exposure that reliance creates. Nothing here is hidden as a footnote.
 ## 7.1 The permission engine (SmartSession)
-- **Relied on for:** storing permissions, deriving their ids, running every policy, and verifying the agent's signature — the whole of chapter 5, steps 4–6.
+- **Relied on for:** storing permissions and each one's agent, deriving their ids, running every policy, and consulting the session validator — the whole of chapter 5, steps 3–5.
 - **What we get for free:** battle-tested storage and lifecycle code; removal that is pure storage deletion and cannot be blocked by any external call (`SmartSessionBase.sol:329-355`, `ConfigLib.sol:274-284`).
 - **The costs, each one carried knowingly:**
-\t- **Policies run before authentication** (`SmartSession.sol:340-352`). Every policy we ever attach must be safe on arbitrary calldata from anyone. This is a standing constraint on all future policy work, not just on URP.
+\t- **Policies run before authentication** (`SmartSession.sol:340-352`). Every policy we ever attach must be safe on arbitrary calldata from anyone. This is a standing constraint on all future policy work, not just on URP. The wallet authenticates the sender before the engine runs, but the engine's own ordering is unchanged.
 \t- **One policy class may legally be empty** (`SmartSession.sol:237-247`) — hence the wiring rule that nothing mandatory lives there.
 \t- **The engine ships an owner-only function that resets a policy's counters in place.** v3 tooling never calls it, and the agent structurally cannot (it is owner-path only) — a named test proves the agent cannot reach it. But it survives upstream, and a future tool that called it would silently refill a budget.
 \t- **At grant, the engine refuses only two targets: the zero address and itself** (`ConfigLib.sol:139-143`). It does **not** refuse its own wildcard marker at grant — only at validation. The wallet is therefore the only grant-time layer keeping that marker, and the two wildcard function markers, out of a native permission. The wallet refuses all three by name; a constant-mirror test pins each value against the vendored engine so a fork bump cannot silently move them.
@@ -403,18 +388,19 @@ Every promise the system makes, with the mechanism behind it and the test that p
 | …never more in total than you set                                                              | Gate 7 + spend recorded before dispatch                                                                                                         | Requests summing past the cap revert at the crossing point                                                                             |
 | …never for anyone's benefit but yours                                                          | Gate 15's beneficiary pin; on Solana, gate S17's account pins                                                                                   | A request naming any other beneficiary — on Solana, any other destination token account — reverts                                      |
 | …never touching any protocol you did not allow                                                 | Gate 15: the allow-list — on Solana, gate S16's exact (program, instruction) match                                                              | A request to an unlisted target or function — on Solana, an unlisted program or instruction — reverts                                  |
-| …never after the end date                                                                      | Gate 2 — the expiry inside URP — plus the wallet's own per-request expiry check                                                                 | A request after expiry reverts with no state change                                                                                    |
+| …never after the end date                                                                      | Gate 2 — the expiry inside URP (N2 native, S2 on Solana)                                                                                        | A request after expiry reverts with no state change                                                                                    |
 | …never instructing your far-chain account directly                                             | Gate 14, including the destination account, checked before the allow-list; on Solana, gate S15, which adds the token, system, stake, loader and lookup-table programs and the gateway program | **Must revert even when that address is in the allow-list** — permanent tests, at grant and at validation on Solana                    |
 | *Solana:* …never handing your account's other balances to the program                          | Gate S18: every value-holding account appears only where the matched rule pins it; the list always contains the destination account            | A value-holding account at an unpinned position reverts — permanent test; a list without the destination account is refused at grant — permanent test |
 | *Solana:* …never swapping below the floor you set                                              | Gate S17's data pins — a floor relative to the input, a slippage ceiling, a zero fee                                                           | A swap whose output falls short of the ratio reverts, including one that raises the input to beat a static floor — permanent test      |
 | *Solana:* …never more per action than Solana can carry                                         | Gate S6b                                                                                                                                        | An amount above 64 bits reverts                                                                                                        |
 | A "failed" action can never deliver funds to the agent                                         | Gate 10 (refunds come home) + gate 11 (no side recipient); on Solana, S10 + S11 and S14 (the recipient is the target program, nothing else)     | A request with any of these fields wrong reverts                                                                                       |
-| No request runs twice                                                                          | Replay lanes consumed before validation                                                                                                         | Resubmission of a used position reverts                                                                                                |
-| A signed request dies with its permission                                                      | The permission id is fingerprint field 5                                                                                                        | **A banked request fails after revoke-and-regrant** — permanent test                                                                   |
-| One permission's request can never be charged to another                                       | Same field 5                                                                                                                                    | Cross-permission replay reverts                                                                                                        |
+| Only the permission's agent can act under it                                                   | The wallet checks the caller against the agent the permission names before the engine runs; the session validator checks the address the wallet wrote, last | Every other caller — the owner included — is refused by name                                                                           |
+| No request runs twice                                                                          | Each agent action is the agent's own transaction — an EOA's nonce, or the UEA payload's nonce; the wallet keeps no agent replay state           | A mined transaction cannot be mined again; the same call sent twice is two actions, each checked and metered                           |
+| A request dies with its permission                                                             | Removal clears the permission's agent; a regrant gets a new id from the wallet's grant counter                                                  | **A request for the old id fails after revoke-and-regrant** — permanent test                                                           |
+| One permission's request can never be charged to another                                       | The call names its permission, whose agent must be the caller; URP keys every counter on that id                                                | An agent acting under another agent's permission reverts                                                                               |
 | Revocation is immediate and unblockable                                                        | One owner call; removal is pure storage deletion, no external calls                                                                             | Revocation succeeds with a hostile policy installed; next request fails                                                                |
 | A change never mixes old and new states                                                        | Atomic revoke + regrant; spent-amount assertion gates it                                                                                        | The change reverts when the agent spent in the composition window                                                                      |
-| A failed action costs gas and nothing else                                                     | Whole-transaction revert unwinds every counter                                                                                                  | Counters and replay state identical before and after a failed action                                                                   |
+| A failed action costs gas and nothing else                                                     | Whole-transaction revert unwinds every counter                                                                                                  | Counters identical before and after a failed action                                                                                    |
 | You can always withdraw everything                                                             | The owner door has no checks                                                                                                                    | Owner withdrawal succeeds in every degraded state we can construct                                                                     |
 | A module can never block its own removal                                                       | The uninstall callback runs defensively with a fixed 100,000-gas stipend; on revert or burn-out an event is emitted and removal proceeds anyway | A callback that reverts and one that burns all its gas are both still removed                                                          |
 | The agent can never refill its own budget                                                      | The engine's reset is owner-path only; v3 tooling never invokes it                                                                              | **The agent-cannot-reset negative test** — permanent                                                                                   |
@@ -429,10 +415,10 @@ Every promise the system makes, with the mechanism behind it and the test that p
 | Two permissions of different kinds on one wallet never touch each other's counters             | Separate storage per kind, keyed by action id                                                                                                   | A native call moves no universal counter — asserted on the raw storage slot, not through a getter                                      |
 | A permission for a chain URP cannot check is never granted                                     | The destination family is derived from the chain's namespace at grant; any namespace but `eip155:` and `solana:` is refused                     | A grant naming any other namespace reverts at initialisation                                                                           |
 ## The permanent tests
-Twenty-six tests across the build documents and suites are marked permanent — **never to be deleted or weakened**. The four below are the ones this table's universal promises rest on directly. The other twenty-two pin promises made elsewhere in this document: the owner path surviving every degraded state; the two routing pins; the Ed25519 fails-closed probe; the enable-mode-is-dead test; the request-body length constant; the seven native-permission tests (the wallet and the engine refused as targets at grant, the wallet and the engine refused at dispatch, a gateway target refused as native, a non-gateway target refused as universal, the wildcard markers refused, and gate N3 proven live); URP's exact external-function set; the refusal to re-initialise a universal configuration that has no mode record; and the eight Solana-rulebook tests (forbidden programs refused at grant, and again at validation; the value-holding list must contain the destination account; vacuous or impossible data-pin values refused; a redirected destination token account refused; the price floor relative to the input; a value-holding account at an unpinned position refused; and the forbidden program ids pinned against their published base58 forms). Each is the only thing pinning a promise that some future refactor will be tempted to break:
+Twenty-seven tests across the build documents and suites are marked permanent — **never to be deleted or weakened**. The four below are the ones this table's universal promises rest on directly. The other twenty-three pin promises made elsewhere in this document: the owner path surviving every degraded state; the two routing pins; the session validator calling nothing — both of its entry points are pure, so no external call can reach the agent check; the agent door never touching the owner's replay lanes; the enable-mode-is-dead test; the request-body length constant; the seven native-permission tests (the wallet and the engine refused as targets at grant, the wallet and the engine refused at dispatch, a gateway target refused as native, a non-gateway target refused as universal, the wildcard markers refused, and gate N3 proven live); URP's exact external-function set; the refusal to re-initialise a universal configuration that has no mode record; and the eight Solana-rulebook tests (forbidden programs refused at grant, and again at validation; the value-holding list must contain the destination account; vacuous or impossible data-pin values refused; a redirected destination token account refused; the price floor relative to the input; a value-holding account at an unpinned position refused; and the forbidden program ids pinned against their published base58 forms). Each is the only thing pinning a promise that some future refactor will be tempted to break:
 1. **Address stability** — the factory's address math never changes. Breaking it strands counterfactually funded addresses, with no migration remedy in existence.
 2. **The forbidden destination-account rule beats the allow-list** — remove this and one owner mistake (allow-listing their own far-chain account) hands the agent everything that account holds. On Solana the same rule covers the forbidden programs of gate S15.
-3. **A banked request fails after regrant** — remove this and every revoke-and-regrant silently leaves old signed requests alive against the new budget.
+3. **A request for a revoked permission fails after regrant** — remove this and a revoke-and-regrant could leave the old id usable against the new budget.
 4. **The agent cannot reset counters** — remove this and the lifetime cap is advisory.
 ---
 # 9 · What this system does not protect against
@@ -440,10 +426,10 @@ Thirty-two accepted limits. Each is a deliberate choice, stated without softenin
 ## Keys and people
 1. **A stolen owner key drains the wallet completely.** Deliberate: any brake on the owner is also a lock-out of the owner. Defence belongs to the user's key-management and identity layer — and what that layer actually guarantees is itself still an open question (chapter 11).
 2. **Nobody can act while the owner is unreachable.** No guardian, no emergency contact. Deliberate. The open question "should an emergency contact return?" would change this.
-3. **Whoever holds a signed request may submit it.** The wallet checks the signature, not the messenger. Deliberate. The open question "should requests name their submitter?" would close it.
+3. ~~Whoever holds a signed request may submit it.~~ **CLOSED.** The agent door admits only the permission's agent as the caller; there is no signed request for anyone else to hold.
 ## Timing
 4. **Revocation cannot recall an instruction already in flight.** The window is bridge latency. Deliberate — physics of bridging. The revoke screen must disclose it.
-5. **There is no ceiling on how far ahead anything may expire, so the agent can bank signed requests for later.** With the per-request expiry bound into the signature, the residual is *mistiming* of an authorised action — never theft, never an amount or target the user did not allow. Deliberate, and pinned by an acceptance test that a distant-future expiry is **accepted** — so a future "fix" fails a test.
+5. **There is no ceiling on how far ahead a permission may expire.** The user's choice is respected as given. The residual is the agent acting late within the authorised window — never theft, never an amount or target the user did not allow. Deliberate.
 ## Budgets
 6. **Replacing a permission starts its counters at zero — tightening a cap can increase remaining authority.** Deliberate: silent compensation was judged worse than an honest reset. The product must show prior consumption before a new cap is set.
 7. **The lifetime cap bounds bridging, not redeployment.** Money already across can be redeployed endlessly until expiry. Deliberate — the cap is exposure-from-the-wallet; the expiry is the time bound.
@@ -453,9 +439,9 @@ Thirty-two accepted limits. Each is a deliberate choice, stated without softenin
 11. **A refund credit's amount cannot be verified by URP.** Trusted from Push core; damage bounded by once-per-id and never-below-zero.
 12. **Gas is never credited back on failure.** The gas was genuinely consumed. Deliberate, with a rule that no credit path may ever touch a gas counter.
 ## Mechanics
-13. **A request that can never succeed wedges its own replay lane forever.** Every cause is agent-side; the agent abandons the lane. No unwedge mechanism exists, deliberately.
-14. **Two relayers racing the same request: the loser wastes its gas.** Accepted.
-15. **Policies run on calldata that has not yet been authenticated** — an adopted-engine ordering. Standing constraint: every policy, forever, must be safe on arbitrary calldata from any caller.
+13. **An EOA agent has one sequential nonce and no per-request expiry.** A stuck transaction blocks that agent's next one, and a broadcast transaction stays valid until it is mined or replaced. Bounded by the permission's own expiry and by revocation; a UEA agent's payloads carry the UEA's own nonce and a deadline. Deliberate: replay protection is the sender's own, and the wallet keeps none for agents.
+14. ~~Two relayers racing the same request: the loser wastes its gas.~~ **CLOSED.** There are no relayers on the agent door: only the agent submits its own call.
+15. **Policies run before the engine consults the session validator** — an adopted-engine ordering. The wallet has already checked the caller, but the standing constraint holds: every policy, forever, must be safe on arbitrary calldata from any caller.
 ## Platform inheritance
 16. **The destination-account templates can be rotated by Push governance.** Accepted on admin trust; monitoring detects derivation changes; nothing on-chain prevents them.
 17. **The destination-account factory is upgradeable — our address-verifiability guarantee is inherited, not owned.** Accepted: Push governance is our platform.
@@ -502,8 +488,8 @@ Twenty-three obligations. The contracts cannot check any of them; each names wha
 8. **The change flow must never silently shrink the owner's chosen new cap to compensate for prior spend.** The reset is honest; a hidden adjustment would be a lie in the other direction.
 9. **The revoke screen states that an already-dispatched instruction still completes.** Otherwise revocation reads as a guarantee it is not (chapter 9, item 4).
 ## Partners and operations
-10. **Launch partners are told, before integration, that rotating an agent signing key means revoking and regranting every permission on that key — counters resetting with it.** A partner who rotates keys casually will burn its users' budgets.
-11. **The agent service holds and maintains its own PC balance for relaying** — separate from any wallet balance. If it runs dry, every user's agent stops at once: an outage, not a security event, but an outage the product owns.
+10. **Launch partners are told, before integration, that rotating an agent's key means a new agent address — revoking and regranting every permission naming the old one, counters resetting with it.** A partner who rotates keys casually will burn its users' budgets.
+11. **The agent funds its own gas** — an EOA agent holds PC, a UEA agent's gas path is funded — separate from any wallet balance. If it runs dry, every user's agent stops at once: an outage, not a security event, but an outage the product owns.
 12. **A user moving to a new wallet version is told their far-chain balances do not move automatically, and is walked through each one.** No tooling for this exists yet; until it does, this is a support-ticket generator (and chapter 9, item 21, is why it will happen).
 13. **Monitoring compares each permission's committed destination address against the current derivation.** This is the detection half of the admin-trust acceptances (chapter 9, items 16–17): drift is caught by operations, or not at all.
 
@@ -531,13 +517,12 @@ Twenty-three obligations. The contracts cannot check any of them; each names wha
 ---
 # 11 · Open questions, and what must not be "fixed"
 ## 11.1 The two items that gate implementation
-These are facts to confirm, not decisions to make. Nothing else in this chapter blocks code — and with the precompile address settled, only the executor module's address still gates implementation.
-- **RESOLVED — the Ed25519 precompile's address is settled** (the canonical V2 registration; the competing value was a legacy V1 with a different method set). What remains is a fork test of the live call path against a known-good signature vector from the node team — it gates testnet, not implementation.
+These are facts to confirm, not decisions to make. Nothing else in this chapter blocks code — only the executor module's address still gates implementation.
+- **RESOLVED — the Ed25519 precompile is no longer used by this system.** A Solana-keyed agent acts through its UEA, which verifies the key itself; the wallet verifies no signature.
 - **The executor module's address.** Written in Push's platform code but unconfirmed against a live deployment. Confirm before URP hardcodes its one trusted caller.
 ## 11.2 Design questions for the team — none blocks v3
 - **Should the contract refuse approval-granting functions outright?** Would close chapter 9, items 9 and 24 — for a native permission, the unpinned-spender form. Today: allow-list-only, owner's responsibility, with the SDK refusing the unpinned form (obligation 16).
 - **Should an emergency contact return to the design?** Would close chapter 9, item 2.
-- **Should requests bind their submitter?** Would close chapter 9, item 3. Today: bearer requests.
 - **Should the destination and refund locks also exist at the gateway layer?** Our layer locks both regardless; a second lock would be belt-and-braces.
 - **When does "no wallet migration, ever" stop being acceptable?** The recorded revisit trigger for chapter 9, item 20.
 ## 11.3 With Push core
@@ -546,26 +531,25 @@ These are facts to confirm, not decisions to make. Nothing else in this chapter 
 - **The gateway's refund behaviour for the outbound direction** is undocumented in the public revert-handling notes (inbound only). Completeness of our exposure analysis, nothing more.
 - **Two admin-only paths can pay an agent-chosen refund destination for funds coming back from a destination account.** Push Chain never issues an automatic refund for an inbound that originates at a destination account, so on every automatic path the agent's choice of refund destination is never used. But the stuck-inbound revert and the rescue path, both of which need an admin action, pay that destination without checking where the inbound came from. The agent cannot trigger either alone. The fix is node-side — for such inbounds, refund to the destination account of the originating Push account, or refuse — and is not URP work.
 ## 11.4 Conventions and text
-- **The SDK's default per-request expiry: 15 minutes recommended.** A convention, not a contract rule — the contracts accept any unexpired request.
+- **A UEA agent's payload deadline: 15 minutes recommended.** A convention of the agent's own tooling, not a wallet rule — the wallet sees only the sender.
 - **The identity layer's recovery guarantees are not yet enumerated.** They are the only defence against chapter 9, item 1. Not this system's work, but this system's users' exposure.
 - **One sentence in the internal rules document still overclaims** that no counter reset exists anywhere; it must be narrowed to "no agent-reachable reset" (chapter 7.1 has the truth).
 ## 11.5 Do not "fix" these
-Sixteen things in this design look like mistakes to a fresh reader. Each is a decision. Every implementation task touching one of these must carry this list.
-1. **The fingerprint binds ten fields; the shipped v2 code binds eight.** Ten is the design. Do not regress to eight for compatibility.
-2. **Gas is never credited back on a failed action** — and no refund path may touch a gas counter. The asymmetry is correct: the gas was consumed.
-3. **There is no paymaster and none is planned.** Agents relay their own requests and pay their own gas. Do not add sponsorship.
-4. **The empty-recipient pin (gate 11) guards a path the current far-side code does not even read.** It is defence in depth against that code changing. Do not remove it as "dead". On Solana the same field is required and is the target program (S11, S14) — the opposite rule for the same field is correct for each family.
-5. **The forbidden-target rule compares against the destination account, and it beats the allow-list.** Not a bug that it overrides the owner's own list — the permanent test demands exactly that.
-6. **Widening and narrowing a permission share one path: revoke and regrant.** There is no separate, "safer" narrow-only edit. Do not add one.
-7. **The configured destination chain is stored but never compared at validation.** The chain is pinned transitively by the token. The unused field is known and documented (`2_UniversalRulesPolicy.md` §1.6), not forgotten.
-8. **The wallet's refusal of itself and the engine as dispatch targets runs after validation, not before.** Placed earlier it would pre-empt the engine's own refusals and change which error surfaces, and the engine-as-target case is only reachable at all through the engine's wildcard, which validation has to resolve first. Two permanent tests pin its position; do not move it.
-9. **A native call limit is consumed by a call that sends no value and meters nothing.** Not a metering bug. The universal counter ignores a zero-amount request because it counts bridging; the native call counter counts calls, and a limit zero-value calls could slip past would be advisory.
-10. **A value-only native action accepts empty call data and nothing else.** The engine buckets one to three bytes under the same action id; URP refuses them by name. That is what value-only means, not overreach.
-11. **URP's kind-specific getters revert on a record of the other kind, and return zeros on an empty slot.** Both halves are deliberate: an empty slot is a state, a wrong-kind read is a caller bug. The mode getter never reverts and is the first call for anything that does not already know the kind.
-12. **Eight actions, eight pins, thirty-two allow-list entries are sanity bounds, not gas bounds** — and so are a Solana permission's thirty-two program rules, sixteen account pins, eight data pins and eight value-holding accounts. They cap what a human is asked to approve and audit at once. Raising any of them is a design change, not a tuning.
-13. **The gateway program is a forbidden Solana target, although calling it is not a drain.** It returns the permission's asset to the owner's own wallet, and the agent's refund destination is never paid on that path. It stays forbidden because under a one-asset permission it can bring home only leftover input — never what the agent bought — while spending the owner's gas and inbound capacity for nothing. Outputs come home through the owner door. A permanent test refuses it at grant and at validation.
-14. **URP refuses a Solana rule with no account pin, though a single pin proves nothing.** One authority pin always passes. The check is hygiene; completeness is the tooling's job (obligation 19). A test deliberately grants a rule with one useless pin and shows URP accepts it, so nobody reads the check as a guarantee.
-15. **A Solana permission's value-holding list must contain the destination account.** That is what keeps gate S18 always on. Do not relax it to allow an empty list "for simple permissions" — an empty list switches the defence off silently. Permanent test.
-16. **Two Solana rules that could match the same instruction are refused at grant, though first-match would simply pick one.** It would pick the first, and the second rule's pins would never run — an owner would believe they had granted limits that do not exist.
+Fifteen things in this design look like mistakes to a fresh reader. Each is a decision. Every implementation task touching one of these must carry this list.
+1. **Gas is never credited back on a failed action** — and no refund path may touch a gas counter. The asymmetry is correct: the gas was consumed.
+2. **There is no paymaster and none is planned.** Agents submit their own calls and pay their own gas. Do not add sponsorship.
+3. **The empty-recipient pin (gate 11) guards a path the current far-side code does not even read.** It is defence in depth against that code changing. Do not remove it as "dead". On Solana the same field is required and is the target program (S11, S14) — the opposite rule for the same field is correct for each family.
+4. **The forbidden-target rule compares against the destination account, and it beats the allow-list.** Not a bug that it overrides the owner's own list — the permanent test demands exactly that.
+5. **Widening and narrowing a permission share one path: revoke and regrant.** There is no separate, "safer" narrow-only edit. Do not add one.
+6. **The configured destination chain is stored but never compared at validation.** The chain is pinned transitively by the token. The unused field is known and documented (`2_UniversalRulesPolicy.md` §1.6), not forgotten.
+7. **The wallet's refusal of itself and the engine as dispatch targets runs after validation, not before.** Placed earlier it would pre-empt the engine's own refusals and change which error surfaces, and the engine-as-target case is only reachable at all through the engine's wildcard, which validation has to resolve first. Two permanent tests pin its position; do not move it.
+8. **A native call limit is consumed by a call that sends no value and meters nothing.** Not a metering bug. The universal counter ignores a zero-amount request because it counts bridging; the native call counter counts calls, and a limit zero-value calls could slip past would be advisory.
+9. **A value-only native action accepts empty call data and nothing else.** The engine buckets one to three bytes under the same action id; URP refuses them by name. That is what value-only means, not overreach.
+10. **URP's kind-specific getters revert on a record of the other kind, and return zeros on an empty slot.** Both halves are deliberate: an empty slot is a state, a wrong-kind read is a caller bug. The mode getter never reverts and is the first call for anything that does not already know the kind.
+11. **Eight actions, eight pins, thirty-two allow-list entries are sanity bounds, not gas bounds** — and so are a Solana permission's thirty-two program rules, sixteen account pins, eight data pins and eight value-holding accounts. They cap what a human is asked to approve and audit at once. Raising any of them is a design change, not a tuning.
+12. **The gateway program is a forbidden Solana target, although calling it is not a drain.** It returns the permission's asset to the owner's own wallet, and the agent's refund destination is never paid on that path. It stays forbidden because under a one-asset permission it can bring home only leftover input — never what the agent bought — while spending the owner's gas and inbound capacity for nothing. Outputs come home through the owner door. A permanent test refuses it at grant and at validation.
+13. **URP refuses a Solana rule with no account pin, though a single pin proves nothing.** One authority pin always passes. The check is hygiene; completeness is the tooling's job (obligation 19). A test deliberately grants a rule with one useless pin and shows URP accepts it, so nobody reads the check as a guarantee.
+14. **A Solana permission's value-holding list must contain the destination account.** That is what keeps gate S18 always on. Do not relax it to allow an empty list "for simple permissions" — an empty list switches the defence off silently. Permanent test.
+15. **Two Solana rules that could match the same instruction are refused at grant, though first-match would simply pick one.** It would pick the first, and the second rule's pins would never run — an owner would believe they had granted limits that do not exist.
 ---
 *End of the architecture document. The decision register holds the checkable form of every ruling above; the phase planning document holds the reasoning. Changes to this document follow the same rule as the system it describes: nothing is edited silently — a change names the ruling it implements.*

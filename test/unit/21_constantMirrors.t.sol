@@ -10,7 +10,12 @@ import {
     OWNER_INTENT_DOMAIN_VERSION_HASH
 } from "../../src/libraries/Types.sol";
 import { IdLib } from "smartsessions/lib/IdLib.sol";
-import { ActionId } from "smartsessions/DataTypes.sol";
+import { ActionId, PermissionId } from "smartsessions/DataTypes.sol";
+import { SmartSessionBase } from "smartsessions/core/SmartSessionBase.sol";
+import { ISmartSessionConfigReader } from "../../src/interfaces/ISmartSessionConfigReader.sol";
+import { AGW } from "../../src/AGW.sol";
+import { AllowedCall, Config } from "../../src/libraries/Types.sol";
+import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
 import {
     FALLBACK_TARGET_FLAG,
     FALLBACK_TARGET_SELECTOR_FLAG,
@@ -184,5 +189,63 @@ contract ConstantMirrorsTest is BaseTest {
         );
         assertEq(OWNER_INTENT_DOMAIN_NAME_HASH, keccak256("AGWFactory"));
         assertEq(OWNER_INTENT_DOMAIN_VERSION_HASH, keccak256("1"));
+    }
+
+    // ─────────────── the engine view the wallet declares locally ───────────────
+
+    /// `ISmartSessionConfigReader` mirrors one engine function upstream `ISmartSession` omits. A fork
+    /// bump that renames or retypes it fails here rather than leaving `agentOf` calling nothing.
+    function test_mirror_getSessionValidatorAndConfigSelector() public pure {
+        assertEq(
+            ISmartSessionConfigReader.getSessionValidatorAndConfig.selector,
+            SmartSessionBase.getSessionValidatorAndConfig.selector,
+            "the local mirror's selector drifted from the engine's"
+        );
+    }
+
+    /// Byte-exact through the real engine: a grant stores `(validator, agentConfig(agent))`, and
+    /// removal clears both — which is what makes `agentOf` zero for a revoked rules set.
+    function test_mirror_getSessionValidatorAndConfigReturnsTheGrantedConfig() public {
+        address walletOwner = makeAddr("mirrorOwner");
+        AGW wallet = newWallet(walletOwner);
+
+        AllowedCall[] memory rules = new AllowedCall[](1);
+        rules[0] = AllowedCall({
+            target: makeAddr("p"),
+            selector: bytes4(0x11223344),
+            beneficiaryOffset: 0,
+            hasBeneficiary: false,
+            maxValue: 0
+        });
+        bytes memory urpInitData = universalInitData(
+            Config({
+                initialized: false,
+                validUntil: uint48(block.timestamp + 1 days),
+                destChainHash: bytes32(0),
+                expectedCEA: makeAddr("cea"),
+                asset: address(new MockPRC20()),
+                maxAmountPerCall: 1 ether,
+                maxAmountTotal: 1 ether,
+                maxPCPerCall: 0,
+                spent: 0,
+                allowedCalls: rules
+            })
+        );
+
+        vm.prank(walletOwner);
+        bytes32 pid = wallet.grantRules(canonicalSession(agentConfig(AGENT), urpInitData));
+
+        (address v, bytes memory config) = ISmartSessionConfigReader(address(engine))
+            .getSessionValidatorAndConfig(address(wallet), PermissionId.wrap(pid));
+        assertEq(v, address(validator), "the canonical validator");
+        assertEq(config, agentConfig(AGENT), "the agent config, byte for byte");
+
+        vm.prank(walletOwner);
+        wallet.revokeRules(pid);
+
+        (v, config) = ISmartSessionConfigReader(address(engine))
+            .getSessionValidatorAndConfig(address(wallet), PermissionId.wrap(pid));
+        assertEq(v, address(0), "removal clears the validator");
+        assertEq(config.length, 0, "and the config");
     }
 }

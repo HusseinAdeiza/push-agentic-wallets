@@ -86,7 +86,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
 
     /// @dev THE canonical session — the only shape v3 permits.
     function _canonical() internal view returns (Session memory) {
-        return canonicalSession(ecdsaConfig(AGENT), _urpInitData());
+        return canonicalSession(agentConfig(AGENT), _urpInitData());
     }
 
     function _grant(Session memory s) internal returns (bytes32) {
@@ -338,7 +338,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         // Only its ADDRESS matters — the wallet rejects any policy that is not the canonical one
         // before it ever calls it, so this needs no proxy and no initialisation.
         UniversalRulesPolicy otherUrp = new UniversalRulesPolicy();
-        Session memory s = sessionWithPolicy(address(otherUrp), ecdsaConfig(AGENT), _urpInitData());
+        Session memory s = sessionWithPolicy(address(otherUrp), agentConfig(AGENT), _urpInitData());
         _expectMalformed(s);
     }
 
@@ -349,32 +349,29 @@ contract PushAgentWalletLifecycleTest is BaseTest {
     }
 
     /**
-     * BOTH malformed-key variants. THIS PAIR IS THE POINT OF THE TEST.
+     * Every malformed agent config is refused `MalformedSessionShape`.
      *
-     * `validateConfig` is three-valued. A test covering only variant (a) passes against an
-     * UNWRAPPED call and is therefore worthless — variant (b) is the one that proves the bare
-     * `catch` exists, because without it the owner sees a raw `Panic(0x41)` from inside another
-     * contract instead of `MalformedSessionShape()`.
+     * The canonical validator's `validateConfig` is two-valued and never reverts, so every malformed
+     * config takes the `false` branch. The wallet's bare `catch` around that call is retained
+     * defensively — it guards a future validator that might revert — and is expected to show as
+     * uncovered.
      */
     function test_W24_Deviation_MalformedKeyConfig_BothVariants() public {
-        // (a) validateConfig RETURNS FALSE — scheme 2 is reserved and unsupported.
-        Session memory a = _canonical();
-        a.sessionValidatorInitData = abi.encode(uint8(2), abi.encodePacked(AGENT));
-        assertFalse(validator.validateConfig(a.sessionValidatorInitData), "precondition: returns false");
-        _expectMalformed(a);
+        bytes[] memory configs = new bytes[](7);
+        configs[0] = abi.encode(address(0));
+        configs[1] = "";
+        configs[2] = hex"0102030405";
+        configs[3] = new bytes(31);
+        configs[4] = new bytes(33);
+        configs[5] = abi.encode(AGENT, AGENT);
+        configs[6] = abi.encodePacked(uint256(0xff) << 248 | uint256(uint160(AGENT))); // dirty upper bytes
 
-        // (b) validateConfig REVERTS — initData too short to decode as (uint8, bytes).
-        Session memory b = _canonical();
-        b.sessionValidatorInitData = hex"0102030405";
-        (bool ok,) = address(validator)
-            .staticcall(abi.encodeWithSelector(validator.validateConfig.selector, b.sessionValidatorInitData));
-        assertFalse(ok, "precondition: validateConfig REVERTS on this input");
-        _expectMalformed(b);
-
-        // (c) a wrong key LENGTH also returns false (19-byte ECDSA key).
-        Session memory c = _canonical();
-        c.sessionValidatorInitData = abi.encode(uint8(0), new bytes(19));
-        _expectMalformed(c);
+        for (uint256 i; i < configs.length; ++i) {
+            Session memory s = _canonical();
+            s.sessionValidatorInitData = configs[i];
+            assertFalse(validator.validateConfig(configs[i]), "precondition: returns false, does not revert");
+            _expectMalformed(s);
+        }
     }
 
     /// Non-owner cannot grant.
@@ -409,7 +406,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         // Correctly WRAPPED — the point of this test is that URP's own TERM guard fires, so the
         // config has to get past the mode decoder to reach it. A bare `abi.encode(bad)` would now
         // die at `InvalidPolicyMode` instead and the test would prove nothing about overreach.
-        Session memory s = canonicalSession(ecdsaConfig(AGENT), universalInitData(bad));
+        Session memory s = canonicalSession(agentConfig(AGENT), universalInitData(bad));
         // URP's OWN error, surfacing through the engine — NOT MalformedSessionShape. Naming it is
         // the whole point of this test: it proves the shape check did not overreach into term
         // validation. URP reverts during initializeWithMultiplexer, which the engine does not

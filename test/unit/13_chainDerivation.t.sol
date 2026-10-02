@@ -122,7 +122,7 @@ contract PushAgentWalletChainDerivationTest is BaseTest {
     function _session(ActionData[] memory actions) internal view returns (Session memory) {
         return Session({
             sessionValidator: ISessionValidator(address(validator)),
-            sessionValidatorInitData: ecdsaConfig(AGENT),
+            sessionValidatorInitData: agentConfig(AGENT),
             salt: bytes32(0),
             userOpPolicies: new PolicyData[](0),
             erc7739Policies: ERC7739Data({

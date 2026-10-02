@@ -21,11 +21,11 @@
 | `0xbobuea` | Bob's Universal Executor Account — his identity | Push Chain |
 | `0xbobagw` | Bob's **agent wallet** — holds the budgeted funds, owned by `0xbobuea`. **One of several Bob may own** | Push Chain |
 | `0xbobagwcea` | `0xbobagw`'s Chain Executor Account — the execution hand | Ethereum |
-| `0xagentkey` | The agent's signing key (ECDSA **or** Ed25519) — **a key, not an account** | off-chain |
+| `0xagent` | The agent's **Push address** — its own EOA, or the UEA of an external key (EVM, Solana, …). It calls the agent door itself | Push Chain |
 | `AGWFactory` | Deploys agent wallets at predictable addresses; the registry of record | Push Chain |
 | `SmartSession` | The adopted permission engine — the wallet's only installed module | Push Chain |
 | `URP` | Universal Rules Policy — **the only contract that inspects what the agent really does on the far chain.** Its universal EVM rulebook runs here; its Solana rulebook is in `2_UniversalRulesPolicy.md` §1.4c, its native rulebook is the other document's subject | Push Chain |
-| `AgentValidator` | Stateless signature checker (secp256k1 / Ed25519). **Never installed** — named inside each permission | Push Chain |
+| `AgentValidator` | Stateless sender validator — confirms the sender is the agent. **Never installed** — named inside each permission | Push Chain |
 | `UniversalGatewayPC` | The frozen outbound gateway — the only thing a **universal** agent action may call, and the one thing a native action never may | Push Chain |
 
 All of Bob's addresses are **deterministic and computable before anything is deployed.**
@@ -58,7 +58,7 @@ All of Bob's addresses are **deterministic and computable before anything is dep
   | Revoke | instantly, one signature, unblockable |
 
 - **Argument offsets are generated from each protocol's ABI by tooling, never hand-typed** — a wrong offset silently disarms the beneficiary check.
-- The tooling calls `AgentValidator.validateConfig` on the key config, and shows Bob the resolved `0xbobagwcea` and whether it is deployed yet.
+- The tooling calls `AgentValidator.validateConfig` on the agent config, and shows Bob the resolved `0xbobagwcea` and whether it is deployed yet.
 - Bob reviews and approves. **This is the last human decision point.**
 
 ---
@@ -109,7 +109,7 @@ It then does exactly three things: it **overwrites the salt** with the wallet's 
 
 ```
 sessionValidator         = AgentValidator
-sessionValidatorInitData = abi.encode(scheme, 0xagentkey)   ← ECDSA or Ed25519
+sessionValidatorInitData = abi.encode(0xagent)              ← the agent's Push address
 salt                     = bytes32(grantNonce++)             ← WALLET-SUPPLIED, never the caller's
 
 userOpPolicies:          [ ]        ← ALWAYS EMPTY (that class has a floor of zero)
@@ -134,9 +134,9 @@ actions: [ EXACTLY ONE — the UNIVERSAL shape ]
 
 **Why URP is the *only* action policy.** The engine requires at least one action policy per action. With URP as the only one, **removing URP leaves zero policies and every request dies**. Add a second policy — a separate time-window policy, say — and that property is gone: stripping URP would leave one policy standing and the request would pass. **This is why the expiry lives inside URP and not in a policy of its own.**
 
-**The rules set identity.** `permissionId = keccak256(sessionValidator, initData, salt)`. Because the wallet supplies the salt, granting byte-identical terms twice yields two independent rules sets. Because the signer config is in the hash, **the agent key cannot be swapped inside a rules set — a different key is a different rules set** (Rule 4).
+**The rules set identity.** `permissionId = keccak256(sessionValidator, initData, salt)`. Because the wallet supplies the salt, granting byte-identical terms twice yields two independent rules sets. Because the agent config is in the hash, **the agent cannot be swapped inside a rules set — a different agent is a different rules set** (Rule 4).
 
-**What the agent key can do:** exactly one function, on exactly one Push contract, for one asset, up to two ceilings, into three possible pools, until the expiry, with the beneficiary forced to Bob's own CEA.
+**What the agent can do:** exactly one function, on exactly one Push contract, for one asset, up to two ceilings, into three possible pools, until the expiry, with the beneficiary forced to Bob's own CEA.
 
 **What it cannot do:** move funds anywhere else · call any other contract · redirect the position · exceed either cap · act after expiry · install or remove modules · call the wallet, URP, the gateway, **or `0xbobagwcea` itself** · touch `0xbobuea` · grant or extend anything · **call anything on Push Chain directly** — that is what a `NATIVE` rules set is for, and this one is not that.
 
@@ -162,34 +162,33 @@ Layer 4  the far-chain call     supply(USDC, 100e6, 0xbobagwcea, 0)
 Layer 3  the instruction list   Multicall[] — 1 to 10 entries, mandatory envelope
 Layer 2  the gateway request    token, amount, EMPTY recipient, revertRecipient = 0xbobagw,
                                 non-zero maxPCForGas, payload = layer 3
-Layer 1  the wallet operation   mode, executionCalldata, lane + position, requestExpiry
+Layer 1  the execution payload  one single call: target = the gateway, value = PC for far-side gas
 ```
 
-- It signs the **ten-field operation hash**. **It composes instructions; it does not move money.**
+- **It composes instructions; it does not move money.** It signs nothing for the wallet: its authority is being the sender.
 
 ---
 
 ## STAGE 5 — Execution via the agent door
 
-**🔑 THE AGENT KEY IS USED — the only time it is used in the entire lifecycle**
+**🔑 THE AGENT ACTS — the only time it acts in the entire lifecycle**
 
 - The agent **cannot** call `UniversalGatewayPC` itself. If it did, `msg.sender` would be the agent, the Vault would derive the *agent's* CEA, and the agent would hold Bob's position. Structurally blocked.
-- Instead it calls **Bob's wallet** — or hands the signed request to any relayer.
+- Instead it calls **Bob's wallet** itself — from `0xagent`, or, for an external key, by driving its UEA, which verifies that key and then calls the wallet.
 
-> **The caller does not matter — the signature does.**
-> `executeWithSession` has no caller check. **Anyone can submit.** Authorisation lives inside the function: the transaction is inert without a signature over the op hash from the key Bob named. In practice the agent service relays its own requests and pays the Push gas from its own PC balance — a separate balance from the wallet's.
+> **The caller is the authority.**
+> `executeAsAgent` admits only the agent the named rules set records. Anyone else — Bob included — is refused `CallerIsNotAgent` before the engine runs. There is no signature and no relayer: the agent pays the Push gas itself (an EOA from its own PC balance, a UEA through its gas path) — a separate balance from the wallet's.
 
 ```
-0xagentkey signs opHash (10 bound fields)
-  └─▶ 0xbobagw.executeWithSession(validator, mode, execCalldata, sig, nonceKey, nonceSeq, requestExpiry)
+0xagent
+  └─▶ 0xbobagw.executeAsAgent(rulesId, mode, execCalldata)
         │
         │  ── THE WALLET DOES THE ENTRYPOINT'S JOBS ITSELF (Push Chain has none) ──
-        ├─ 1. requestExpiry passed?            revert   (0 = no expiry; no ceiling either)
-        ├─ 2. validator installed?             ✓
-        ├─ 3. consume nonce lane BEFORE validation — nothing can run twice
-        ├─ 4. recompute the ten-field opHash from what arrived
-        ├─ 5. build PackedUserOperation in memory (ABI shape only)
-        │       sender = address(this) · paymasterAndData = "" · gas fields zeroed
+        ├─ 1. session engine still installed?                       ✓
+        ├─ 2. msg.sender == agentOf(rulesId)?   else CallerIsNotAgent — before the engine runs
+        ├─ 3. build PackedUserOperation in memory (ABI shape only)
+        │       sender = address(this) · paymasterAndData = "" · gas fields and nonce zeroed
+        │       signature = USE ‖ rulesId ‖ msg.sender   ← written by the wallet, never supplied
         │
         └─▶ SmartSession.validateUserOp
               ├─ permission enabled?
@@ -205,18 +204,20 @@ Layer 1  the wallet operation   mode, executionCalldata, lane + position, reques
               │     EFFECTS LAST: spent += amount · emit OutboundMetered
               │
               └─ AgentValidator.validateSignatureWithData   ← LAST, after every policy
-                    ECDSA: ecrecover      Ed25519: raw staticcall to the USV precompile
+                    the 20 bytes the wallet wrote == the agent stored in the rules set?
         │
-        ├─ 6. the wallet enforces the verdict itself (authorizer, validAfter/validUntil)
-        ├─ 7. the wallet refuses itself and the engine as target, whatever the verdict
-        └─▶ 8. dispatch THE EXACT VALIDATED BYTES ──▶ UniversalGatewayPC.sendUniversalTxOutbound
-                                                            ▲
-                                                  msg.sender == 0xbobagw
-                                                  ← decides which CEA executes
+        ├─ 4. the wallet enforces the verdict itself (authorizer, validAfter/validUntil)
+        ├─ 5. the wallet refuses itself and the engine as target, whatever the verdict
+        ├─▶ 6. dispatch THE EXACT VALIDATED BYTES ──▶ UniversalGatewayPC.sendUniversalTxOutbound
+        │                                                   ▲
+        │                                         msg.sender == 0xbobagw
+        │                                         ← decides which CEA executes
+        └─ 7. emit RulesActionAuthorized(rulesId, 0xagent, keccak256(execCalldata))
 ```
 
-- **Any single gate failing reverts the whole transaction** — nonce, counters, everything. A failed action costs the relayer gas and changes nothing else. The agent's runtime is never trusted; URP is the trust boundary.
-- **Ordering note that looks wrong and is not:** the signature is verified **after** the policies. Policies therefore run on calldata that has not yet been authenticated — so every policy, forever, must be safe against arbitrary calldata from any caller. URP is safe by construction: no external calls, effects last, revert on every failure.
+- **Any single gate failing reverts the whole transaction** — counters, everything. A failed action costs the agent gas and changes nothing else. The agent's runtime is never trusted; URP is the trust boundary.
+- **Replay** is the sender's own nonce — the EOA's, or the UEA payload's. The wallet keeps no agent replay state: the same call sent twice is two actions, each checked and metered.
+- **Ordering note that looks wrong and is not:** the engine consults the session validator **after** the policies. The wallet has already checked the caller, but every policy, forever, must still be safe against arbitrary calldata the engine has not yet authenticated. URP is safe by construction: no external calls, effects last, revert on every failure.
 
 ### 💰 FUND MOVEMENT #3 — 100 pUSDC burns on Push Chain
 
@@ -268,20 +269,20 @@ msg.sender = 0xbobagwcea · onBehalfOf = 0xbobagwcea · shares → 0xbobagwcea
 ```
 
 - **The UEA cannot command the CEA directly.** To withdraw from Morpho, `0xbobuea` calls `0xbobagw.execute(...)`, which originates an outbound, which the TSS routes to `0xbobagwcea`. Always two hops.
-- **The agent key cannot withdraw** — `withdraw()` is not in the allow-list, so the owner path is the only exit by construction.
+- **The agent cannot withdraw** — `withdraw()` is not in the allow-list, so the owner path is the only exit by construction.
 - **The CEA has no independent security.** It is a projection of the agent wallet, not a second line of defence.
 
 | Actor | Can do | Cannot do |
 | --- | --- | --- |
 | **`0xbobuea`** (Bob) | anything, unconditionally — withdraw anywhere, revoke, replace a rules set, install/uninstall a validator | — |
-| **`0xagentkey`** | exactly what the rules set permits, until expiry | everything else |
+| **`0xagent`** | exactly what the rules set permits, until expiry | everything else |
 | **Push governance** | — | reach `0xbobagwcea`; the only path in is a TSS outbound originating from `0xbobagw` |
 
 ### The owner's three operations, in full
 
 - **Withdraw** — `execute([...])`. **There is no `withdraw()` function**; the owner path *is* withdrawal, with no destination restriction and no policy in the path. It must succeed in every degraded state — zero rules sets, engine uninstalled, hostile validator installed.
 - **Revoke** — `revokeRules(pid)` (existence-checked, so a typo reverts loudly instead of silently "succeeding") or `revokeAllRules()`. Immediate on Push, unblockable, no callbacks on the path. **One honest limit:** an instruction already dispatched across the bridge still completes.
-- **Change a rules set** — **it cannot be edited.** A change is one owner transaction batching: `URP.assertSpent(expected)` → `revokeRules(old)` → `grantRules(new)`. If the agent spent in the composition window, the assertion reverts the whole change. **Counters restart at zero on the new rules set**, and any request the agent signed against the old id is dead, because the op hash binds the permission id.
+- **Change a rules set** — **it cannot be edited.** A change is one owner transaction batching: `URP.assertSpent(expected)` → `revokeRules(old)` → `grantRules(new)`. If the agent spent in the composition window, the assertion reverts the whole change. **Counters restart at zero on the new rules set**, and any request for the old id is dead: removal cleared its agent, and the new rules set has a new id.
 
 ### STAGE 7b — the second action, and why it may carry zero USDC
 
@@ -341,14 +342,14 @@ msg.sender = 0xbobagwcea · onBehalfOf = 0xbobagwcea · shares → 0xbobagwcea
                         ├──3─▶ 💰 100 pUSDC ──▶ 0xbobagw
                         └──4─▶ ⛽ PC ──▶ 0xbobagw   (pays its own outbound gas swap)
 
-  STAGE 4        agent researches off-chain · composes 4 nested layers · signs opHash
+  STAGE 4        agent researches off-chain · composes 4 nested layers
                                 │
   STAGE 5                       ▼
-     anyone relays ──▶ 0xbobagw.executeWithSession(...)
+     0xagent calls ──▶ 0xbobagw.executeAsAgent(rulesId, …)
                                 │
                     ┌───────────┴────────────────────────┐
-                    │ WALLET: expiry · validator · nonce │
-                    │         · opHash · build userOp    │
+                    │ WALLET: engine installed ·         │
+                    │   caller == the agent · userOp     │
                     ├────────────────────────────────────┤
                     │ URP: 16 gates, fail closed        │
                     │  gateway only · asset · caps       │
@@ -356,7 +357,7 @@ msg.sender = 0xbobagwcea · onBehalfOf = 0xbobagwcea · shares → 0xbobagwcea
                     │  ≤10 entries · NOT the CEA         │
                     │  allow-list · beneficiary == CEA   │
                     ├────────────────────────────────────┤
-                    │ SIGNATURE CHECKED LAST             │
+                    │ SENDER CHECKED AGAIN, LAST         │
                     └───────────┬────────────────────────┘
                                 ▼
                     UniversalGatewayPC.sendUniversalTxOutbound
@@ -383,8 +384,8 @@ msg.sender = 0xbobagwcea · onBehalfOf = 0xbobagwcea · shares → 0xbobagwcea
 ## The five things to remember
 
 1. **One signature — and the wallet is Bob's forever.** Identity, wallet, rules set and funding land atomically. The wallet's owner is baked into its bytecode at creation and can never be reassigned.
-2. **The agent key authorises; it never holds.** It triggers one function under sixteen simultaneous gates. Funds move only from Bob's own accounts, only to Bob's own CEA.
-3. **The caller is irrelevant; the signature is everything.** `executeWithSession` is open to anyone and inert without the right signature. That is also why relaying is a service concern, not a security one.
+2. **The agent authorises; it never holds.** It triggers one function under sixteen simultaneous gates. Funds move only from Bob's own accounts, only to Bob's own CEA.
+3. **The caller is the authority.** `executeAsAgent` admits only the agent the rules set names; an external key acts through its UEA, which verifies the key. There is no bearer request and no relayer.
 4. **`msg.sender` at the gateway decides everything.** Because `0xbobagw` originates the outbound, the CEA is Bob's — so Morpho credits Bob. Had the agent originated it, the position would have been the agent's. **That single fact is the design.**
 5. **URP is the only contract that can see what the agent is really doing.** To the engine, every universal agent action looks identical — the wallet calling the gateway. Everything Bob actually cares about lives two decode levels down, and URP is what opens it. Remove URP and the rules set enforces nothing.
 

@@ -12,14 +12,15 @@ import { IModule as IERC7579Module } from "erc7579/interfaces/IERC7579Module.sol
 
 import { IAgentValidator } from "./interfaces/IAgentValidator.sol";
 import { IAGW } from "./interfaces/IAGW.sol";
+import { ISmartSessionConfigReader } from "./interfaces/ISmartSessionConfigReader.sol";
 import { AGWErrors } from "./libraries/Errors.sol";
+import { AgentConfigLib } from "./libraries/AgentConfigLib.sol";
 import { PushChainLib } from "./libraries/PushChainLib.sol";
 import { OwnerAuthLib } from "./libraries/OwnerAuthLib.sol";
 import {
     OwnerIntent,
     OWNER_LANE_FLAG,
     SEND_OUTBOUND_SELECTOR,
-    OP_HASH_DOMAIN,
     RulesType,
     ENGINE_FALLBACK_TARGET,
     ENGINE_FALLBACK_SELECTOR,
@@ -41,13 +42,14 @@ import { ExecutionLib, Execution } from "./libraries/ExecutionLib.sol";
  * @notice The user's per-purpose agent wallet on Push Chain. It holds the budgeted funds and is
  *         `msg.sender` at the gateway, which is what binds it to its destination-chain account.
  *
- * @dev    - Push Chain has no ERC-4337 EntryPoint, so this wallet performs the EntryPoint's jobs
- *           itself in `executeWithSession`.
+ * @dev    - Push Chain has no ERC-4337 EntryPoint, so this wallet builds the operation and enforces
+ *           the engine's verdict itself in `executeAsAgent`.
  *         - An ERC-7579 modular account restricted to validator modules; executor, fallback and
  *           hook modules are refused. A hook would run on the owner path and could block it.
  *         - `execute` is the owner door: no policy is ever consulted on it.
- *         - `executeWithSession` is the agent door: permissionless to call, authorised entirely by
- *           signature, nonce and bound operation hash.
+ *         - `executeAsAgent` is the agent door: callable only by the rules set's agent — a Push
+ *           address (an EOA, or the UEA of an external key) — and every call is checked by the
+ *           rules set's policy.
  *         - Deliberately near-stateless. A request exists only for the transaction that carries it.
  */
 contract AGW is IAGW, ReentrancyGuardTransient {
@@ -88,7 +90,8 @@ contract AGW is IAGW, ReentrancyGuardTransient {
     /// @notice The canonical action policy (URP) every rules set on this wallet must name.
     address public immutable RULES_POLICY;
 
-    /// @notice The canonical session validator every rules set on this wallet must name.
+    /// @notice The canonical session validator every rules set on this wallet must name — the sender
+    ///         validator that confirms the caller is the rules set's agent.
     address public immutable SESSION_VALIDATOR;
 
     /// @notice The Push-side outbound gateway, the only target a universal agent action may reach.
@@ -103,7 +106,7 @@ contract AGW is IAGW, ReentrancyGuardTransient {
     /// @dev The account's entire module registry.
     mapping(address => bool) private _installedValidators;
 
-    /// @dev Replay lanes: lane key => next expected sequence number.
+    /// @dev Owner replay lanes for `executeWithSig`: lane key => next expected sequence number.
     mapping(uint192 => uint64) private _nonces;
 
     /**
@@ -302,8 +305,8 @@ contract AGW is IAGW, ReentrancyGuardTransient {
      *           refactor can ever add a check to `execute`.
      *         - Checks, in order: deadline · `intent.wallet == this` · owner · presenter is
      *           `intent.executor` · owner lane · `mode` and a non-zero `execCalldataHash` match ·
-     *           nonce (consumed before the signature check, as on the agent door; any revert unwinds
-     *           it) · the owner's signature under the FACTORY's domain.
+     *           nonce (consumed before the signature check; any revert unwinds it) · the owner's
+     *           signature under the FACTORY's domain.
      *         - Single or batch, default exec type. No dispatch guard: this is owner authority, so a
      *           batch may call the wallet's own lifecycle functions through `onlyOwnerOrSelf`.
      *         - Emits `OwnerExecutedWithSig`.
@@ -380,7 +383,7 @@ contract AGW is IAGW, ReentrancyGuardTransient {
     }
 
     /**
-     * @notice Grants one rules set to an agent key. One of exactly two lifecycle operations.
+     * @notice Grants one rules set to an agent. One of exactly two lifecycle operations.
      *
      * @dev    - Reverts unless the caller is the owner or the wallet itself.
      *         - Rejects any session that is not the one shape this wallet permits, all with
@@ -389,18 +392,19 @@ contract AGW is IAGW, ReentrancyGuardTransient {
      *           target is not the gateway or whose selector is not the outbound send, an action
      *           policy set that is not exactly the canonical policy, or a session validator that is
      *           not the canonical one.
-     *         - Rejects a key config the session validator does not accept, including one that makes
-     *           it revert; that is why the call is wrapped in a bare catch rather than a typed one,
-     *           which would miss the compiler panic this exists to absorb. Wrapping is correct here
-     *           only because the external call already exists; the action policy's own decode is
-     *           deliberately not wrapped, since there it would introduce one.
+     *         - Rejects an agent config the session validator does not accept — anything but
+     *           `abi.encode(address agent)` with a non-zero agent. The canonical validator's check
+     *           never reverts; the call is still wrapped in a bare catch rather than a typed one, so a
+     *           future validator's revert or compiler panic is absorbed as a refusal. Wrapping is
+     *           correct here only because the external call already exists; the action policy's own
+     *           decode is deliberately not wrapped, since there it would introduce one.
      *         - Refusing the paymaster permit keeps dead surface dead: setting it would write a live
      *           permit row into engine storage, and that row decides whether a non-empty
      *           `paymasterAndData` is rejected outright or instead requires a user-op policy to run,
      *           which this shape forbids.
      *         - Overwrites the caller's salt with the wallet's monotonic grant counter, so identical
      *           terms granted twice yield distinct permission ids and a replaced id never recurs.
-     *           That is what makes a banked signed request die on regrant.
+     *           That is what makes a request built for a revoked rules set die on regrant.
      *         - Enables the session on the engine and emits `RulesGranted`.
      *         - Validates the session's shape only. The caps, allow-list and expiry inside the policy
      *           config are the policy's own concern; do not extend this into term validation.
@@ -684,8 +688,8 @@ contract AGW is IAGW, ReentrancyGuardTransient {
      *         - Reverts with `UnknownPermission` if the id is not enabled, because the upstream
      *           removal silently no-ops on a ghost id and an operator must never read "revoked"
      *           while the rules set lives.
-     *         - Removes the session and emits `RulesRevoked`. Revocation is immediate, and a
-     *           banked signed request dies with the id.
+     *         - Removes the session and emits `RulesRevoked`. Revocation is immediate: removal clears
+     *           the agent, so any request under the id fails `CallerIsNotAgent`.
      *         - Deliberately carries no reentrancy guard and no health probe: nothing that can fail
      *           belongs on the stop path, since blockable removal is the one regression this
      *           function can develop.
@@ -728,77 +732,49 @@ contract AGW is IAGW, ReentrancyGuardTransient {
     }
 
     /**
-     * @notice The agent door. Permissionless to call; a request is authorised by its signature, its
-     *         nonce and the bound operation hash, never by the caller.
+     * @notice The agent door. Callable only by the rules set's agent; every call is checked by the
+     *         rules set's policy before it runs.
      *
      * @dev    This chain has no EntryPoint, so this function does the EntryPoint's work, in order:
-     *         1. reject an expired request; a zero expiry means no expiry, per the 4337 convention
-     *         2. reject an uninstalled validator
-     *         3. consume the replay position, before validation
-     *         4. require use mode and read the permission id from the signature prefix
-     *         5. compute the operation hash from arrived data only
-     *         6. build the operation, validate it, and enforce the verdict
-     *         7. reject any mode other than single and default
-     *         8. dispatch the exact validated bytes
-     *         9. emit `RulesActionAuthorized`
+     *         1. reject if the session engine is no longer installed
+     *         2. reject unless `msg.sender` is the agent `rulesId` names on this wallet
+     *         3. build the operation, validate it through the engine, and enforce the verdict
+     *         4. reject any mode other than single and default, and the two forbidden targets
+     *         5. dispatch the exact validated bytes
+     *         6. emit `RulesActionAuthorized`
      *
-     *         - The nonce is consumed before validation; deferring it would reopen replay through a
-     *           re-entrant validator. Lanes are independent, so a stalled lane never blocks another.
-     *         - There is no ceiling on how far ahead a non-zero expiry may sit; a distant expiry is
-     *           accepted.
+     *         - The agent is a Push address. An external key (EVM, Solana, anything) acts through its
+     *           UEA, which verifies that key before calling here; this wallet verifies no signature.
+     *         - Replay protection is the sender's own transaction nonce (an EOA's nonce, or the UEA
+     *           payload's nonce). Expiry is the rules set's own (policy gate 2 / N2 / S2); an EOA
+     *           transaction carries no per-request expiry, a UEA payload carries its `deadline`.
+     *         - A request against a revoked rules set fails at step 2: removal clears the agent.
      *         - Not payable, but a validated request does move PC out of the wallet's own balance,
-     *           bounded by the policy's per-call ceiling. A relayer cannot attach value.
-     *         - Any revert unwinds the whole transaction including the nonce and the policy's
-     *           counters; dispatch is never wrapped in try/catch to preserve lane continuity.
-     *         - Mode is single-only here: batching lives inside the multicall payload, bounded by
-     *           the policy.
+     *           bounded by the policy's per-call ceiling.
+     *         - Any revert unwinds the whole transaction, including the policy's counters; dispatch
+     *           is never wrapped in try/catch.
+     *         - Mode is single-only here: batching lives inside the multicall payload, bounded by the
+     *           policy.
      *
-     * @param  validator          Installed validator module to validate against.
+     * @param  rulesId            The rules set this call acts under. `rulesId` is the engine's
+     *                            `permissionId`.
      * @param  mode               ERC-7579 mode word; must decode to single and default.
      * @param  executionCalldata  Encoded single execution, dispatched byte-for-byte once validated.
-     * @param  signature          Engine session signature: mode byte, permission id, then the
-     *                            agent's signature.
-     * @param  nonceKey           Replay lane to consume from.
-     * @param  nonceSeq           Expected sequence number within that lane.
-     * @param  requestExpiry      Unix timestamp after which the request is dead; zero means never.
      */
-    function executeWithSession(
-        address validator,
-        bytes32 mode,
-        bytes calldata executionCalldata,
-        bytes calldata signature,
-        uint192 nonceKey,
-        uint64 nonceSeq,
-        uint48 requestExpiry
-    ) external nonReentrant {
-        if (requestExpiry != 0 && block.timestamp > requestExpiry) {
-            revert AGWErrors.RequestExpired();
+    function executeAsAgent(bytes32 rulesId, bytes32 mode, bytes calldata executionCalldata) external nonReentrant {
+        if (!_installedValidators[SESSION_ENGINE]) {
+            revert AGWErrors.ValidatorNotInstalled(SESSION_ENGINE);
         }
 
-        if (!_installedValidators[validator]) revert AGWErrors.ValidatorNotInstalled(validator);
+        if (msg.sender != _agentOf(rulesId)) revert AGWErrors.CallerIsNotAgent(rulesId, msg.sender);
 
-        // Owner lanes belong to `executeWithSig`. A pure calldata check, before any nonce read.
-        if (nonceKey & OWNER_LANE_FLAG != 0) revert AGWErrors.OwnerLaneForbidden(nonceKey);
+        bytes32 callsHash = keccak256(executionCalldata);
 
-        uint64 expected = _nonces[nonceKey];
-        if (nonceSeq != expected) revert AGWErrors.InvalidNonce(nonceKey, expected, nonceSeq);
-        _nonces[nonceKey] = expected + 1;
-
-        // Use mode only: in enable mode the engine derives the id from session data, so bytes 1:33
-        // would not be a permission id.
-        if (signature.length < 33 || uint8(signature[0]) != uint8(SmartSessionMode.USE)) {
-            revert AGWErrors.InvalidSessionSignature();
-        }
-        bytes32 rulesId = bytes32(signature[1:33]);
-
-        bytes32 opHash =
-            _computeOpHash(validator, rulesId, mode, keccak256(executionCalldata), nonceKey, nonceSeq, requestExpiry);
-
-        _validate(validator, mode, executionCalldata, signature, nonceKey, nonceSeq, opHash);
+        _validate(rulesId, mode, executionCalldata, callsHash);
 
         _gateAndDispatch(mode, executionCalldata);
 
-        emit RulesActionAuthorized(rulesId, nonceKey, nonceSeq, opHash);
+        emit RulesActionAuthorized(rulesId, msg.sender, callsHash);
     }
 
     /**
@@ -838,101 +814,46 @@ contract AGW is IAGW, ReentrancyGuardTransient {
     }
 
     /**
-     * @dev Builds the operation hash an agent signs.
+     * @dev Builds the operation, validates it through the engine, and enforces the verdict.
      *
-     *      - Ten fields, combined with `abi.encode` for a fixed 32-byte-per-field layout with no
-     *        encoding ambiguity. The field list is frozen and must not be shortened.
-     *      - Field 5 binds the request to one rules set: the engine reads the permission id from an
-     *        unsigned signature prefix, so without it a relayer could re-prefix a signed request onto
-     *        a different permission and charge the wrong budget. It is also what makes a banked
-     *        request die once the rules set is regranted.
-     *      - Field 10 makes the expiry unforgeable, so a relayer cannot extend or trim a request's
-     *        lifetime.
-     *      - Split out for stack depth only; it reads nothing but its arguments, `block.chainid` and
-     *        `address(this)`.
-     *
-     * @param  validator              Validator the request names.
-     * @param  rulesId           Rules set the request is bound to.
-     * @param  mode                   ERC-7579 mode word.
-     * @param  executionCalldataHash  Hash of the execution calldata, covering every nested layer.
-     * @param  nonceKey               Replay lane.
-     * @param  nonceSeq               Sequence number within that lane.
-     * @param  requestExpiry          Expiry stamp carried by the request.
-     * @return The hash the agent's signature must cover.
-     */
-    function _computeOpHash(
-        address validator,
-        bytes32 rulesId,
-        bytes32 mode,
-        bytes32 executionCalldataHash,
-        uint192 nonceKey,
-        uint64 nonceSeq,
-        uint48 requestExpiry
-    ) internal view returns (bytes32) {
-        return keccak256(
-            abi.encode(
-                OP_HASH_DOMAIN, //  1 cross-protocol isolation
-                block.chainid, //  2 cross-chain replay
-                address(this), //  3 cross-account replay
-                validator, //  4 validator substitution
-                rulesId, //  5 cross-rules-set substitution
-                mode, //  6 single->batch substitution
-                executionCalldataHash, //  7 payload integrity — covers every nested layer
-                nonceKey, //  8 lane substitution
-                nonceSeq, //  9 straight replay
-                requestExpiry //  10 expiry substitution
-            )
-        );
-    }
-
-    /**
-     * @dev Builds the operation, validates it, and enforces the verdict.
-     *
-     *      - Builds a `PackedUserOperation` for its ABI shape only, since there is no EntryPoint.
-     *        The engine requires `sender` to equal `msg.sender`; the nonce field is an informational
-     *        mirror of the lane pair.
+     *      - Builds a `PackedUserOperation` for its ABI shape only, since there is no EntryPoint. The
+     *        engine requires `sender` to equal `msg.sender` (the wallet); that is what makes the
+     *        signature field below unforgeable.
      *      - The callData selector must be `execute(bytes32,bytes)`, because that is the only engine
      *        branch that decodes the mode and forwards the real decoded value to the action policy.
      *        Every other selector reaches the policy with the account as target and a hardcoded zero
      *        value, which would make the policy's value gate compare against nothing.
+     *      - The signature field is `USE ‖ rulesId ‖ msg.sender`, written here and nowhere else. The
+     *        session validator accepts it only when those 20 bytes are the rules set's agent.
+     *      - `callsHash` is passed as the operation hash. Nothing verifies a signature over it; it is
+     *        what the engine forwards to the validator, which ignores it.
      *      - Gas fields are zero and `paymasterAndData` must stay empty, or the engine's paymaster
-     *        permit check reverts.
-     *      - Calls the validator, then enforces the returned authorizer and time window itself. That
-     *        is the EntryPoint's job, and doing it here is what makes the policy's expiry gate real
-     *        rather than decorative.
-     *      - The engine runs the action policy before verifying the session signature, so policies
-     *        see calldata that is not yet authenticated.
-     *      - Performs exactly one external call, to the validator. Split out for stack depth.
+     *        permit check reverts. The nonce field is zero: replay protection is the sender's own.
+     *      - Enforces the returned authorizer and time window itself — the EntryPoint's job, and what
+     *        makes the policy's expiry gate real rather than decorative.
+     *      - The engine runs the action policy before it consults the session validator, so policies
+     *        still see calldata the engine has not yet authenticated; the wallet's own agent check
+     *        has already run by then.
+     *      - Performs exactly one external call, to the engine. Split out for stack depth.
      *
-     * @param validator          Validator module to call.
+     * @param rulesId            The rules set, written into the signature field.
      * @param mode               ERC-7579 mode word, re-encoded into the operation's calldata.
      * @param executionCalldata  Execution calldata, re-encoded into the operation's calldata.
-     * @param signature          Engine session signature.
-     * @param nonceKey           Replay lane, mirrored into the operation's nonce field.
-     * @param nonceSeq           Sequence number, mirrored into the operation's nonce field.
-     * @param opHash             Hash the validator checks the signature against.
+     * @param callsHash          `keccak256(executionCalldata)`, passed as the operation hash.
      */
-    function _validate(
-        address validator,
-        bytes32 mode,
-        bytes calldata executionCalldata,
-        bytes calldata signature,
-        uint192 nonceKey,
-        uint64 nonceSeq,
-        bytes32 opHash
-    ) internal {
+    function _validate(bytes32 rulesId, bytes32 mode, bytes calldata executionCalldata, bytes32 callsHash) internal {
         PackedUserOperation memory op;
         op.sender = address(this);
-        op.nonce = (uint256(nonceKey) << 64) | uint256(nonceSeq);
+        op.nonce = 0;
         op.initCode = "";
         op.callData = abi.encodeWithSelector(this.execute.selector, mode, executionCalldata);
         op.accountGasLimits = bytes32(0);
         op.preVerificationGas = 0;
         op.gasFees = bytes32(0);
         op.paymasterAndData = "";
-        op.signature = signature;
+        op.signature = abi.encodePacked(SmartSessionMode.USE, rulesId, msg.sender);
 
-        uint256 vd = ValidationData.unwrap(ISmartSession(validator).validateUserOp(op, opHash));
+        uint256 vd = ValidationData.unwrap(ISmartSession(SESSION_ENGINE).validateUserOp(op, callsHash));
 
         address authorizer = address(uint160(vd));
         uint48 validUntil = uint48(vd >> 160); // 0 = unbounded
@@ -943,6 +864,21 @@ contract AGW is IAGW, ReentrancyGuardTransient {
         if (validUntil != 0 && block.timestamp > validUntil) {
             revert AGWErrors.OutsideTimeWindow(validAfter, validUntil);
         }
+    }
+
+    /**
+     * @dev The agent `rulesId` names on this wallet, or `address(0)` if it names none.
+     *      Zero when the id is unknown or revoked (removal clears the config), when its session
+     *      validator is not the canonical one, or when its config is malformed. One external view
+     *      call to the engine; decodes through the same library the validator enforces with.
+     * @param  rulesId  The rules set to look up.
+     * @return The agent's Push address, or zero.
+     */
+    function _agentOf(bytes32 rulesId) internal view returns (address) {
+        (address sessionValidator_, bytes memory config) = ISmartSessionConfigReader(SESSION_ENGINE)
+            .getSessionValidatorAndConfig(address(this), PermissionId.wrap(rulesId));
+        if (sessionValidator_ != SESSION_VALIDATOR) return address(0);
+        return AgentConfigLib.decode(config);
     }
 
     /**
@@ -1072,9 +1008,10 @@ contract AGW is IAGW, ReentrancyGuardTransient {
     }
 
     /**
-     * @notice Next expected sequence number in `nonceKey`'s replay lane.
+     * @notice Next expected sequence number in an owner lane (`OWNER_LANE_FLAG` set), consumed by
+     *         `executeWithSig`. The agent door uses no nonce lanes.
      * @param  nonceKey  Replay lane to query.
-     * @return The sequence number the next request in that lane must carry.
+     * @return The sequence number the next intent in that lane must carry.
      */
     function getNonce(uint192 nonceKey) external view returns (uint64) {
         return _nonces[nonceKey];
@@ -1083,6 +1020,18 @@ contract AGW is IAGW, ReentrancyGuardTransient {
     /// @notice The salt the next grant will use.
     function grantNonce() external view returns (uint64) {
         return _grantNonce;
+    }
+
+    /**
+     * @notice The agent a rules set names on this wallet, or zero if it names none.
+     * @dev    Zero for an unknown or revoked id, for a session the owner enabled on the engine
+     *         directly with a non-canonical session validator, and for a malformed config. Such a
+     *         rules set cannot be used through `executeAsAgent`.
+     * @param  rulesId  The rules set to look up. `rulesId` is the engine's `permissionId`.
+     * @return The agent's Push address, or zero.
+     */
+    function agentOf(bytes32 rulesId) external view returns (address) {
+        return _agentOf(rulesId);
     }
 
     /// @notice The OwnerIntent domain separator this wallet verifies against, for a signer on

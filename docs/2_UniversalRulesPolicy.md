@@ -90,7 +90,7 @@ Run for a universal permission whose destination family is EVM (`_checkUniversal
 
 After every gate passes, URP **records the spend before the bridge is called** — effects first, so no ordering trick can spend twice against a stale counter.
 ## 1.4b The native gates — every gate, in order
-Run only for a native permission (`_checkNative`). The same discipline as the universal gauntlet, for the same reason: this runs before the signature is verified, on unauthenticated call data from any caller. No external calls; every counter written last; any failure reverts the whole request with nothing spent.
+Run only for a native permission (`_checkNative`). The same discipline as the universal gauntlet, for the same reason: this runs before the engine consults the session validator, on call data the engine has not yet authenticated. The wallet has already checked that the caller is the permission's agent, but URP does not rely on that. No external calls; every counter written last; any failure reverts the whole request with nothing spent.
 | #   | Gate                   | Demands                                                                                                                                                                                                                                 | Stops                                                                                                                                                                                                                                                                                   |
 | --- | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | N1  | **Configured**         | This action's native record exists and is initialised                                                                                                                                                                                   | Requests against ghosts — action ids never granted on this wallet                                                                                                                                                                                                                       |
@@ -151,12 +151,12 @@ After every gate passes, URP **records the spend** — the same counter discipli
 ```mermaid
 flowchart TB
   subgraph OFF["Off-chain"]
-    AG["Agent signs the request\
-(ten-field fingerprint)"]
+    AG["Agent builds the request\
+and calls the agent door itself"]
   end
   subgraph PUSH["Push Chain — one transaction"]
     DOOR["Wallet: agent door\
-replay lane consumed · fingerprint recomputed"]
+caller must be the permission's agent"]
     ENG["Permission engine: look up the permission,\
 run its policies"]
     subgraph GAUNTLET["URP — the gauntlet (any failure: revert, nothing spent)"]
@@ -173,8 +173,8 @@ target + function every entry,\
 beneficiary = destination account"]
       G15 --> G16["16 per-entry value cap"]
     end
-    SIGN["Signature verified LAST\
-against the permission's key"]
+    SIGN["Session validator LAST:\
+the sender is the permission's agent"]
     SPEND["URP records the spend\
 (before the bridge)"]
     GW["Gateway: pulls the token,\
@@ -199,12 +199,12 @@ DESIGNED — NOT YET FUNCTIONAL" .-> SPEND
 ```mermaid
 flowchart TB
   subgraph OFF["Off-chain"]
-    AG["Agent signs the request\
-(ten-field fingerprint; one flat call inside)"]
+    AG["Agent builds the request — one flat call —\
+and calls the agent door itself"]
   end
   subgraph PUSH["Push Chain — one transaction, start to finish"]
     DOOR["Wallet: agent door\
-replay lane consumed · fingerprint recomputed"]
+caller must be the permission's agent"]
     ENG["Permission engine: identify the action by\
 (contract, function) — an ungranted pair dies here"]
     subgraph NGATES["URP — the native gates (any failure: revert, nothing spent)"]
@@ -221,8 +221,8 @@ in bounds · per call · lifetime"]
       N8 --> N9["N9 call limit\
 (every call counts)"]
     end
-    SIGN["Signature verified LAST\
-against the permission's key"]
+    SIGN["Session validator LAST:\
+the sender is the permission's agent"]
     METER["URP writes value · amount · calls\
 (all three, after every gate)"]
     GUARD["Wallet refuses the wallet or the engine\
@@ -240,12 +240,12 @@ credited to the wallet. Done."]
 ```mermaid
 flowchart TB
   subgraph OFF["Off-chain"]
-    AG["Agent signs the request\
-(ten-field fingerprint; one Solana instruction inside)"]
+    AG["Agent builds the request — one Solana instruction —\
+and calls the agent door itself"]
   end
   subgraph PUSH["Push Chain — one transaction"]
     DOOR["Wallet: agent door\
-replay lane consumed · fingerprint recomputed"]
+caller must be the permission's agent"]
     ENG["Permission engine: look up the permission,\
 run its policies"]
     subgraph SGATES["URP — the Solana gauntlet (any failure: revert, nothing spent)"]
@@ -266,8 +266,8 @@ fee · slippage · price floor)"]
       S17 --> S18["S18 value-holding accounts\
 only where pinned"]
     end
-    SIGN["Signature verified LAST\
-against the permission's key"]
+    SIGN["Session validator LAST:\
+the sender is the permission's agent"]
     SPEND["URP records the spend"]
     GW["Gateway: pulls the token,\
 emits the cross-chain message"]
@@ -291,11 +291,12 @@ DESIGNED — NOT YET FUNCTIONAL" .-> SPEND
 flowchart TB
   REQ["Agent request submitted"]
   V{"Validation on Push Chain\
-(gates 1–16, S1–S18 or N1–N9, expiry, signature)"}
+(the agent check, gates 1–16, S1–S18 or N1–N9,\
+expiry, the session validator)"}
   REV["Whole transaction reverts.\
 Nothing bridged, nothing spent,\
-counters and replay state unwound.\
-Relayer paid gas — nothing else happened."]
+counters unwound.\
+The agent paid gas — nothing else happened."]
   OK["Dispatched through the gateway.\
 Spend recorded. Token bridged."]
   NOK["Native: the Push contract was called.\

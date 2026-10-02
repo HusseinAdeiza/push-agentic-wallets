@@ -60,11 +60,9 @@ forge coverage --ir-minimum                       # via_ir is on; plain coverage
 forge test --gas-report
 ```
 
-Two suites are env-gated and **skip silently when the variable is unset** — a skipped test is not a passing
-test, so run each at least once against a real endpoint before reporting a phase done:
+One suite is env-gated and **skips silently when the variable is unset** — a skipped test is not a passing
+test, so run it at least once against a real endpoint before reporting a phase done:
 
-- `PUSH_TESTNET_RPC` — gates P-03, the only fork test of the live Ed25519 precompile, and the sole liveness
-  proof of that branch.
 - `DEPLOYMENT_RPC` + `CHAIN_ID` — gate S-05, which checks `deployments/<chainId>.json` against a live chain.
 
 Deployment (all five contracts, dependency order, writes `deployments/<chainId>.json`):
@@ -79,7 +77,7 @@ chains. See `.env.example`. The script asks the chain for its id and reverts on 
 ## The system in one pass
 
 A user funds a small, purpose-built wallet on Push Chain and grants it a **rules set**: a frozen bundle of
-limits (which agent key, which token, which destination protocol and functions, how much per call, how much
+limits (which agent, which token, which destination protocol and functions, how much per call, how much
 total, until when). The wallet's balance is the hard ceiling on everything the agent can lose. Every agent
 action is checked by contracts at execution time; the agent's honesty is never assumed.
 
@@ -95,7 +93,7 @@ about lives inside the payload, two decode levels down. **URP is the contract th
 | `AGWFactory` (`src/`) | UUPS proxy. Deploys wallet clones at pre-computable addresses; the registry of record for "is this a real wallet, and who owns it?" There is no owner parameter: the owner is the caller, or the signer of an `OwnerIntent` (the `deployWalletWithSig(intent, sig, label)` form). |
 | `AGW` (`src/`) | Holds funds. Minimal clone with 40 bytes of immutable args (owner 0–19, factory 20–39). Push Chain has no ERC-4337 EntryPoint, so the wallet does the EntryPoint's jobs itself. |
 | `UniversalRulesPolicy` — URP (`src/policies/`) | The only novel contract and the security boundary. **Three rulebooks**, in normative order, fail closed: universal-EVM (gates 1–16), universal-SVM (S1–S18; S1–S10 restate gates 1–10, S11+ parse the Solana execute payload), and native/Push-side (nine gates). Which one runs is derived from the rules set's chain string, never from a flag anyone sets. Upgradeable behind a transparent proxy. |
-| `AgentValidator` (`src/validators/`) | Stateless signature check: secp256k1, or Ed25519 via a raw `staticcall` to the USV precompile. |
+| `AgentValidator` (`src/validators/`) | Stateless sender validator: the rules set's config is the agent's Push address; it confirms the sender the wallet wrote into the engine's signature field. Verifies no signature. |
 | `SmartSession` (`lib/smartsessions/`) | Adopted unmodified. Stores rules sets, runs policies, deletes on revoke. The wallet's only installed module. |
 
 ### Naming
@@ -121,8 +119,10 @@ AGW follows the core/gateway naming standard (`docs-internal/sdk-first-changes/N
 - **The two doors are the whole authority model.** `execute` (owner door) consults *exactly two things* —
   the immutable-args owner and calldata. No module, policy, engine state or flag may ever be read there; it
   must succeed with the engine uninstalled, a hostile validator installed, or ghost-rules state. Adding
-  any check is the catastrophic regression. `executeWithSession` (agent door) is permissionless — signature,
-  nonce and bound op-hash are the authority, never the caller.
+  any check is the catastrophic regression. `executeAsAgent` (agent door) is callable only by the rules set's
+  agent: the wallet checks `msg.sender == agentOf(rulesId)` and writes the sender into the engine's signature
+  field, which the sender validator checks. The agent is a Push address — an EOA, or the UEA of an external
+  key; the wallet verifies no signature, and replay is the sender's own nonce.
 - **Owner-intent doors are siblings, not extensions, of `execute`.** `executeWithSig` and
   `grantRulesWithSig` let a relayer (`intent.executor`) present an EIP-712 `OwnerIntent` signed by the
   owner — usually a UEA, which has no ERC-1271, so `OwnerAuthLib.isOwnerSig` tries
@@ -132,9 +132,6 @@ AGW follows the core/gateway naming standard (`docs-internal/sdk-first-changes/N
   duplicates `execute`'s mode switch deliberately rather than sharing it.
 - **`execute(bytes32,bytes)` is a frozen signature.** The engine branches on this selector; any other shape
   routes validation to a path where URP's value gate sees a hardcoded zero instead of the real value.
-- **The ten-field operation hash** (`_computeOpHash`) uses `abi.encode`, never `encodePacked`. Fields 5
-  (permissionId) and 10 (requestExpiry) are v3 additions over shipped v2's eight; regressing to eight is
-  forbidden. Field 5 is what makes a banked signed request die on regrant.
 - **`grantRules` enforces the canonical session shape and nothing else** — the skeleton, not the organs.
   Term validation is URP's own init guards. Its monotonic `_grantNonce` becomes the session salt, so every
   grant yields a distinct permission id that never recurs.
@@ -149,9 +146,10 @@ AGW follows the core/gateway naming standard (`docs-internal/sdk-first-changes/N
   otherwise be granted with no URP gate on that action at all.
 - **`revokeRules` / `revokeAllRules` must have nothing on them that can fail.** No guard, no probe, no extra
   external call. Blockable revocation is the one regression these functions can develop.
-- **URP's `checkAction` makes no external calls.** It runs *before* the session signature is verified, on
-  unauthenticated calldata from an arbitrary caller; its safety rests on having no external calls, all
-  effects last, and reverting on every failure. Do not wrap its `abi.decode` in `try/catch` to name an
+- **URP's `checkAction` makes no external calls.** It runs *before* the session validator is consulted, and
+  must remain safe on arbitrary calldata (the wallet's own agent check precedes the engine, but URP does not
+  rely on it); its safety rests on having no external calls, all effects last, and reverting on every
+  failure. Do not wrap its `abi.decode` in `try/catch` to name an
   error — that introduces the external call the argument forbids.
 - **Gate 12 (payload must be a multicall) is not a format check.** It confines the agent to the one CEA
   branch whose entries gates 13–16 can walk; the other branches bypass the allow-list, beneficiary pin and
@@ -221,9 +219,9 @@ AGW follows the core/gateway naming standard (`docs-internal/sdk-first-changes/N
 
 ## Standing test rules
 
-1. **Every negative test names its expected error.** Three documented exceptions only: URP gate 4 case (d)
-   (correct-length, malformed-offset body), validator P-05 — both assert "reverts" because both fail at
-   the same un-named `abi.decode` step — and the **malformed-envelope rejection test**.
+1. **Every negative test names its expected error.** Two documented exceptions only: URP gate 4 case (d)
+   (correct-length, malformed-offset body), which asserts "reverts" because it fails at an un-named
+   `abi.decode` step, and the **malformed-envelope rejection test**.
 
    **The envelope exception, restated for `abi.encode(string chainNamespace, bytes body)`.** On an **uninitialised**
    config, an envelope whose outer `(string, bytes)` decode fails — a `(uint8, bytes32, bytes)` header,
@@ -262,7 +260,7 @@ AGW follows the core/gateway naming standard (`docs-internal/sdk-first-changes/N
 Every suite extends `BaseTest` (`test/Base.t.sol`), which deploys the real engine, validator, URP, wallet
 implementation and an ERC-1967 factory proxy, then hands out wallets via `newWallet(owner)` — the real
 `deployWallet` path, not a simulated factory. It also carries the canonical session builder, the outbound
-request builder, the gate-naming helper, the USV observers and the call recorder. Test ids (`T-`, `W-`,
+request builder, the gate-naming helper, the agent-config helper and the call recorder. Test ids (`T-`, `W-`,
 `U-`, `P-`, `S-`) come from the PRDs and appear in test names and comments.
 
 ## Toolchain pins (facts, not preferences)
@@ -295,10 +293,10 @@ conveniences: the artifact-based storage-layout and selector-set assertions depe
 | `src/` (root) | `AGW.sol`, `AGWFactory.sol` |
 | `src/policies/` | `UniversalRulesPolicy.sol` (URP) |
 | `src/validators/` | `AgentValidator.sol` |
-| `src/interfaces/` | `IUniversalRulesPolicy`, `IAgentValidator`, `IAGWFactory`, `IAGW`, `IAGWInit`, gateway + module interfaces |
-| `src/libraries/` | `Types.sol` (the policy's terms/config types, `RulesType`, `VmFamily`, `OwnerIntent` + EIP-712 typehashes, and the temporary gateway/core mirrors), `Errors.sol` (one error library per contract), `PushChainLib` (mode/VM derivation), `OwnerAuthLib` (owner-signature check shared by factory and wallet), `ModeLib`, `ExecutionLib` |
+| `src/interfaces/` | `IUniversalRulesPolicy`, `IAgentValidator`, `IAGWFactory`, `IAGW`, `IAGWInit`, `ISmartSessionConfigReader` (the one engine view upstream omits), gateway + module interfaces |
+| `src/libraries/` | `Types.sol` (the policy's terms/config types, `RulesType`, `VmFamily`, `OwnerIntent` + EIP-712 typehashes, and the temporary gateway/core mirrors), `Errors.sol` (one error library per contract), `PushChainLib` (mode/VM derivation), `OwnerAuthLib` (owner-signature check shared by factory and wallet), `AgentConfigLib` (the one decoder of the agent config, shared by validator and wallet), `ModeLib`, `ExecutionLib` |
 | `test/Base.t.sol` | Shared harness — every suite extends `BaseTest` |
-| `test/unit/`, `test/integration/`, `test/mocks/` | Suites numbered by area (`1_factory` … `27_naming`; slots 7, 17, 18 are reserved for the D3/B2 suites), end-to-end flows, observers |
+| `test/unit/`, `test/integration/`, `test/mocks/` | Suites numbered by area (`1_factory` … `27_naming`; slot 18 is reserved for the B2 suite), end-to-end flows, observers |
 | `script/check-execute.sh`, `script/snapshot-execute.sh` | The `execute()` source pin and its advisory gas check |
 | `demo/`, `demo-native/` | Cross-chain and Push-native demos — **frozen** against the deployed v1 contracts; own `justfile`, Foundry profile and `state/` ledger |
 | `script/Deploy.s.sol` | The five-contract deployment, in dependency order |

@@ -61,9 +61,11 @@ interface IAGW {
 
     /// @notice An agent request passed validation and was dispatched.
     /// @dev    Rules-level attribution on the Push side, without touching the gateway's own frozen
-    ///         event. The operation hash is what ties this record to the exact signed request the
-    ///         agent produced.
-    event RulesActionAuthorized(bytes32 indexed rulesId, uint192 indexed nonceKey, uint64 nonceSeq, bytes32 opHash);
+    ///         event. `agent` is the sender (always equal to the rules set's agent). `callsHash` is
+    ///         `keccak256(executionCalldata)` — what ties this record to the exact call executed.
+    ///         A deliberate wire-format break from the earlier `(rulesId, nonceKey, nonceSeq, opHash)`
+    ///         shape; it ships with the new deployment.
+    event RulesActionAuthorized(bytes32 indexed rulesId, address indexed agent, bytes32 callsHash);
 
     // ═══════════════════════════════ AGW_2: OWNER DOOR ═══════════════════════════════
 
@@ -82,21 +84,17 @@ interface IAGW {
 
     // ═══════════════════════════════ AGW_3: AGENT DOOR ═══════════════════════════════
 
-    /// @notice The agent door. Permissionless to call; a request is authorised by its signature, its
-    ///         nonce and the bound operation hash, never by the caller.
-    function executeWithSession(
-        address validator,
-        bytes32 mode,
-        bytes calldata executionCalldata,
-        bytes calldata signature,
-        uint192 nonceKey,
-        uint64 nonceSeq,
-        uint48 requestExpiry
-    ) external;
+    /// @notice The agent door. Callable only by the agent `rulesId` names — a Push address (an EOA, or
+    ///         the UEA of an external key); every call is checked by the rules set's policy.
+    function executeAsAgent(bytes32 rulesId, bytes32 mode, bytes calldata executionCalldata) external;
+
+    /// @notice The agent a rules set names on this wallet, or zero if it names none (unknown or
+    ///         revoked id, non-canonical session validator, malformed config).
+    function agentOf(bytes32 rulesId) external view returns (address);
 
     // ═══════════════════════════════ AGW_4: RULES LIFECYCLE ═══════════════════════════════
 
-    /// @notice Grants one rules set to an agent key. Owner or the wallet itself.
+    /// @notice Grants one rules set to an agent. Owner or the wallet itself.
     /// @return rulesId  The engine's `permissionId` for the new rules set.
     function grantRules(Session calldata session) external returns (bytes32 rulesId);
 
@@ -138,7 +136,8 @@ interface IAGW {
     /// @notice The factory that deployed this wallet.
     function factory() external view returns (address);
 
-    /// @notice Next expected sequence number in `nonceKey`'s replay lane.
+    /// @notice Next expected sequence number in an owner lane (`OWNER_LANE_FLAG` set), consumed by
+    ///         `executeWithSig`.
     function getNonce(uint192 nonceKey) external view returns (uint64);
 
     /// @notice The salt the next grant will use.
@@ -157,7 +156,8 @@ interface IAGW {
     /// @notice The canonical action policy (URP) every rules set on this wallet must name.
     function RULES_POLICY() external view returns (address);
 
-    /// @notice The canonical session validator every rules set on this wallet must name.
+    /// @notice The canonical session validator every rules set on this wallet must name — the sender
+    ///         validator that confirms the caller is the rules set's agent.
     function SESSION_VALIDATOR() external view returns (address);
 
     /// @notice The Push-side gateway this wallet's agents send through.

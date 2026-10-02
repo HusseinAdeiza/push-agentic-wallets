@@ -6,52 +6,63 @@ import { UniversalRulesPolicyErrors } from "../../src/libraries/Errors.sol";
 import { Vm } from "forge-std/Vm.sol";
 
 import { BaseTest } from "../Base.t.sol";
-import { AllowedCall, Config, OWNER_LANE_FLAG, OwnerIntent, RulesType } from "../../src/libraries/Types.sol";
+import {
+    AllowedCall,
+    AmountRule,
+    ArgPin,
+    Config,
+    NativeConfig,
+    OWNER_LANE_FLAG,
+    OwnerIntent
+} from "../../src/libraries/Types.sol";
 import { AGW } from "../../src/AGW.sol";
 import { IAGW } from "../../src/interfaces/IAGW.sol";
 import { AGWErrors } from "../../src/libraries/Errors.sol";
+import { AgentValidator } from "../../src/validators/AgentValidator.sol";
 import { ModeLib, ModeCode } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib, Execution } from "../../src/libraries/ExecutionLib.sol";
 import { IUniversalRulesPolicy } from "../../src/interfaces/IUniversalRulesPolicy.sol";
-import { UniversalOutboundTxRequest, Multicall, MULTICALL_SELECTOR } from "../../src/libraries/Types.sol";
+import { Multicall } from "../../src/libraries/Types.sol";
 import { Session, PermissionId, ConfigId, SmartSessionMode } from "smartsessions/DataTypes.sol";
 import { ISmartSession } from "smartsessions/ISmartSession.sol";
+import { ISessionValidator } from "smartsessions/interfaces/ISessionValidator.sol";
+import { IdLib } from "smartsessions/lib/IdLib.sol";
 import { IERC7579Account } from "erc7579/interfaces/IERC7579Account.sol";
 import { IActionPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { IERC165 } from "forge-std/interfaces/IERC165.sol";
 import { PackedUserOperation } from "account-abstraction/interfaces/PackedUserOperation.sol";
+import { ReentrancyGuardTransient } from "@openzeppelin/contracts/utils/ReentrancyGuardTransient.sol";
 import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
 
 /**
- * @notice AGW — Phase 3c: the agent door.
+ * @notice AGW — the agent door, `executeAsAgent`.
  *
- * @dev    Every test here drives the REAL path: real engine, real URP, real validator, real
- *         signatures. Nothing is mocked except where a test needs a specific failure the real
- *         components cannot produce (a verdict-returning validator for W-07, a reverting target for
- *         W-18) — and those are OBSERVERS of the wallet's reaction, never oracles for the
- *         behaviour under test.
+ * @dev    Every test here drives the REAL path: real engine, real URP, real sender validator. The
+ *         agent is a Push address and calls the door itself; the wallet checks it is the agent the
+ *         rules set names, writes it into the engine's signature field, and the validator confirms
+ *         it. Nothing is mocked except where a test needs a failure the real components cannot
+ *         produce (a fixed-verdict policy for W-07, a reverting target for W-18, a re-entering
+ *         target for W-05) — and those are OBSERVERS of the wallet's reaction, never oracles.
  *
  * @dev    EXACTLY ONE selector-less `vm.expectRevert()` exists in this file, and it is bare by
  *         construction: `test_W03_OpHash_Field6_MalformedBatchShapeIsRejected`, where the ENGINE's
  *         batch decoder rejects a shape mismatch and reverts WITHOUT DATA. Every other negative
- *         test names its error, because a bare assertion cannot distinguish "the signature rejected
- *         the flipped hash" from "the request was malformed some other way" — a distinction that
- *         already hid one real coverage gap in this file (see W-09).
+ *         test names its error.
  *
  *         The recurring named expectations, and what each proves:
- *           · `ValidationFailed(address(1))` — a SIGNATURE-level rejection. The engine returns a
- *             failure verdict rather than reverting; the wallet converts it. This is the expectation
- *             for every W-03 field flip.
- *           · `InvalidPermissionId(pid)`     — the engine does not know that mandate (revoked, or
- *             never granted on this wallet).
- *           · `NoPoliciesSet(pid)`           — the engine's minimum-one-policy floor.
- *           · `expectUrpGate(...)`          — a URP gate, seen through the engine's 32-byte
+ *           · `CallerIsNotAgent(pid, caller)` — the wallet's own pre-check: the caller is not the
+ *             agent `pid` names here (including an unknown, revoked or non-canonical id).
+ *           · `NoPoliciesSet(pid)`            — the engine's minimum-one-policy floor.
+ *           · `expectUrpGate(...)`           — a URP gate, seen through the engine's 32-byte
  *             rewrap as `PolicyCheckReverted`. Names WHICH gate fired.
  */
 contract PushAgentWalletAgentDoorTest is BaseTest {
     AGW internal wallet;
     address internal WALLET_OWNER;
+    uint256 internal walletOwnerPk;
 
+    /// @dev The agent's Push address. Its key is used only by X17, to prove an agent-signed
+    ///      OwnerIntent is refused; the agent door itself verifies no signature.
     address internal agentAddr;
     uint256 internal agentPk;
 
@@ -62,11 +73,27 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
     bytes4 internal constant SWAP_SELECTOR = bytes4(keccak256("swap(uint256,address)"));
     uint16 internal constant BENEFICIARY_OFFSET = 36;
 
+    /**
+     * @dev Steady-state gas of one universal `executeAsAgent` — warm wallet, warm engine and URP rows,
+     *      the gateway a call recorder — measured at 41,016 on forge 1.5.1-stable with the pinned
+     *      toolchain, plus 10%. It measures the door, the engine and URP, not a real gateway's work.
+     */
+    uint256 internal constant AGENT_DOOR_GAS_BUDGET = 45_118;
+
+    /**
+     * @dev The same call under `--isolate`, which `--gas-report` switches on: every top-level call is
+     *      then its own transaction, paying the 21,000 intrinsic cost, its calldata and cold access
+     *      again. Measured at 134,316, plus 10%.
+     */
+    uint256 internal constant AGENT_DOOR_GAS_BUDGET_ISOLATED = 147_748;
+
     bytes32 internal permissionId;
 
     function setUp() public override {
         super.setUp();
-        WALLET_OWNER = makeAddr("walletOwner");
+        // makeAddrAndKey("walletOwner") is the same address makeAddr("walletOwner") yields; the key
+        // lets the owner-lane test sign an OwnerIntent.
+        (WALLET_OWNER, walletOwnerPk) = makeAddrAndKey("walletOwner");
         (agentAddr, agentPk) = ecdsaKey("agentSigner");
 
         CEA = makeAddr("destinationAccount");
@@ -109,8 +136,12 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
     }
 
     function _grant() internal returns (bytes32) {
+        return _grantFor(agentAddr);
+    }
+
+    function _grantFor(address agent) internal returns (bytes32) {
         vm.prank(WALLET_OWNER);
-        return wallet.grantRules(canonicalSession(ecdsaConfig(agentAddr), _urpInitData()));
+        return wallet.grantRules(canonicalSession(agentConfig(agent), _urpInitData()));
     }
 
     function _calls() internal view returns (Multicall[] memory c) {
@@ -126,616 +157,408 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         );
     }
 
+    function _ecd() internal view returns (bytes memory) {
+        return _executionCalldata(1 ether, 0);
+    }
+
     function _singleMode() internal pure returns (bytes32) {
         return ModeCode.unwrap(ModeLib.encodeSimpleSingle());
     }
 
-    struct Req {
-        address validator;
-        bytes32 mode;
-        bytes executionCalldata;
-        uint192 nonceKey;
-        uint64 nonceSeq;
-        uint48 requestExpiry;
-        bytes32 pid;
+    function _submitAs(address caller, bytes32 pid, bytes32 mode, bytes memory ecd) internal {
+        vm.prank(caller);
+        wallet.executeAsAgent(pid, mode, ecd);
     }
 
-    function _defaultReq() internal view returns (Req memory r) {
-        r.validator = address(engine);
-        r.mode = _singleMode();
-        r.executionCalldata = _executionCalldata(1 ether, 0);
-        r.nonceKey = 0;
-        r.nonceSeq = 0;
-        r.requestExpiry = 0;
-        r.pid = permissionId;
-    }
-
-    /// @dev The ten-field hash, recomputed INDEPENDENTLY of the contract, so a test that signs is
-    ///      asserting the contract's layout rather than inheriting it.
-    function _opHash(Req memory r) internal view returns (bytes32) {
-        return keccak256(
-            abi.encode(
-                keccak256("AGW.Op.v3"),
-                block.chainid,
-                address(wallet),
-                r.validator,
-                r.pid,
-                r.mode,
-                keccak256(r.executionCalldata),
-                r.nonceKey,
-                r.nonceSeq,
-                r.requestExpiry
-            )
-        );
-    }
-
-    /// @dev Sign the ten-field hash and wrap it in the engine's USE-mode wire format:
-    ///      mode byte ‖ permissionId ‖ sessionSig (EncodeLib.sol:29-37).
-    function _signed(Req memory r) internal view returns (bytes memory) {
-        bytes32 h = _opHash(r);
-        (uint8 v, bytes32 rr, bytes32 s) = vm.sign(agentPk, h);
-        return abi.encodePacked(uint8(SmartSessionMode.USE), r.pid, abi.encodePacked(rr, s, v));
-    }
-
-    function _submit(Req memory r, bytes memory signature) internal {
-        vm.prank(RELAYER);
-        wallet.executeWithSession(
-            r.validator, r.mode, r.executionCalldata, signature, r.nonceKey, r.nonceSeq, r.requestExpiry
-        );
-    }
-
-    /// @dev Sign and submit a well-formed request. The gateway is a recorder so dispatch succeeds.
-    function _run(Req memory r) internal {
+    /// @dev Submit a well-formed request as the agent. The gateway is a recorder so dispatch succeeds.
+    function _run(bytes32 pid, bytes memory ecd) internal {
         etchCallRecorder(GATEWAY);
         vm.store(GATEWAY, bytes32(uint256(0)), bytes32(0));
-        _submit(r, _signed(r));
+        _submitAs(agentAddr, pid, _singleMode(), ecd);
     }
 
-    function _configId() internal view returns (ConfigId) {
-        bytes32 actionId = keccak256(abi.encodePacked(GATEWAY, SEND_OUTBOUND_SELECTOR));
-        bytes32 actionPolicyId = keccak256(abi.encodePacked(permissionId, actionId));
+    function _run() internal {
+        _run(permissionId, _ecd());
+    }
+
+    function _configIdOf(bytes32 pid, address target, bytes4 selector) internal view returns (ConfigId) {
+        bytes32 actionId = keccak256(abi.encodePacked(target, selector));
+        bytes32 actionPolicyId = keccak256(abi.encodePacked(pid, actionId));
         return ConfigId.wrap(keccak256(abi.encodePacked(address(wallet), actionPolicyId)));
     }
 
+    function _configId() internal view returns (ConfigId) {
+        return _configIdOf(permissionId, GATEWAY, SEND_OUTBOUND_SELECTOR);
+    }
+
+    function _spentOf(bytes32 pid) internal view returns (uint256) {
+        return urp.getConfig(_configIdOf(pid, GATEWAY, SEND_OUTBOUND_SELECTOR), address(wallet)).spent;
+    }
+
     function _spent() internal view returns (uint256) {
-        return urp.getConfig(_configId(), address(wallet)).spent;
+        return _spentOf(permissionId);
+    }
+
+    /// @dev The exact operation the wallet must hand the engine for `(pid, mode, ecd)` from `caller`.
+    function _expectedOp(bytes32 pid, bytes32 mode, bytes memory ecd, address caller)
+        internal
+        view
+        returns (PackedUserOperation memory op)
+    {
+        op.sender = address(wallet);
+        op.nonce = 0;
+        op.initCode = "";
+        op.callData = abi.encodeWithSelector(AGW.execute.selector, mode, ecd);
+        op.accountGasLimits = bytes32(0);
+        op.preVerificationGas = 0;
+        op.gasFees = bytes32(0);
+        op.paymasterAndData = "";
+        op.signature = abi.encodePacked(SmartSessionMode.USE, pid, caller);
+    }
+
+    /// @dev A session on one native action, with an arbitrary policy and config. For tests that
+    ///      enable sessions on the engine DIRECTLY, bypassing `grantRules`.
+    function _directSession(
+        address sessionValidator,
+        bytes memory config,
+        address target,
+        bytes4 selector,
+        address policy,
+        bytes memory policyInitData,
+        bytes32 salt
+    ) internal view returns (Session memory s) {
+        s = sessionWithPolicy(policy, config, policyInitData);
+        s.sessionValidator = ISessionValidator(sessionValidator);
+        s.actions[0].actionTarget = target;
+        s.actions[0].actionTargetSelector = selector;
+        s.salt = salt;
+    }
+
+    /// @dev The owner enables `s` on the engine DIRECTLY, through the owner door — the legitimate
+    ///      path that bypasses `grantRules` and its shape checks entirely.
+    function _enableDirect(Session memory s) internal returns (bytes32 pid) {
+        Session[] memory arr = new Session[](1);
+        arr[0] = s;
+        vm.prank(WALLET_OWNER);
+        wallet.execute(
+            _singleMode(),
+            ExecutionLib.encodeSingle(address(engine), 0, abi.encodeCall(ISmartSession.enableSessions, (arr)))
+        );
+        pid = PermissionId.unwrap(IdLib.toPermissionIdMemory(s));
+        assertTrue(engine.isPermissionEnabled(PermissionId.wrap(pid), address(wallet)), "enabled directly");
     }
 
     // ═══════════════════════════ the happy path ═══════════════════════════
 
     function test_HappyPath_ValidatesAndDispatches() public {
-        Req memory r = _defaultReq();
-        _run(r);
+        _run();
 
         assertEq(callsRecorded(GATEWAY), 1, "the gateway was called exactly once");
-        assertEq(wallet.getNonce(0), 1, "the lane advanced");
         assertEq(_spent(), 1 ether, "URP metered the bridged amount");
     }
 
     // ═══════════════════════════════════ W-19 ═══════════════════════════════════
 
-    /// PERMISSIONLESS: any unrelated EOA can relay, and the owner can self-relay. The caller is
-    /// never the authority.
-    function test_W19_Permissionless_Relay() public {
+    /// ONLY THE AGENT: every other caller — the owner included — is refused before the engine runs,
+    /// and nothing moves. Then the agent itself succeeds.
+    function test_W19_OnlyTheAgentMayCall() public {
         etchCallRecorder(GATEWAY);
+        bytes memory ecd = _ecd();
 
-        Req memory r = _defaultReq();
-        bytes memory sig = _signed(r);
+        address[8] memory callers = [
+            WALLET_OWNER,
+            OWNER,
+            RELAYER,
+            makeAddr("stranger"),
+            address(factory),
+            address(urp),
+            address(engine),
+            address(validator)
+        ];
+        for (uint256 i; i < callers.length; ++i) {
+            vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, permissionId, callers[i]));
+            _submitAs(callers[i], permissionId, _singleMode(), ecd);
+        }
 
-        address stranger = makeAddr("someRandomRelayer");
-        vm.prank(stranger);
-        wallet.executeWithSession(
-            r.validator, r.mode, r.executionCalldata, sig, r.nonceKey, r.nonceSeq, r.requestExpiry
-        );
-        assertEq(wallet.getNonce(0), 1, "a stranger relayed successfully");
+        assertEq(callsRecorded(GATEWAY), 0, "nothing dispatched");
+        assertEq(_spent(), 0, "nothing metered");
 
-        // the owner can self-relay too
-        Req memory r2 = _defaultReq();
-        r2.nonceSeq = 1;
-        bytes memory sig2 = _signed(r2);
-        vm.prank(WALLET_OWNER);
-        wallet.executeWithSession(
-            r2.validator, r2.mode, r2.executionCalldata, sig2, r2.nonceKey, r2.nonceSeq, r2.requestExpiry
-        );
-        assertEq(wallet.getNonce(0), 2, "the owner self-relayed");
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
+        assertEq(callsRecorded(GATEWAY), 1, "the agent itself succeeds");
+    }
+
+    function testFuzz_W19_anyNonAgentRefused(address caller) public {
+        vm.assume(caller != agentAddr);
+        bytes memory ecd = _ecd();
+
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, permissionId, caller));
+        _submitAs(caller, permissionId, _singleMode(), ecd);
+
+        assertEq(_spent(), 0, "nothing metered");
     }
 
     // ═══════════════════════════════════ W-02 ═══════════════════════════════════
 
     /**
-     * W-02 ⚠️ NEVER-DELETE — THE BANKED-REQUEST GUARANTEE.
+     * W-02 ⚠️ NEVER-DELETE — A REQUEST DIES WITH ITS RULES SET.
      *
-     * Sign a valid request under mandate A. Revoke A, regrant BYTE-IDENTICAL terms as mandate B.
-     * The banked request must now fail — because `_grantNonce` gave B a different salt, hence a
-     * different permissionId, which is bound into op-hash field 5. Without field 5 (§11 item 8) the
-     * old signature would still verify against the new mandate and charge the new budget.
+     * A request built for rules set A. Revoke A, regrant BYTE-IDENTICAL terms as rules set B. The
+     * request for A must now fail and must never charge B. Two mechanisms carry it: removal clears
+     * A's agent on the engine, so `agentOf(A)` is zero and the agent check refuses; and the wallet's
+     * grant nonce salts B with a fresh id, so nothing addressed to A can ever reach B.
      */
     function test_W02_BankedRequest_FailsAfterRegrant() public {
         etchCallRecorder(GATEWAY);
+        bytes memory banked = _ecd();
 
-        // the agent banks a valid, signed request
-        Req memory banked = _defaultReq();
-        bytes memory bankedSig = _signed(banked);
-
-        // the owner revokes and regrants IDENTICAL terms
         vm.startPrank(WALLET_OWNER);
         wallet.revokeRules(permissionId);
-        bytes32 newPid = wallet.grantRules(canonicalSession(ecdsaConfig(agentAddr), _urpInitData()));
+        bytes32 newPid = wallet.grantRules(canonicalSession(agentConfig(agentAddr), _urpInitData()));
         vm.stopPrank();
 
-        assertTrue(newPid != permissionId, "the regranted mandate has a NEW id");
+        assertTrue(newPid != permissionId, "the regranted rules set has a NEW id");
+        assertEq(wallet.agentOf(permissionId), address(0), "the revoked id names no agent");
+        assertEq(wallet.agentOf(newPid), agentAddr, "the new id names the agent");
 
-        // the banked request now fails
-        vm.prank(RELAYER);
-        // The regranted mandate has a new id, so the banked prefix names a permission the
-        // engine no longer knows.
-        vm.expectRevert(
-            abi.encodeWithSelector(ISmartSession.InvalidPermissionId.selector, PermissionId.wrap(banked.pid))
-        );
-        wallet.executeWithSession(
-            banked.validator,
-            banked.mode,
-            banked.executionCalldata,
-            bankedSig,
-            banked.nonceKey,
-            banked.nonceSeq,
-            banked.requestExpiry
-        );
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, permissionId, agentAddr));
+        _submitAs(agentAddr, permissionId, _singleMode(), banked);
 
         assertEq(callsRecorded(GATEWAY), 0, "nothing dispatched");
+        assertEq(_spentOf(newPid), 0, "the new rules set's budget is untouched");
 
-        // and the NEW permission's counters are untouched
-        bytes32 actionId = keccak256(abi.encodePacked(GATEWAY, SEND_OUTBOUND_SELECTOR));
-        ConfigId newCfg =
-            ConfigId.wrap(keccak256(abi.encodePacked(address(wallet), keccak256(abi.encodePacked(newPid, actionId)))));
-        assertEq(urp.getConfig(newCfg, address(wallet)).spent, 0, "the new mandate's budget is untouched");
+        _submitAs(agentAddr, newPid, _singleMode(), banked);
+        assertEq(_spentOf(newPid), 1 ether, "the same request works under the new id");
     }
 
     // ═══════════════════════════════════ W-03 ═══════════════════════════════════
 
-    /**
-     * W-03 — the op hash binds all TEN fields. Flip each independently; each must fail.
-     *
-     * The mechanism: the agent signs `_opHash(r)`. If the wallet recomputes a DIFFERENT hash from
-     * the arrived parameters, the engine's signature check fails. So flipping a field in the
-     * submitted parameters — while keeping the signature over the ORIGINAL — must break validation.
-     *
-     * Fields 1 (domain), 2 (chainid) and 3 (address(this)) cannot be flipped through the door's
-     * parameters; they are asserted structurally at the end.
-     */
-    /**
-     * Field 4 binds the VALIDATOR ADDRESS, so a signature authorising validator A cannot be
-     * replayed against validator B.
-     *
-     * The second validator VERIFIES THE HASH rather than rubber-stamping — an always-succeed mock
-     * would accept anything, and the test could not fail. It recomputes the ten-field hash with
-     * ITSELF as field 4 and compares against the opHash the wallet passed in: they differ, because
-     * the wallet computed field 4 from the submitted validator while the agent signed for the
-     * engine.
-     */
-    function test_W03_OpHash_Field4_Validator() public {
-        HashCheckingValidator alt = new HashCheckingValidator();
-        vm.prank(WALLET_OWNER);
-        wallet.installModule(1, address(alt), "");
+    /// The request names its rules set, and the agent must be the one THAT rules set names: an agent
+    /// can never act under, or charge, another agent's rules set.
+    function test_W03_PermissionIdBindsTheAgent() public {
+        address agentB = makeAddr("agentB");
+        bytes32 pidB = _grantFor(agentB);
+        bytes memory ecd = _ecd();
 
-        Req memory r = _defaultReq();
-        bytes memory sig = _signed(r); // signed with validator == engine in field 4
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, pidB, agentAddr));
+        _submitAs(agentAddr, pidB, _singleMode(), ecd);
 
-        // What the agent actually signed:
-        alt.expectHash(_opHash(r));
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, permissionId, agentB));
+        _submitAs(agentB, permissionId, _singleMode(), ecd);
 
-        // Submitted against a DIFFERENT validator: the wallet now computes field 4 = alt, so the
-        // opHash it hands the validator differs from the one the agent signed.
-        r.validator = address(alt);
-        vm.prank(RELAYER);
-        vm.expectRevert(HashCheckingValidator.HashMismatch.selector);
-        wallet.executeWithSession(
-            r.validator, r.mode, r.executionCalldata, sig, r.nonceKey, r.nonceSeq, r.requestExpiry
-        );
-    }
+        etchCallRecorder(GATEWAY);
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
+        assertEq(_spent(), 1 ether, "A acts under its own id");
+        assertEq(_spentOf(pidB), 0, "and B's budget did not move");
 
-    function test_W03_OpHash_Field5_PermissionId() public {
-        // grant a second mandate, so a real second id exists
-        vm.prank(WALLET_OWNER);
-        bytes32 otherPid = wallet.grantRules(canonicalSession(ecdsaConfig(agentAddr), _urpInitData()));
-
-        Req memory r = _defaultReq();
-        bytes32 h = _opHash(r); // hash commits to permissionId A
-        (uint8 v, bytes32 rr, bytes32 s) = vm.sign(agentPk, h);
-
-        // ...but the wire prefix names permissionId B. The wallet reads field 5 from the prefix, so
-        // it recomputes a different hash and the signature fails.
-        bytes memory tampered = abi.encodePacked(uint8(SmartSessionMode.USE), otherPid, abi.encodePacked(rr, s, v));
-
-        // The engine returns FAILURE (it does not revert) and the wallet converts that to
-        // ValidationFailed(address(1)). Naming it is what proves the SIGNATURE rejected the flipped
-        // hash, rather than the request being malformed in some other way.
-        vm.prank(RELAYER);
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.ValidationFailed.selector, address(1)));
-        wallet.executeWithSession(
-            r.validator, r.mode, r.executionCalldata, tampered, r.nonceKey, r.nonceSeq, r.requestExpiry
-        );
-    }
-
-    /**
-     * Field 6 binds the WHOLE ModeCode, not just the two bytes the door gates on.
-     *
-     * THE OBVIOUS TEST IS WRONG, and mutation proved it: flipping single -> batch reverts at step 9
-     * regardless of whether `mode` is in the hash at all, so a field-6 test built that way passes
-     * against a hash that omits field 6 entirely — verified.
-     *
-     * This flips the ModePayload instead: 22 bytes the wallet never inspects and the engine never
-     * gates on. If the mode were not hash-bound, this request would sail through. The ONLY thing
-     * that can reject it is the signature over field 6.
-     */
-    function test_W03_OpHash_Field6_Mode() public {
-        Req memory r = _defaultReq();
-        bytes memory sig = _signed(r);
-
-        // Same CALLTYPE_SINGLE + EXECTYPE_DEFAULT; a different ModePayload.
-        r.mode = bytes32(abi.encodePacked(bytes1(0x00), bytes1(0x00), bytes4(0), bytes4(0), bytes22(uint176(0xABCDEF))));
-        assertTrue(wallet.supportsExecutionMode(r.mode), "the flipped mode is still an ACCEPTED mode");
-
-        vm.prank(RELAYER);
-        // Signature-level rejection: the engine returns FAILURE (it does not revert) and the
-        // wallet converts that verdict to ValidationFailed(address(1)). Naming it proves the
-        // SIGNATURE rejected the flip, not that the request was malformed some other way.
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.ValidationFailed.selector, address(1)));
-        wallet.executeWithSession(
-            r.validator, r.mode, r.executionCalldata, sig, r.nonceKey, r.nonceSeq, r.requestExpiry
-        );
+        _submitAs(agentB, pidB, _singleMode(), _executionCalldata(2 ether, 0));
+        assertEq(_spentOf(pidB), 2 ether, "B acts under its own id");
+        assertEq(_spent(), 1 ether, "and A's budget did not move");
     }
 
     /**
      * A MALFORMED batch — batch mode paired with single-encoded calldata — is rejected by the
-     * ENGINE's batch decoder, on SHAPE, before the wallet's step-9 gate is reached.
+     * ENGINE's batch decoder, on SHAPE, before the wallet's mode gate is reached.
      *
-     * THIS TEST WAS ONCE MISNAMED, and the misnaming hid a real gap. It used to be called
-     * "...BatchIsRejectedByTheEngineFirst" and was read as evidence that the wallet's call-type gate
-     * is unreachable — which is FALSE. The engine ACCEPTS batch mode
-     * (`SmartSession.sol:280-288` routes it to `checkBatch7579Exec`); it was only the malformed
-     * SHAPE that failed here. W-09 now sends a WELL-FORMED batch and proves the wallet's gate fires
-     * on its own, with its own named error.
+     * The engine ACCEPTS batch mode (`SmartSession.sol:280-288` routes it to `checkBatch7579Exec`);
+     * it is only the malformed SHAPE that fails here. W-09 sends a WELL-FORMED batch and proves the
+     * wallet's gate fires on its own, with its own named error.
      *
-     * What this test actually pins: the engine rejects a shape mismatch, and it does so without
-     * revert data — the one bare expectRevert in this file.
+     * What this test pins: the engine rejects a shape mismatch, and it does so without revert data —
+     * the one bare expectRevert in this file.
      */
     function test_W03_OpHash_Field6_MalformedBatchShapeIsRejected() public {
-        Req memory r = _defaultReq();
-        r.mode = ModeCode.unwrap(ModeLib.encodeSimpleBatch());
-        bytes memory sig = _signed(r); // correctly signed FOR batch
+        bytes32 batchMode = ModeCode.unwrap(ModeLib.encodeSimpleBatch());
+        bytes memory ecd = _ecd();
 
-        vm.prank(RELAYER);
         // BARE BY CONSTRUCTION (1 of 1 in this file — see the header). Batch mode paired with
         // single-encoded calldata fails the ENGINE's batch decoder on SHAPE, and that decoder
         // reverts without data. There is no named error to expect.
         vm.expectRevert();
-        wallet.executeWithSession(
-            r.validator, r.mode, r.executionCalldata, sig, r.nonceKey, r.nonceSeq, r.requestExpiry
-        );
+        _submitAs(agentAddr, permissionId, batchMode, ecd);
 
         // The wallet's own gate is still live and reachable — proven by a mode the engine accepts
         // but the wallet refuses: EXECTYPE_TRY with a single call type.
-        Req memory t = _defaultReq();
-        t.mode = bytes32(abi.encodePacked(bytes1(0x00), bytes1(0x01), bytes4(0), bytes4(0), bytes22(0)));
-        assertFalse(wallet.supportsExecutionMode(t.mode), "try-exec is not an accepted mode");
-    }
-
-    function test_W03_OpHash_Field7_ExecutionCalldata() public {
-        Req memory r = _defaultReq();
-        bytes memory sig = _signed(r);
-
-        r.executionCalldata = _executionCalldata(2 ether, 0); // a different amount, one layer down
-        vm.prank(RELAYER);
-        // Signature-level rejection: the engine returns FAILURE (it does not revert) and the
-        // wallet converts that verdict to ValidationFailed(address(1)). Naming it proves the
-        // SIGNATURE rejected the flip, not that the request was malformed some other way.
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.ValidationFailed.selector, address(1)));
-        wallet.executeWithSession(
-            r.validator, r.mode, r.executionCalldata, sig, r.nonceKey, r.nonceSeq, r.requestExpiry
-        );
-    }
-
-    function test_W03_OpHash_Field8_NonceKey() public {
-        Req memory r = _defaultReq();
-        bytes memory sig = _signed(r);
-
-        r.nonceKey = 7; // a different lane, whose position also starts at 0 so step 3 still passes
-        vm.prank(RELAYER);
-        // Signature-level rejection: the engine returns FAILURE (it does not revert) and the
-        // wallet converts that verdict to ValidationFailed(address(1)). Naming it proves the
-        // SIGNATURE rejected the flip, not that the request was malformed some other way.
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.ValidationFailed.selector, address(1)));
-        wallet.executeWithSession(
-            r.validator, r.mode, r.executionCalldata, sig, r.nonceKey, r.nonceSeq, r.requestExpiry
-        );
-    }
-
-    function test_W03_OpHash_Field9_NonceSeq() public {
-        // burn position 0 so position 1 is the expected one
-        _run(_defaultReq());
-
-        Req memory r = _defaultReq();
-        r.nonceSeq = 1;
-        bytes memory sig = _signed(r);
-
-        // sign for seq 1 but... the hash commits to 1, and we submit 1. To flip the FIELD we must
-        // sign a different value: sign seq 2's hash and submit as seq 1.
-        Req memory other = _defaultReq();
-        other.nonceSeq = 2;
-        bytes memory wrongSig = _signed(other);
-        sig; // the correct signature exists; we deliberately submit the other one
-
-        vm.prank(RELAYER);
-        // Signature-level rejection: the engine returns FAILURE (it does not revert) and the
-        // wallet converts that verdict to ValidationFailed(address(1)). Naming it proves the
-        // SIGNATURE rejected the flip, not that the request was malformed some other way.
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.ValidationFailed.selector, address(1)));
-        wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, wrongSig, r.nonceKey, 1, r.requestExpiry);
-    }
-
-    function test_W03_OpHash_Field10_RequestExpiry() public {
-        Req memory r = _defaultReq();
-        r.requestExpiry = uint48(block.timestamp + 1 days);
-        bytes memory sig = _signed(r);
-
-        // a relayer trying to EXTEND the request's lifetime
-        vm.prank(RELAYER);
-        // Signature-level rejection: the engine returns FAILURE (it does not revert) and the
-        // wallet converts that verdict to ValidationFailed(address(1)). Naming it proves the
-        // SIGNATURE rejected the flip, not that the request was malformed some other way.
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.ValidationFailed.selector, address(1)));
-        wallet.executeWithSession(
-            r.validator, r.mode, r.executionCalldata, sig, r.nonceKey, r.nonceSeq, uint48(block.timestamp + 30 days)
-        );
-    }
-
-    /// Fields 1-3 are not reachable through the door's parameters. They are asserted structurally:
-    /// the hash the contract computes equals the hash built from the domain, this chain and this
-    /// wallet — so a different chain or a different wallet yields a different hash by construction.
-    function test_W03_OpHash_Fields1to3_StructuralBinding() public {
-        Req memory r = _defaultReq();
-
-        bytes32 mine = _opHash(r);
-
-        bytes32 otherChain = keccak256(
-            abi.encode(
-                keccak256("AGW.Op.v3"),
-                block.chainid + 1,
-                address(wallet),
-                r.validator,
-                r.pid,
-                r.mode,
-                keccak256(r.executionCalldata),
-                r.nonceKey,
-                r.nonceSeq,
-                r.requestExpiry
-            )
-        );
-        bytes32 otherWallet = keccak256(
-            abi.encode(
-                keccak256("AGW.Op.v3"),
-                block.chainid,
-                address(walletImpl),
-                r.validator,
-                r.pid,
-                r.mode,
-                keccak256(r.executionCalldata),
-                r.nonceKey,
-                r.nonceSeq,
-                r.requestExpiry
-            )
-        );
-        bytes32 otherDomain = keccak256(
-            abi.encode(
-                keccak256("SomeOtherProtocol.Op.v1"),
-                block.chainid,
-                address(wallet),
-                r.validator,
-                r.pid,
-                r.mode,
-                keccak256(r.executionCalldata),
-                r.nonceKey,
-                r.nonceSeq,
-                r.requestExpiry
-            )
-        );
-
-        assertTrue(mine != otherChain, "field 2: chainid is bound");
-        assertTrue(mine != otherWallet, "field 3: address(this) is bound");
-        assertTrue(mine != otherDomain, "field 1: the domain is bound");
-
-        // and the contract really computes `mine` — proven by the signature over it validating
-        _run(r);
-        assertEq(callsRecorded(GATEWAY), 1, "the contract's hash == the independently built one");
+        bytes32 tryMode = bytes32(abi.encodePacked(bytes1(0x00), bytes1(0x01), bytes4(0), bytes4(0), bytes22(0)));
+        assertFalse(wallet.supportsExecutionMode(tryMode), "try-exec is not an accepted mode");
     }
 
     // ═══════════════════════════════════ W-04 ═══════════════════════════════════
 
-    function test_W04_Replay_And_LaneIndependence() public {
-        Req memory r = _defaultReq();
-        _run(r);
-        assertEq(wallet.getNonce(0), 1, "lane 0 advanced");
+    /**
+     * The same call submitted twice is two actions: both run, both are metered, both are recorded.
+     * Replay protection is the sender's own transaction nonce — an EOA's nonce, or the UEA payload's
+     * nonce — and the wallet keeps no agent replay state by design.
+     */
+    function test_W04_SameCallTwiceIsTwoActions() public {
+        etchCallRecorder(GATEWAY);
+        bytes memory ecd = _ecd();
 
-        // the SAME (key, seq) again
-        bytes memory sig = _signed(r);
-        vm.prank(RELAYER);
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.InvalidNonce.selector, uint192(0), uint64(1), uint64(0)));
-        wallet.executeWithSession(
-            r.validator, r.mode, r.executionCalldata, sig, r.nonceKey, r.nonceSeq, r.requestExpiry
-        );
+        vm.recordLogs();
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
+        Vm.Log[] memory logs = vm.getRecordedLogs();
 
-        // a DIFFERENT lane is unaffected and starts at zero
-        Req memory lane5 = _defaultReq();
-        lane5.nonceKey = 5;
-        _run(lane5);
-        assertEq(wallet.getNonce(5), 1, "lane 5 advanced independently");
-        assertEq(wallet.getNonce(0), 1, "lane 0 unchanged");
+        uint256 authorized;
+        for (uint256 i; i < logs.length; ++i) {
+            if (logs[i].emitter == address(wallet) && logs[i].topics[0] == IAGW.RulesActionAuthorized.selector) {
+                ++authorized;
+            }
+        }
 
-        // a WEDGED lane (submitting seq 9 on lane 3) blocks nothing else
-        Req memory wedged = _defaultReq();
-        wedged.nonceKey = 3;
-        wedged.nonceSeq = 9;
-        bytes memory wsig = _signed(wedged);
-        vm.prank(RELAYER);
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.InvalidNonce.selector, uint192(3), uint64(0), uint64(9)));
-        wallet.executeWithSession(
-            wedged.validator, wedged.mode, wedged.executionCalldata, wsig, wedged.nonceKey, wedged.nonceSeq, 0
-        );
-
-        Req memory lane7 = _defaultReq();
-        lane7.nonceKey = 7;
-        _run(lane7);
-        assertEq(wallet.getNonce(7), 1, "a wedged lane blocks nothing else");
+        assertEq(callsRecorded(GATEWAY), 2, "both dispatched");
+        assertEq(_spent(), 2 ether, "both metered");
+        assertEq(authorized, 2, "both recorded");
     }
 
     // ═══════════════════════════════════ W-05 ═══════════════════════════════════
 
     /**
-     * W-05 — the position is consumed BEFORE validation (§11 item 2).
+     * A dispatched call that re-enters the agent door is refused by the reentrancy guard, and the
+     * whole outer action unwinds with it.
      *
-     * A FAILED validation reverts the whole transaction, so the lane is restored — which is why the
-     * ordering looks unobservable from outside. What it actually buys is that a re-entrant
-     * validator cannot reuse the position DURING validation: by the time the engine is called, the
-     * position is already spent in this frame.
-     *
-     * Asserted directly: a validator that re-enters the door mid-validation cannot replay.
+     * Driven through a real NATIVE rules set whose one action is `ReenteringTarget.poke`, so the
+     * re-entry happens exactly where it could matter: inside dispatch, after validation.
      */
-    function test_W05_Nonce_ConsumedBeforeValidation() public {
-        ReenteringValidator reenter = new ReenteringValidator();
+    function test_W05_ReentryIntoTheAgentDoorRefused() public {
+        ReenteringTarget target = new ReenteringTarget();
+        NativeConfig memory cfg = NativeConfig({
+            initialized: false,
+            validUntil: uint48(block.timestamp + 7 days),
+            target: address(target),
+            selector: ReenteringTarget.poke.selector,
+            maxValuePerCall: 0,
+            maxValueTotal: 0,
+            valueSpent: 0,
+            amount: AmountRule({ enabled: false, offset: 0, maxPerCall: 0, maxTotal: 0 }),
+            amountSpent: 0,
+            maxCalls: 5,
+            callsUsed: 0,
+            pins: new ArgPin[](0)
+        });
+        Session memory s = sessionWithPolicy(address(urp), agentConfig(agentAddr), nativeInitData(cfg));
+        s.actions[0].actionTarget = address(target);
+        s.actions[0].actionTargetSelector = ReenteringTarget.poke.selector;
         vm.prank(WALLET_OWNER);
-        wallet.installModule(1, address(reenter), "");
-        reenter.arm(address(wallet), _defaultReq().executionCalldata, _singleMode());
+        bytes32 nativePid = wallet.grantRules(s);
 
-        Req memory r = _defaultReq();
-        r.validator = address(reenter);
-        bytes memory sig = _signed(r);
+        bytes memory inner = _ecd();
+        bytes memory outer = ExecutionLib.encodeSingle(
+            address(target),
+            0,
+            abi.encodeCall(ReenteringTarget.poke, (address(wallet), permissionId, _singleMode(), inner))
+        );
 
-        // The re-entrant call inside validation must not succeed. Whatever the outer result, the
-        // lane can never have advanced twice.
-        vm.prank(RELAYER);
-        try wallet.executeWithSession(
-            r.validator, r.mode, r.executionCalldata, sig, r.nonceKey, r.nonceSeq, r.requestExpiry
-        ) { }
-            catch { }
+        etchCallRecorder(GATEWAY);
+        vm.expectRevert(ReentrancyGuardTransient.ReentrancyGuardReentrantCall.selector);
+        _submitAs(agentAddr, nativePid, _singleMode(), outer);
 
-        assertLe(wallet.getNonce(0), 1, "the position was never consumed twice");
-        assertTrue(reenter.reentryFailed(), "the re-entrant call was refused");
-    }
-
-    // ═══════════════════════════════════ W-06 ═══════════════════════════════════
-
-    function test_W06_RequestExpiry_Semantics() public {
-        // (a) 0 => NEVER expires by time. Warp far forward — but stay INSIDE the mandate's own
-        // validUntil (365 days), because URP gate 2 would otherwise kill the request first and
-        // this test would pass for the wrong reason.
-        vm.warp(block.timestamp + 300 days);
-        Req memory never = _defaultReq();
-        never.requestExpiry = 0;
-        _run(never);
-        assertEq(callsRecorded(GATEWAY), 1, "requestExpiry == 0 means NO expiry");
-
-        // (b) a DISTANT-FUTURE stamp is ACCEPTED — there is no ceiling (§11 item 7). The stamp may
-        // sit far beyond the mandate's own expiry; the wallet does not police the distance.
-        Req memory distant = _defaultReq();
-        distant.nonceSeq = 1;
-        distant.requestExpiry = uint48(block.timestamp + 3650 days);
-        _run(distant);
-        assertEq(callsRecorded(GATEWAY), 1, "a year-ahead expiry is ACCEPTED, not rejected");
-
-        // (c) a PAST stamp reverts, with zero state change.
-        Req memory past = _defaultReq();
-        past.nonceSeq = 2;
-        past.requestExpiry = uint48(block.timestamp - 1);
-        bytes memory sig = _signed(past);
-
-        uint64 nonceBefore = wallet.getNonce(0);
-        uint256 spentBefore = _spent();
-
-        vm.prank(RELAYER);
-        vm.expectRevert(AGWErrors.RequestExpired.selector);
-        wallet.executeWithSession(past.validator, past.mode, past.executionCalldata, sig, 0, 2, past.requestExpiry);
-
-        assertEq(wallet.getNonce(0), nonceBefore, "nonce unchanged");
-        assertEq(_spent(), spentBefore, "spend unchanged");
-    }
-
-    /// The boundary: expiry == now is still valid (the check is strictly greater-than).
-    function test_W06_ExpiryBoundaryIsInclusive() public {
-        Req memory r = _defaultReq();
-        r.requestExpiry = uint48(block.timestamp);
-        _run(r);
-        assertEq(callsRecorded(GATEWAY), 1, "block.timestamp == requestExpiry is NOT expired");
+        ConfigId nativeCfg = _configIdOf(nativePid, address(target), ReenteringTarget.poke.selector);
+        assertEq(urp.getNativeConfig(nativeCfg, address(wallet)).callsUsed, 0, "the outer action unwound");
+        assertEq(callsRecorded(GATEWAY), 0, "the inner action never ran");
+        assertEq(_spent(), 0, "and nothing was metered");
     }
 
     // ═══════════════════════════════════ W-07 ═══════════════════════════════════
 
     /**
-     * W-07 — the verdict is enforced. Skipping this makes URP's expiry gate DECORATIVE: the engine
-     * returns the window in `vd` and only the wallet enforces it.
+     * W-07 — the verdict is enforced. Skipping this makes the policy's expiry gate DECORATIVE: the
+     * engine returns the window in `vd` and only the wallet enforces it.
      *
-     * A mock validator is used because the real engine cannot be made to return an arbitrary
-     * ValidationData. It is an OBSERVER of the wallet's reaction, not an oracle for validation.
+     * A fixed-verdict policy is used because the real URP cannot be made to return an arbitrary
+     * window. It supplies only the verdict whose ENFORCEMENT by the wallet is under test. Each case is
+     * a separate session the owner enables on the engine directly, with the canonical validator and
+     * the agent's config, on a native target.
      */
     function test_W07_Verdict_Enforced() public {
-        VerdictValidator v = new VerdictValidator();
-        vm.prank(WALLET_OWNER);
-        wallet.installModule(1, address(v), "");
+        address target = makeAddr("verdictTarget");
+        etchCallRecorder(target);
+        bytes memory ecd = ExecutionLib.encodeSingle(target, 0, hex"11223344");
+        uint48 nowTs = uint48(block.timestamp);
 
-        Req memory r = _defaultReq();
-        r.validator = address(v);
+        // (i) a non-zero authorizer: the ENGINE refuses it as a policy violation, before the wallet
+        //     sees a verdict (`PolicyLib.sol:31-35`, `:157`). The wallet's own `ValidationFailed`
+        //     branch is therefore unreachable through the real engine.
+        {
+            (bytes32 pid, address policy) = _verdictSession(target, uint256(uint160(0xBEEF)), 1);
+            vm.expectRevert(
+                abi.encodeWithSelector(ISmartSession.PolicyViolation.selector, PermissionId.wrap(pid), policy)
+            );
+            _submitAs(agentAddr, pid, _singleMode(), ecd);
+        }
 
-        // (a) a non-zero authorizer => ValidationFailed. The engine signals failure with address(1).
-        v.setVerdict(uint256(uint160(address(1))));
-        bytes memory sig = _signed(r);
-        vm.prank(RELAYER);
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.ValidationFailed.selector, address(1)));
-        wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, sig, 0, 0, 0);
+        // (ii) before validAfter => OutsideTimeWindow. The policy's unbounded `validUntil = 0` reaches
+        //      the wallet as `type(uint48).max`: the engine merges the policy's verdict with the
+        //      validator's through `ValidationDataLib.intersect`, which normalises an unbounded
+        //      `validUntil` to the maximum (`ValidationDataLib.sol:30-35`).
+        {
+            (bytes32 pid,) = _verdictSession(target, _verdict(0, nowTs + 100), 2);
+            vm.expectRevert(abi.encodeWithSelector(AGWErrors.OutsideTimeWindow.selector, nowTs + 100, type(uint48).max));
+            _submitAs(agentAddr, pid, _singleMode(), ecd);
+        }
 
-        // (b) before validAfter => OutsideTimeWindow
-        uint48 futureStart = uint48(block.timestamp + 1 days);
-        v.setVerdict(uint256(futureStart) << 208);
-        vm.prank(RELAYER);
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.OutsideTimeWindow.selector, futureStart, uint48(0)));
-        wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, sig, 0, 0, 0);
+        // (iii) after a non-zero validUntil => OutsideTimeWindow
+        {
+            (bytes32 pid,) = _verdictSession(target, _verdict(nowTs - 1, 0), 3);
+            vm.expectRevert(abi.encodeWithSelector(AGWErrors.OutsideTimeWindow.selector, uint48(0), nowTs - 1));
+            _submitAs(agentAddr, pid, _singleMode(), ecd);
+        }
 
-        // (c) after a non-zero validUntil => OutsideTimeWindow
-        uint48 pastEnd = uint48(block.timestamp - 1);
-        v.setVerdict(uint256(pastEnd) << 160);
-        vm.prank(RELAYER);
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.OutsideTimeWindow.selector, uint48(0), pastEnd));
-        wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, sig, 0, 0, 0);
+        // (iv) validUntil == 0 and validAfter == 0 => unbounded, dispatches
+        {
+            (bytes32 pid,) = _verdictSession(target, 0, 4);
+            _submitAs(agentAddr, pid, _singleMode(), ecd);
+            assertEq(callsRecorded(target), 1, "validUntil == 0 is unbounded, not expired");
+        }
 
-        // (d) validUntil == 0 => UNBOUNDED. A zero verdict passes and dispatches.
-        etchCallRecorder(GATEWAY);
-        vm.store(GATEWAY, bytes32(uint256(0)), bytes32(0));
-        v.setVerdict(0);
-        vm.prank(RELAYER);
-        wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, sig, 0, 0, 0);
-        assertEq(callsRecorded(GATEWAY), 1, "validUntil == 0 is unbounded, not expired");
+        // (v) validUntil == now => still valid (the check is strictly greater-than)
+        {
+            (bytes32 pid,) = _verdictSession(target, _verdict(nowTs, 0), 5);
+            _submitAs(agentAddr, pid, _singleMode(), ecd);
+            assertEq(callsRecorded(target), 2, "validUntil == now is not expired");
+        }
+
+        // (vi) validAfter == now => already valid (the check is strictly less-than)
+        {
+            (bytes32 pid,) = _verdictSession(target, _verdict(0, nowTs), 6);
+            _submitAs(agentAddr, pid, _singleMode(), ecd);
+            assertEq(callsRecorded(target), 3, "validAfter == now is valid");
+        }
+    }
+
+    function _verdict(uint48 validUntil, uint48 validAfter) internal pure returns (uint256) {
+        return uint256(validUntil) << 160 | uint256(validAfter) << 208;
+    }
+
+    function _verdictSession(address target, uint256 verdict, uint256 salt)
+        internal
+        returns (bytes32 pid, address policy)
+    {
+        policy = address(new FixedVerdictPolicy(verdict));
+        pid = _enableDirect(
+            _directSession(
+                address(validator),
+                agentConfig(agentAddr),
+                target,
+                bytes4(0x11223344),
+                policy,
+                "",
+                bytes32(0xF7000 + salt)
+            )
+        );
     }
 
     // ═══════════════════════════════════ W-08 ═══════════════════════════════════
 
-    /// The built operation's paymasterAndData is EMPTY on every path. Captured from a validator
-    /// that records what the wallet actually built.
+    /// The built operation, pinned field by field through the exact engine calldata: empty
+    /// paymaster and init code, zero gas fields and nonce, the wallet as sender, the execute
+    /// selector, and `USE ‖ pid ‖ agent` as the signature, with `keccak256(ecd)` as the hash.
     function test_W08_Paymaster_AlwaysEmpty() public {
-        CapturingValidator cap = new CapturingValidator();
-        vm.prank(WALLET_OWNER);
-        wallet.installModule(1, address(cap), "");
-
         etchCallRecorder(GATEWAY);
-        Req memory r = _defaultReq();
-        r.validator = address(cap);
-        _submit(r, _signed(r));
+        bytes memory ecd = _ecd();
+        PackedUserOperation memory expectedOp = _expectedOp(permissionId, _singleMode(), ecd, agentAddr);
 
-        assertEq(cap.paymasterAndDataLength(), 0, "paymasterAndData is empty");
-        assertEq(cap.initCodeLength(), 0, "initCode is empty");
-        assertEq(cap.accountGasLimits(), bytes32(0), "gas limits are zero");
-        assertEq(cap.preVerificationGas(), 0, "preVerificationGas is zero");
-        assertEq(cap.gasFees(), bytes32(0), "gasFees are zero");
-        assertEq(cap.sender(), address(wallet), "sender == the wallet");
-        assertEq(cap.nonce(), (uint256(r.nonceKey) << 64) | uint256(r.nonceSeq), "nonce mirrors the lane pair");
+        vm.expectCall(address(engine), abi.encodeCall(ISmartSession.validateUserOp, (expectedOp, keccak256(ecd))));
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
     }
 
     // ═══════════════════════════════════ W-26 ═══════════════════════════════════
@@ -749,17 +572,15 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
      * branch, which calls the policy with target = account and a HARDCODED value = 0.
      */
     function test_W26_EngineBranch_SingleExecOnly() public {
-        CapturingValidator cap = new CapturingValidator();
-        vm.prank(WALLET_OWNER);
-        wallet.installModule(1, address(cap), "");
-
         etchCallRecorder(GATEWAY);
-        Req memory r = _defaultReq();
-        r.validator = address(cap);
-        _submit(r, _signed(r));
+        bytes memory ecd = _ecd();
+        PackedUserOperation memory expectedOp = _expectedOp(permissionId, _singleMode(), ecd, agentAddr);
 
-        assertEq(cap.callDataSelector(), IERC7579Account.execute.selector, "the standard execute selector");
-        assertEq(cap.callDataSelector(), bytes4(0xe9ae5c53), "and its literal value");
+        assertEq(bytes4(expectedOp.callData), IERC7579Account.execute.selector, "the standard execute selector");
+        assertEq(bytes4(expectedOp.callData), bytes4(0xe9ae5c53), "and its literal value");
+
+        vm.expectCall(address(engine), abi.encodeCall(ISmartSession.validateUserOp, (expectedOp, keccak256(ecd))), 1);
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
     }
 
     /**
@@ -771,17 +592,10 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
      * gateway: the action id does not match the one configured, so no policy is found.
      */
     function test_W26_UnconfiguredActionDiesAtThePolicyFloor() public {
-        Req memory r = _defaultReq();
-        // a target the mandate has no action for
-        r.executionCalldata = ExecutionLib.encodeSingle(makeAddr("someOtherContract"), 0, hex"11223344");
-        bytes memory sig = _signed(r);
+        bytes memory ecd = ExecutionLib.encodeSingle(makeAddr("someOtherContract"), 0, hex"11223344");
 
-        vm.prank(RELAYER);
-        // The engine finds no policy configured for this (account, selector) and dies at its
-        // minimum-one-policy floor — the second, independent reason a zero-value comparison
-        // can never be reached.
-        vm.expectRevert(abi.encodeWithSelector(ISmartSession.NoPoliciesSet.selector, PermissionId.wrap(r.pid)));
-        wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, sig, 0, 0, 0);
+        vm.expectRevert(abi.encodeWithSelector(ISmartSession.NoPoliciesSet.selector, PermissionId.wrap(permissionId)));
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
     }
 
     // ═══════════════════════════════════ W-09 ═══════════════════════════════════
@@ -790,146 +604,100 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
      * W-09 — the agent door is SINGLE-call-type only. Batching lives two layers deeper, inside the
      * multicall payload, bounded by URP's ten.
      *
-     * THE GATE IS INDEPENDENTLY REACHABLE, and this test is what proves it. An earlier version
-     * paired batch MODE with single-ENCODED executionCalldata; the engine's batch decoder then
-     * failed on SHAPE, and a bare `expectRevert` accepted that as if the gate had fired. Mutation
-     * exposed it: deleting `callType != CALLTYPE_SINGLE` left the suite green.
-     *
-     * The engine ACCEPTS batch mode — `SmartSession.sol:280-288` routes CALLTYPE_BATCH to
-     * `checkBatch7579Exec`, which runs URP per entry, so a well-formed batch of one valid
-     * (gateway, sendOutbound) entry passes engine validation cleanly. The ONLY thing standing
-     * between it and dispatch is the wallet's step-9 gate, and it must name its own error.
+     * THE GATE IS INDEPENDENTLY REACHABLE, and this test is what proves it. The engine ACCEPTS
+     * batch mode — `SmartSession.sol:280-288` routes CALLTYPE_BATCH to `checkBatch7579Exec`, which
+     * runs URP per entry, so a well-formed batch of one valid (gateway, sendOutbound) entry passes
+     * engine validation cleanly. The ONLY thing standing between it and dispatch is the wallet's
+     * mode gate, and it must name its own error.
      */
     function test_W09_AgentDoor_SingleCallTypeOnly() public {
-        // A WELL-FORMED batch: batch mode AND batch-encoded calldata, one valid gateway entry,
-        // signed for batch. This passes the engine and dies at the wallet's gate.
         Execution[] memory entries = new Execution[](1);
         entries[0] = Execution({
             target: GATEWAY, value: 0, callData: outboundRequest(ASSET, 1 ether, 1 ether, address(wallet), _calls())
         });
+        bytes memory batchEcd = ExecutionLib.encodeBatch(entries);
+        bytes32 batchMode = ModeCode.unwrap(ModeLib.encodeSimpleBatch());
 
-        Req memory b = _defaultReq();
-        b.mode = ModeCode.unwrap(ModeLib.encodeSimpleBatch());
-        b.executionCalldata = ExecutionLib.encodeBatch(entries);
-        bytes memory bsig = _signed(b);
-
-        vm.prank(RELAYER);
         vm.expectRevert(AGWErrors.UnsupportedExecutionMode.selector);
-        wallet.executeWithSession(b.validator, b.mode, b.executionCalldata, bsig, 0, 0, 0);
+        _submitAs(agentAddr, permissionId, batchMode, batchEcd);
 
         // and BATCH still works on the OWNER door — the restriction is contextual, not global
         Execution[] memory execs = new Execution[](1);
         execs[0] = Execution({ target: makeAddr("sink"), value: 1 ether, callData: "" });
         vm.prank(WALLET_OWNER);
-        wallet.execute(ModeCode.unwrap(ModeLib.encodeSimpleBatch()), ExecutionLib.encodeBatch(execs));
+        wallet.execute(batchMode, ExecutionLib.encodeBatch(execs));
         assertEq(makeAddr("sink").balance, 1 ether, "the owner door still batches");
     }
 
     /**
      * The exotic call types and the try-exec type, each naming the error that actually fires.
      *
-     * These do NOT reach the wallet's step-9 gate: the ENGINE rejects them first, and it names them
+     * These do NOT reach the wallet's mode gate: the ENGINE rejects them first, and it names them
      * itself — `UnsupportedExecutionType()` for a non-default exec type, and `UnsupportedCallType`
      * for a call type it does not route. Read from the trace, not assumed.
      */
     function test_W09_ExoticModes_RejectedByTheEngineWithNamedErrors() public {
+        bytes memory ecd = _ecd();
+
         // try-exec type: the engine's own named error (SmartSession.sol:276)
-        Req memory t = _defaultReq();
-        t.mode = bytes32(abi.encodePacked(bytes1(0x00), bytes1(0x01), bytes4(0), bytes4(0), bytes22(0)));
-        bytes memory tsig = _signed(t);
-        vm.prank(RELAYER);
+        bytes32 tryMode = bytes32(abi.encodePacked(bytes1(0x00), bytes1(0x01), bytes4(0), bytes4(0), bytes22(0)));
         vm.expectRevert(ISmartSession.UnsupportedExecutionType.selector);
-        wallet.executeWithSession(t.validator, t.mode, t.executionCalldata, tsig, 0, 0, 0);
+        _submitAs(agentAddr, permissionId, tryMode, ecd);
 
         // delegatecall and static: neither is a routed call type, so the engine refuses them
         bytes1[2] memory exotic = [bytes1(0xFF), bytes1(0xFE)];
         for (uint256 i; i < exotic.length; ++i) {
-            Req memory r = _defaultReq();
-            r.mode = bytes32(abi.encodePacked(exotic[i], bytes1(0x00), bytes4(0), bytes4(0), bytes22(0)));
-            bytes memory sig = _signed(r);
-            vm.prank(RELAYER);
+            bytes32 mode = bytes32(abi.encodePacked(exotic[i], bytes1(0x00), bytes4(0), bytes4(0), bytes22(0)));
             vm.expectRevert(abi.encodeWithSelector(ISmartSession.UnsupportedCallType.selector, exotic[i]));
-            wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, sig, 0, 0, 0);
+            _submitAs(agentAddr, permissionId, mode, ecd);
         }
     }
 
     // ═══════════════════════════════════ W-28 ═══════════════════════════════════
 
     /**
-     * W-28 — ENABLE and UNSAFE_ENABLE are refused AT THE WALLET, and NO CALL REACHES THE ENGINE.
-     *
-     * This pins §6.6 step 4: field 5 is unconditionally a permission id. In ENABLE mode the engine
-     * does not read bytes [1:33] as a permission id at all (`EncodeLib.sol:29-37`) — it derives the
-     * id from the session data — so without the wallet's mode check, arbitrary session bytes would
-     * be bound into op-hash field 5.
-     *
-     * The zero-call assertion uses the recorder rather than `vm.expectCall(..., 0)` because a
-     * cheatcode-level expectation failure is not catchable, so its negative branch could never be
-     * demonstrated. The recorder's counter is ordinary storage, so both branches are provable.
+     * W-28 — the agent door ALWAYS builds a USE-mode operation. There is no signature input, so no
+     * caller can choose ENABLE or UNSAFE_ENABLE: the engine's enable path, which derives a
+     * permission from session bytes carried in the signature, is unreachable from this door.
      */
-    function test_W28_AgentDoor_RejectsEnableMode() public {
-        bytes memory realEngineCode = address(engine).code;
-        etchCallRecorder(address(engine));
-        vm.store(address(engine), bytes32(uint256(0)), bytes32(0));
+    function test_W28_AgentDoor_AlwaysBuildsUseMode() public {
+        etchCallRecorder(GATEWAY);
+        bytes memory ecd = _ecd();
+        PackedUserOperation memory expectedOp = _expectedOp(permissionId, _singleMode(), ecd, agentAddr);
+        assertEq(uint8(expectedOp.signature[0]), uint8(SmartSessionMode.USE), "byte 0 is USE");
 
-        Req memory r = _defaultReq();
+        PermissionId[] memory before = engine.getPermissionIDs(address(wallet));
 
-        // a well-formed, >= 33-byte signature whose mode byte is ENABLE
-        bytes memory enableSig = abi.encodePacked(uint8(SmartSessionMode.ENABLE), r.pid, new bytes(65));
-        vm.prank(RELAYER);
-        vm.expectRevert(AGWErrors.InvalidSessionSignature.selector);
-        wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, enableSig, 0, 0, 0);
+        vm.expectCall(address(engine), abi.encodeCall(ISmartSession.validateUserOp, (expectedOp, keccak256(ecd))));
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
 
-        // and UNSAFE_ENABLE
-        bytes memory unsafeSig = abi.encodePacked(uint8(SmartSessionMode.UNSAFE_ENABLE), r.pid, new bytes(65));
-        vm.prank(RELAYER);
-        vm.expectRevert(AGWErrors.InvalidSessionSignature.selector);
-        wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, unsafeSig, 0, 0, 0);
-
-        assertEq(callsRecorded(address(engine)), 0, "NO call reached the engine");
-
-        vm.etch(address(engine), realEngineCode);
-    }
-
-    /// A signature too short to carry USE ‖ permissionId is refused by the same guard.
-    function test_W28_ShortSignatureRefused() public {
-        Req memory r = _defaultReq();
-
-        bytes[3] memory shorts = [bytes(""), abi.encodePacked(uint8(0)), abi.encodePacked(uint8(0), new bytes(31))];
-        for (uint256 i; i < shorts.length; ++i) {
-            vm.prank(RELAYER);
-            vm.expectRevert(AGWErrors.InvalidSessionSignature.selector);
-            wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, shorts[i], 0, 0, 0);
+        PermissionId[] memory afterIds = engine.getPermissionIDs(address(wallet));
+        assertEq(afterIds.length, before.length, "no permission was enabled by the agent door");
+        for (uint256 i; i < before.length; ++i) {
+            assertEq(PermissionId.unwrap(afterIds[i]), PermissionId.unwrap(before[i]), "the id set is unchanged");
         }
     }
 
     // ═══════════════════════════════════ W-18 ═══════════════════════════════════
 
     /**
-     * W-18 — an execution revert unwinds EVERYTHING: the nonce, URP's spent counter, and the
-     * metering event. This is the atomicity the whole failure model rests on, and it is why
-     * dispatch is NEVER wrapped in try/catch (§11 item 3).
+     * W-18 — an execution revert unwinds EVERYTHING: URP's spent counter and the metering event.
+     * This is the atomicity the whole failure model rests on, and it is why dispatch is NEVER
+     * wrapped in try/catch.
      */
     function test_W18_ExecutionRevert_UnwindsAll() public {
         // first, a successful request so there is real state to preserve
-        _run(_defaultReq());
-        uint64 nonceAfter = wallet.getNonce(0);
+        _run();
         uint256 spentAfter = _spent();
-        assertEq(nonceAfter, 1, "state exists");
         assertEq(spentAfter, 1 ether, "spend recorded");
 
         // now a request whose DISPATCH reverts: the gateway rejects the call
         vm.etch(GATEWAY, type(RevertingGateway).runtimeCode);
+        bytes memory ecd = _ecd();
 
-        Req memory r = _defaultReq();
-        r.nonceSeq = 1;
-        bytes memory sig = _signed(r);
-
-        vm.prank(RELAYER);
         vm.expectRevert(RevertingGateway.GatewayRejected.selector); // bubbled from the gateway, verbatim
-        wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, sig, 0, 1, 0);
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
 
-        assertEq(wallet.getNonce(0), nonceAfter, "the NONCE unwound");
         assertEq(_spent(), spentAfter, "URP's SPENT counter unwound");
 
         // The EVENTS are unwound with the frame too. Asserted through STATE rather than through
@@ -937,36 +705,31 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         // log-scanning assertion here would fail against correct behaviour. What actually matters —
         // and what a chain observer would see — is that no counter moved, which is asserted above.
         //
-        // The event's absence is then proven positively: a SECOND, successful request re-emits
-        // exactly one of each, so the counters and the events stay in lockstep.
+        // The event's absence is then proven positively: the identical request, once the gateway
+        // accepts, emits exactly one record and meters exactly once.
         vm.etch(GATEWAY, "");
         etchCallRecorder(GATEWAY);
         vm.store(GATEWAY, bytes32(uint256(0)), bytes32(0));
 
-        Req memory good = _defaultReq();
-        good.nonceSeq = 1;
+        vm.expectEmit(true, true, false, true, address(wallet));
+        emit IAGW.RulesActionAuthorized(permissionId, agentAddr, keccak256(ecd));
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
 
-        vm.expectEmit(true, true, true, true, address(wallet));
-        emit IAGW.RulesActionAuthorized(good.pid, good.nonceKey, good.nonceSeq, _opHash(good));
-        _submit(good, _signed(good));
-
-        assertEq(wallet.getNonce(0), 2, "the retry advanced the lane exactly once");
-        assertEq(_spent(), spentAfter + 1 ether, "and metered exactly once");
+        assertEq(_spent(), spentAfter + 1 ether, "the retry metered exactly once");
     }
 
     // ═══════════════════════════════════ W-23 ═══════════════════════════════════
 
-    /// The agent-door half of the attribution record.
+    /// The agent-door half of the attribution record: the rules set, the agent, and the hash of the
+    /// exact calldata executed.
     function test_W23_Events_Attribution_AgentDoor() public {
         etchCallRecorder(GATEWAY);
+        bytes memory ecd = _ecd();
 
-        Req memory r = _defaultReq();
-        bytes32 expectedHash = _opHash(r);
+        vm.expectEmit(true, true, false, true, address(wallet));
+        emit IAGW.RulesActionAuthorized(permissionId, agentAddr, keccak256(ecd));
 
-        vm.expectEmit(true, true, true, true, address(wallet));
-        emit IAGW.RulesActionAuthorized(r.pid, r.nonceKey, r.nonceSeq, expectedHash);
-
-        _submit(r, _signed(r));
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
     }
 
     // ═══════════════════════════════════ W-29 ═══════════════════════════════════
@@ -981,7 +744,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
      *
      * WHICH LAYER FIRES DEPENDS ON HOW FAR THE REQUEST GETS, and the ordering was read from traces,
      * not assumed:
-     *   (a) a 7579-level dispatch target of the wallet never matches the mandate's one configured
+     *   (a) a 7579-level dispatch target of the wallet never matches the rules set's one configured
      *       action, so it dies at the engine's minimum-one-policy FLOOR before URP runs;
      *   (b) a request that DOES match the action (target = gateway) but names the wallet as an
      *       INNER multicall target reaches URP gate 14, which forbids it;
@@ -990,38 +753,25 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
      */
     function test_W29_AgentDoor_CannotSelfCall() public {
         // ── (a) the engine's no-policy floor ──
-        // Dispatch target = the wallet, calling revokeAllRules. The mandate configures exactly one action,
-        // (gateway, sendOutbound); this matches nothing, so no policy is found.
-        Req memory a = _defaultReq();
-        a.executionCalldata = ExecutionLib.encodeSingle(address(wallet), 0, abi.encodeCall(AGW.revokeAllRules, ()));
-        bytes memory aSig = _signed(a);
-
-        vm.prank(RELAYER);
-        vm.expectRevert(abi.encodeWithSelector(ISmartSession.NoPoliciesSet.selector, PermissionId.wrap(a.pid)));
-        wallet.executeWithSession(a.validator, a.mode, a.executionCalldata, aSig, 0, 0, 0);
+        bytes memory a = ExecutionLib.encodeSingle(address(wallet), 0, abi.encodeCall(AGW.revokeAllRules, ()));
+        vm.expectRevert(abi.encodeWithSelector(ISmartSession.NoPoliciesSet.selector, PermissionId.wrap(permissionId)));
+        _submitAs(agentAddr, permissionId, _singleMode(), a);
 
         // ── (b) URP gate 14: the wallet is a forbidden INNER target ──
-        // This request DOES match the configured action, so the gauntlet runs. The multicall names
-        // the wallet, which gate 14 refuses before the allow-list is even consulted.
         Multicall[] memory selfCalls = new Multicall[](1);
         selfCalls[0] = Multicall({ to: address(wallet), value: 0, data: abi.encodeCall(AGW.revokeAllRules, ()) });
+        bytes memory b =
+            ExecutionLib.encodeSingle(GATEWAY, 0, outboundRequest(ASSET, 1 ether, 1 ether, address(wallet), selfCalls));
 
-        Req memory b = _defaultReq();
-        b.executionCalldata = ExecutionLib.encodeSingle(
-            GATEWAY, 0, outboundRequest(ASSET, 1 ether, 1 ether, address(wallet), selfCalls)
-        );
-        bytes memory bSig = _signed(b);
-
-        vm.prank(RELAYER);
         expectUrpGate(abi.encodeWithSelector(UniversalRulesPolicyErrors.ForbiddenInnerTarget.selector, address(wallet)));
-        wallet.executeWithSession(b.validator, b.mode, b.executionCalldata, bSig, 0, 0, 0);
+        _submitAs(agentAddr, permissionId, _singleMode(), b);
 
         // ── (c) with URP BYPASSED, the engine's own InvalidSelfCall ──
-        // sessionWithPolicy grants a mandate whose action policy is NOT URP — a shape grantRules
+        // sessionWithPolicy grants a rules set whose action policy is NOT URP — a shape grantRules
         // would refuse — so the gauntlet never runs. The engine still refuses an execute-selector
         // self-target (PolicyLib.sol:196).
         PermissivePolicy permissive = new PermissivePolicy();
-        Session memory bypass = sessionWithPolicy(address(permissive), ecdsaConfig(agentAddr), "");
+        Session memory bypass = sessionWithPolicy(address(permissive), agentConfig(agentAddr), "");
         bypass.actions[0].actionTarget = address(wallet);
         bypass.actions[0].actionTargetSelector = AGW.execute.selector;
         bypass.salt = bytes32(uint256(0xE29));
@@ -1033,10 +783,8 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
 
         // The dispatch calldata must carry the EXECUTE selector for this branch to fire:
         // `PolicyLib.sol:195-198` reverts only when targetSig == IERC7579Account.execute.selector
-        // AND target == msg.sender. A revokeAllRules payload falls through to the action lookup instead.
-        Req memory c = _defaultReq();
-        c.pid = bypassPid;
-        c.executionCalldata = ExecutionLib.encodeSingle(
+        // AND target == msg.sender.
+        bytes memory c = ExecutionLib.encodeSingle(
             address(wallet),
             0,
             abi.encodeCall(
@@ -1044,11 +792,9 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
                 (_singleMode(), ExecutionLib.encodeSingle(address(wallet), 0, abi.encodeCall(AGW.revokeAllRules, ())))
             )
         );
-        bytes memory cSig = _signed(c);
 
-        vm.prank(RELAYER);
         vm.expectRevert(ISmartSession.InvalidSelfCall.selector);
-        wallet.executeWithSession(c.validator, c.mode, c.executionCalldata, cSig, 0, 0, 0);
+        _submitAs(agentAddr, bypassPid, _singleMode(), c);
 
         // ── THE POSITIVE CONTROL ──
         // The same revokeRules calldata, through the OWNER door, succeeds via exactly the self-call
@@ -1077,9 +823,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         vm.expectEmit(true, true, true, true, address(urp));
         emit IUniversalRulesPolicy.OutboundMetered(_configId(), address(engine), address(wallet), 3 ether);
 
-        Req memory r = _defaultReq();
-        r.executionCalldata = _executionCalldata(3 ether, 0);
-        _submit(r, _signed(r));
+        _submitAs(agentAddr, permissionId, _singleMode(), _executionCalldata(3 ether, 0));
 
         assertEq(_spent(), 3 ether, "spent advanced by exactly the bridged amount");
     }
@@ -1088,23 +832,19 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
     function test_U04_ZeroAmountThroughTheRealPath() public {
         etchCallRecorder(GATEWAY);
 
-        Req memory r = _defaultReq();
-        r.executionCalldata = _executionCalldata(0, 0);
-        _submit(r, _signed(r));
+        _submitAs(agentAddr, permissionId, _singleMode(), _executionCalldata(0, 0));
 
         assertEq(callsRecorded(GATEWAY), 1, "the zero-amount request dispatched");
         assertEq(_spent(), 0, "and metered nothing");
     }
 
     /// The PC-value path: value decoded from the VALIDATED calldata leaves the wallet's own
-    /// balance, bounded by URP gate 8. The relayer cannot attach value — this door is not payable.
+    /// balance, bounded by URP gate 8. The agent cannot attach value — this door is not payable.
     function test_AgentRequestMovesPCFromTheWalletsOwnBalance() public {
         etchCallRecorder(GATEWAY);
         uint256 before = address(wallet).balance;
 
-        Req memory r = _defaultReq();
-        r.executionCalldata = _executionCalldata(1 ether, 2 ether); // 2 PC, within maxPCPerCall = 5
-        _submit(r, _signed(r));
+        _submitAs(agentAddr, permissionId, _singleMode(), _executionCalldata(1 ether, 2 ether)); // within 5
 
         assertEq(address(wallet).balance, before - 2 ether, "PC left the wallet's own balance");
         assertEq(GATEWAY.balance, 2 ether, "and reached the gateway");
@@ -1114,85 +854,174 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
     function test_PCValueAboveGate8IsRefused() public {
         etchCallRecorder(GATEWAY);
         uint256 before = address(wallet).balance;
+        bytes memory ecd = _executionCalldata(1 ether, 6 ether); // maxPCPerCall is 5 ether
 
-        Req memory r = _defaultReq();
-        r.executionCalldata = _executionCalldata(1 ether, 6 ether); // maxPCPerCall is 5 ether
-        bytes memory sig = _signed(r);
-
-        vm.prank(RELAYER);
         // URP gate 8 fired, named through the engine's 32-byte rewrap.
         expectUrpGate(
             abi.encodeWithSelector(
                 UniversalRulesPolicyErrors.PCValueExceedsCap.selector, uint256(6 ether), uint256(5 ether)
             )
         );
-        wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, sig, 0, 0, 0);
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
 
         assertEq(address(wallet).balance, before, "no PC moved");
     }
 
     // ═══════════════════════════ door-level guards ═══════════════════════════
 
-    function test_UninstalledValidatorIsRefused() public {
-        Req memory r = _defaultReq();
-        r.validator = makeAddr("neverInstalled");
-        bytes memory sig = _signed(r);
-
-        vm.prank(RELAYER);
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.ValidatorNotInstalled.selector, r.validator));
-        wallet.executeWithSession(r.validator, r.mode, r.executionCalldata, sig, 0, 0, 0);
-    }
-
-    /// W-22's agent half, now that the door is real: a wallet with NO mandates refuses every agent
-    /// request — the engine reverts on an unknown permission id.
+    /// W-22's agent half: a wallet with NO rules sets refuses every agent request — no id names an
+    /// agent there, so the wallet's pre-check fires before the engine is ever called.
     function test_W22_EmptyWallet_RejectsAgents_AgentHalf() public {
         AGW fresh = newWallet(WALLET_OWNER);
         vm.deal(address(fresh), 10 ether);
+        bytes memory ecd = _ecd();
 
-        Req memory r = _defaultReq();
-        bytes memory sig = _signed(r);
+        vm.prank(agentAddr);
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, permissionId, agentAddr));
+        fresh.executeAsAgent(permissionId, _singleMode(), ecd);
 
         vm.prank(RELAYER);
-        // No mandate exists on this wallet, so the engine refuses the permission id outright.
-        vm.expectRevert(abi.encodeWithSelector(ISmartSession.InvalidPermissionId.selector, PermissionId.wrap(r.pid)));
-        fresh.executeWithSession(r.validator, r.mode, r.executionCalldata, sig, 0, 0, 0);
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, bytes32(0), RELAYER));
+        fresh.executeAsAgent(bytes32(0), _singleMode(), ecd);
+    }
+
+    function test_W_agentDoor_unknownPermission_refused() public {
+        bytes32 unknown = keccak256("never granted");
+        bytes memory ecd = _ecd();
+
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, unknown, agentAddr));
+        _submitAs(agentAddr, unknown, _singleMode(), ecd);
+    }
+
+    function test_W_agentDoor_revokedPermission_refused() public {
+        bytes memory ecd = _ecd();
+
+        vm.prank(WALLET_OWNER);
+        wallet.revokeRules(permissionId);
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, permissionId, agentAddr));
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
+
+        bytes32 pid1 = _grant();
+        bytes32 pid2 = _grant();
+        vm.prank(WALLET_OWNER);
+        wallet.revokeAllRules();
+
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, pid1, agentAddr));
+        _submitAs(agentAddr, pid1, _singleMode(), ecd);
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, pid2, agentAddr));
+        _submitAs(agentAddr, pid2, _singleMode(), ecd);
+    }
+
+    /// Uninstalling the engine (after revoking everything) switches the agent door off entirely; the
+    /// installed check fires before the agent check.
+    function test_W_agentDoor_engineUninstalled_refused() public {
+        bytes memory ecd = _ecd();
+
+        vm.startPrank(WALLET_OWNER);
+        wallet.revokeAllRules();
+        wallet.uninstallModule(1, address(engine), "");
+        vm.stopPrank();
+
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.ValidatorNotInstalled.selector, address(engine)));
+        _submitAs(agentAddr, permissionId, _singleMode(), ecd);
+    }
+
+    /// A session the owner enabled on the engine directly, naming a session validator other than the
+    /// canonical one, has no agent here — even with a well-formed agent config and URP as its policy.
+    function test_W_agentDoor_foreignValidatorSessionHasNoAgent() public {
+        AgentValidator other = new AgentValidator();
+        Session memory s = canonicalSession(agentConfig(agentAddr), _urpInitData());
+        s.sessionValidator = ISessionValidator(address(other));
+        s.salt = bytes32(uint256(0xF0));
+        bytes32 pid = _enableDirect(s);
+
+        assertEq(wallet.agentOf(pid), address(0), "a non-canonical validator names no agent");
+
+        bytes memory ecd = _ecd();
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, pid, agentAddr));
+        _submitAs(agentAddr, pid, _singleMode(), ecd);
+    }
+
+    /// A session enabled directly with the CANONICAL validator but a pre-D3 config: the engine
+    /// accepts it — at enable it checks only `isModuleType(7)`, never the config
+    /// (`ConfigLib.sol:207-213`) — and the wallet reads no agent from it.
+    function test_W_agentDoor_malformedConfigSessionHasNoAgent() public {
+        Session memory s = canonicalSession(abi.encode(uint8(0), abi.encodePacked(agentAddr)), _urpInitData());
+        s.salt = bytes32(uint256(0xF1));
+        bytes32 pid = _enableDirect(s);
+
+        assertEq(wallet.agentOf(pid), address(0), "a malformed config names no agent");
+
+        bytes memory ecd = _ecd();
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, pid, agentAddr));
+        _submitAs(agentAddr, pid, _singleMode(), ecd);
     }
 
     // ═══════════════════ the owner-intent doors (UniversalMarketplace PRD, C and D) ═══════════════════
 
-    /// ⚠️ NEVER-DELETE. Owner lanes belong to `executeWithSig`: the agent door refuses them BEFORE
-    ///      reading or consuming the nonce, and an agent lane still works afterwards.
-    function test_W_agentDoor_rejectsOwnerLane_revertsOwnerLaneForbidden() public {
-        Req memory r = _defaultReq();
-        r.nonceKey = OWNER_LANE_FLAG;
-        bytes memory sig = _signed(r);
-        vm.prank(RELAYER);
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.OwnerLaneForbidden.selector, OWNER_LANE_FLAG));
-        wallet.executeWithSession(
-            r.validator, r.mode, r.executionCalldata, sig, r.nonceKey, r.nonceSeq, r.requestExpiry
-        );
-        assertEq(wallet.getNonce(OWNER_LANE_FLAG), 0, "the owner lane was not consumed");
-
-        Req memory ok = _defaultReq();
-        _run(ok);
-        assertEq(wallet.getNonce(0), 1, "an agent lane still works");
-    }
-
-    /// ⚠️ NEVER-DELETE. The AGENT's key signing an OwnerIntent produces nothing the agent door accepts.
-    function test_X17_ownerIntentSigNeverValidatesAsSessionSig() public {
-        OwnerIntent memory i = blankIntent(WALLET_OWNER, address(wallet), RELAYER);
-        Req memory r = _defaultReq();
-        i.mode = r.mode;
-        i.execCalldataHash = keccak256(r.executionCalldata);
-        bytes memory intentSig = signIntent(agentPk, i);
-        bytes memory wrapped = abi.encodePacked(uint8(SmartSessionMode.USE), r.pid, intentSig);
+    /// ⚠️ NEVER-DELETE. Owner lanes belong to `executeWithSig`: the agent door can neither read nor
+    ///      advance any lane, and the owner lane still works at the recorded position afterwards.
+    function test_W_agentDoor_neverTouchesOwnerLanes() public {
+        uint192 laneA = OWNER_LANE_FLAG;
+        uint192 laneB = OWNER_LANE_FLAG | 7;
+        uint64 seqA = wallet.getNonce(laneA);
+        uint64 seqB = wallet.getNonce(laneB);
+        uint64 seq0 = wallet.getNonce(0);
 
         etchCallRecorder(GATEWAY);
-        vm.prank(RELAYER);
-        vm.expectRevert(abi.encodeWithSelector(AGWErrors.ValidationFailed.selector, address(1)));
-        wallet.executeWithSession(
-            r.validator, r.mode, r.executionCalldata, wrapped, r.nonceKey, r.nonceSeq, r.requestExpiry
+        bytes memory ecd = _ecd();
+        for (uint256 i; i < 3; ++i) {
+            _submitAs(agentAddr, permissionId, _singleMode(), ecd);
+        }
+        bytes memory overCap = _executionCalldata(1 ether, 6 ether);
+        expectUrpGate(
+            abi.encodeWithSelector(
+                UniversalRulesPolicyErrors.PCValueExceedsCap.selector, uint256(6 ether), uint256(5 ether)
+            )
         );
+        _submitAs(agentAddr, permissionId, _singleMode(), overCap);
+
+        assertEq(wallet.getNonce(laneA), seqA, "owner lane A untouched");
+        assertEq(wallet.getNonce(laneB), seqB, "owner lane B untouched");
+        assertEq(wallet.getNonce(0), seq0, "lane 0 untouched");
+
+        address sink = makeAddr("laneSink");
+        bytes memory ownerEcd = ExecutionLib.encodeSingle(sink, 1 ether, "");
+        OwnerIntent memory intent = blankIntent(WALLET_OWNER, address(wallet), RELAYER);
+        intent.mode = _singleMode();
+        intent.execCalldataHash = keccak256(ownerEcd);
+        intent.nonceKey = laneA;
+        intent.nonceSeq = seqA;
+        bytes memory sig = signIntent(walletOwnerPk, intent);
+
+        vm.prank(RELAYER);
+        wallet.executeWithSig(_singleMode(), ownerEcd, intent, sig);
+
+        assertEq(sink.balance, 1 ether, "the owner lane works at the recorded position");
+        assertEq(wallet.getNonce(laneA), seqA + 1, "and advanced exactly once");
+    }
+
+    /**
+     * ⚠️ NEVER-DELETE. Owner authority and agent authority never cross:
+     *   (a) the agent's key signing an OwnerIntent, presented by the agent as `intent.executor`, is
+     *       refused `InvalidOwnerSignature` — the agent is not the owner;
+     *   (b) the OWNER calling the agent door is refused `CallerIsNotAgent` — owner authority never
+     *       passes as agent authority.
+     */
+    function test_X17_ownerIntentSigNeverValidatesAsSessionSig() public {
+        bytes memory ecd = _ecd();
+
+        OwnerIntent memory i = blankIntent(WALLET_OWNER, address(wallet), agentAddr);
+        i.mode = _singleMode();
+        i.execCalldataHash = keccak256(ecd);
+        bytes memory agentSig = signIntent(agentPk, i);
+
+        vm.prank(agentAddr);
+        vm.expectRevert(AGWErrors.InvalidOwnerSignature.selector);
+        wallet.executeWithSig(_singleMode(), ecd, i, agentSig);
+
+        vm.expectRevert(abi.encodeWithSelector(AGWErrors.CallerIsNotAgent.selector, permissionId, WALLET_OWNER));
+        _submitAs(WALLET_OWNER, permissionId, _singleMode(), ecd);
     }
 
     /// ⚠️ NEVER-DELETE. Neither new door is reachable from the agent side:
@@ -1203,7 +1032,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         bytes4[2] memory sels = [AGW.grantRulesWithSig.selector, AGW.executeWithSig.selector];
         for (uint256 k; k < 2; ++k) {
             // (a) grant time
-            Session memory s = sessionWithPolicy(address(urp), ecdsaConfig(agentAddr), envelope(nativeChain(), ""));
+            Session memory s = sessionWithPolicy(address(urp), agentConfig(agentAddr), envelope(nativeChain(), ""));
             s.actions[0].actionTarget = address(wallet);
             s.actions[0].actionTargetSelector = sels[k];
             vm.prank(WALLET_OWNER);
@@ -1212,7 +1041,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
 
             // (b) dispatch time
             PermissivePolicy permissive = new PermissivePolicy();
-            Session memory bypass = sessionWithPolicy(address(permissive), ecdsaConfig(agentAddr), "");
+            Session memory bypass = sessionWithPolicy(address(permissive), agentConfig(agentAddr), "");
             bypass.actions[0].actionTarget = address(wallet);
             bypass.actions[0].actionTargetSelector = sels[k];
             bypass.salt = bytes32(uint256(0xC0DE + k));
@@ -1221,139 +1050,81 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
             vm.prank(address(wallet));
             bytes32 bypassPid = PermissionId.unwrap(engine.enableSessions(arr)[0]);
 
-            Req memory r = _defaultReq();
-            r.pid = bypassPid;
-            r.nonceKey = uint192(100 + k);
-            r.executionCalldata = ExecutionLib.encodeSingle(address(wallet), 0, abi.encodePacked(sels[k], bytes32(0)));
-            bytes memory sig = _signed(r);
-            vm.prank(RELAYER);
+            bytes memory ecd = ExecutionLib.encodeSingle(address(wallet), 0, abi.encodePacked(sels[k], bytes32(0)));
             vm.expectRevert(abi.encodeWithSelector(AGWErrors.ForbiddenDispatchTarget.selector, address(wallet)));
-            wallet.executeWithSession(
-                r.validator, r.mode, r.executionCalldata, sig, r.nonceKey, r.nonceSeq, r.requestExpiry
-            );
+            _submitAs(agentAddr, bypassPid, _singleMode(), ecd);
         }
+    }
+
+    // ═══════════════════════════════════ agentOf ═══════════════════════════════════
+
+    function test_agentOf_lifecycle() public {
+        assertEq(wallet.agentOf(permissionId), agentAddr, "the granted agent");
+
+        address agentB = makeAddr("agentB");
+        bytes32 pidB = _grantFor(agentB);
+        assertEq(wallet.agentOf(pidB), agentB, "each rules set names its own agent");
+        assertEq(wallet.agentOf(permissionId), agentAddr, "and the first is unchanged");
+
+        vm.prank(WALLET_OWNER);
+        wallet.revokeRules(permissionId);
+        assertEq(wallet.agentOf(permissionId), address(0), "revoked: no agent");
+        assertEq(wallet.agentOf(pidB), agentB, "the other rules set still names its agent");
+
+        assertEq(wallet.agentOf(bytes32(0)), address(0), "the zero id");
+        assertEq(wallet.agentOf(keccak256("random")), address(0), "a random id");
+    }
+
+    function test_agentOf_viaGrantMandateWithSig() public {
+        address agentB = makeAddr("agentB");
+        Session memory s = canonicalSession(agentConfig(agentB), _urpInitData());
+
+        OwnerIntent memory i = blankIntent(WALLET_OWNER, address(wallet), RELAYER);
+        i.sessionHash = keccak256(abi.encode(s));
+        i.grantNonce = wallet.grantNonce();
+        bytes memory sig = signIntent(walletOwnerPk, i);
+
+        vm.prank(RELAYER);
+        bytes32 pid = wallet.grantRulesWithSig(s, i, sig);
+        assertEq(wallet.agentOf(pid), agentB, "a signed grant names its agent");
+
+        etchCallRecorder(GATEWAY);
+        _submitAs(agentB, pid, _singleMode(), _ecd());
+        assertEq(_spentOf(pid), 1 ether, "and that agent can act");
+    }
+
+    // ═══════════════════════════════════ gas ═══════════════════════════════════
+
+    function test_gas_executeAsAgent_universalHappyPath() public {
+        etchCallRecorder(GATEWAY);
+        bytes memory ecd = _ecd();
+        bytes32 mode = _singleMode();
+
+        _submitAs(agentAddr, permissionId, mode, ecd); // warm the wallet, engine and URP rows
+
+        vm.prank(agentAddr);
+        uint256 before = gasleft();
+        wallet.executeAsAgent(permissionId, mode, ecd);
+        uint256 used = before - gasleft();
+
+        emit log_named_uint("executeAsAgent universal steady-state gas", used);
+        uint256 budget = _isolated() ? AGENT_DOOR_GAS_BUDGET_ISOLATED : AGENT_DOOR_GAS_BUDGET;
+        assertLt(used, budget, "agent door gas within its measured budget");
+    }
+
+    /// @dev Whether top-level calls run as separate transactions (`--isolate`). A plain call to an empty
+    ///      account then costs at least the 21,000 intrinsic gas; otherwise it costs a few thousand.
+    function _isolated() internal returns (bool) {
+        address probe = makeAddr("isolationProbe");
+        uint256 before = gasleft();
+        (bool ok,) = probe.call("");
+        uint256 cost = before - gasleft();
+        assertTrue(ok, "a call to an empty account succeeds");
+        return cost >= 21_000;
     }
 }
 
 // ─────────────────────────────── test doubles ───────────────────────────────
-
-/// @dev Records what the wallet BUILT. An observer: it returns a passing verdict and asserts
-///      nothing itself, so the assertions live in the test where they are visible.
-contract CapturingValidator {
-    address public sender;
-    uint256 public nonce;
-    uint256 public initCodeLength;
-    bytes4 public callDataSelector;
-    bytes32 public accountGasLimits;
-    uint256 public preVerificationGas;
-    bytes32 public gasFees;
-    uint256 public paymasterAndDataLength;
-
-    function onInstall(bytes calldata) external { }
-    function onUninstall(bytes calldata) external { }
-
-    function isModuleType(uint256 t) external pure returns (bool) {
-        return t == 1;
-    }
-
-    /// @dev Takes the TYPED struct, exactly as ISmartSession declares it. An earlier version took
-    ///      `bytes calldata` and hand-decoded, which does not match the ABI the wallet encodes.
-    function validateUserOp(PackedUserOperation calldata op, bytes32) external returns (uint256) {
-        sender = op.sender;
-        nonce = op.nonce;
-        initCodeLength = op.initCode.length;
-        callDataSelector = bytes4(op.callData);
-        accountGasLimits = op.accountGasLimits;
-        preVerificationGas = op.preVerificationGas;
-        gasFees = op.gasFees;
-        paymasterAndDataLength = op.paymasterAndData.length;
-        return 0;
-    }
-}
-
-/// @dev Returns an arbitrary ValidationData so the wallet's verdict enforcement is testable. The
-///      real engine cannot be made to produce these; this is an observer of the wallet's reaction.
-contract VerdictValidator {
-    uint256 private _vd;
-
-    function setVerdict(uint256 vd) external {
-        _vd = vd;
-    }
-
-    function onInstall(bytes calldata) external { }
-    function onUninstall(bytes calldata) external { }
-
-    function isModuleType(uint256 t) external pure returns (bool) {
-        return t == 1;
-    }
-
-    fallback(bytes calldata) external returns (bytes memory) {
-        return abi.encode(_vd);
-    }
-}
-
-/// @dev Verifies the opHash it is handed against one supplied by the test. An always-succeed mock
-///      would accept anything, so a field-binding test built on one could never fail.
-contract HashCheckingValidator {
-    error HashMismatch();
-
-    bytes32 private _expected;
-
-    function expectHash(bytes32 h) external {
-        _expected = h;
-    }
-
-    function onInstall(bytes calldata) external { }
-    function onUninstall(bytes calldata) external { }
-
-    function isModuleType(uint256 t) external pure returns (bool) {
-        return t == 1;
-    }
-
-    function validateUserOp(PackedUserOperation calldata, bytes32 opHash) external view returns (uint256) {
-        if (opHash != _expected) revert HashMismatch();
-        return 0;
-    }
-}
-
-/// @dev Re-enters the agent door during validation, to prove the position is already consumed.
-contract ReenteringValidator {
-    address private _wallet;
-    bytes private _ecd;
-    bytes32 private _mode;
-    bool public reentryFailed;
-
-    function arm(address w, bytes calldata ecd, bytes32 m) external {
-        _wallet = w;
-        _ecd = ecd;
-        _mode = m;
-    }
-
-    function onInstall(bytes calldata) external { }
-    function onUninstall(bytes calldata) external { }
-
-    function isModuleType(uint256 t) external pure returns (bool) {
-        return t == 1;
-    }
-
-    fallback(bytes calldata) external returns (bytes memory) {
-        // Try to reuse position 0 while the outer frame is still validating it.
-        (bool ok,) = _wallet.call(
-            abi.encodeWithSignature(
-                "executeWithSession(address,bytes32,bytes,bytes,uint192,uint64,uint48)",
-                address(this),
-                _mode,
-                _ecd,
-                new bytes(33),
-                uint192(0),
-                uint64(0),
-                uint48(0)
-            )
-        );
-        if (!ok) reentryFailed = true;
-        return abi.encode(uint256(0));
-    }
-}
 
 contract RevertingGateway {
     error GatewayRejected();
@@ -1367,9 +1138,9 @@ contract RevertingGateway {
     }
 }
 
-/// @dev An action policy that permits everything. Used ONLY to BYPASS URP in W-29(b), so the
-///      engine's own InvalidSelfCall is reachable and provable on its own. It is never used to
-///      establish that something is allowed.
+/// @dev An action policy that permits everything. Used ONLY to BYPASS URP in W-29(c) and the
+///      dispatch-guard test, so the engine's and wallet's own refusals are reachable and provable on
+///      their own. It is never used to establish that something is allowed.
 contract PermissivePolicy {
     function onInstall(bytes calldata) external { }
     function onUninstall(bytes calldata) external { }
@@ -1390,5 +1161,38 @@ contract PermissivePolicy {
     ///      InvalidSelfCall with URP out of the way. It never establishes that something is allowed.
     function checkAction(ConfigId, address, address, uint256, bytes calldata) external pure returns (uint256) {
         return 0;
+    }
+}
+
+/// @dev An action policy that returns a fixed validation-data word. Observer, never oracle: it
+///      supplies only the verdict whose ENFORCEMENT by the wallet is under test.
+contract FixedVerdictPolicy {
+    uint256 public immutable VERDICT;
+
+    constructor(uint256 verdict) {
+        VERDICT = verdict;
+    }
+
+    function onInstall(bytes calldata) external { }
+    function onUninstall(bytes calldata) external { }
+
+    /// @dev The engine calls this during enableSessions; it must not revert.
+    function initializeWithMultiplexer(address, ConfigId, bytes calldata) external { }
+
+    function checkAction(ConfigId, address, address, uint256, bytes calldata) external view returns (uint256) {
+        return VERDICT;
+    }
+
+    /// @dev Same ERC-165 shape as `PermissivePolicy`: OZ's ERC165Checker requires 0xffffffff => false.
+    function supportsInterface(bytes4 id) external pure returns (bool) {
+        if (id == 0xffffffff) return false;
+        return id == type(IERC165).interfaceId || id == type(IActionPolicy).interfaceId;
+    }
+}
+
+/// @dev A native target that re-enters the wallet's agent door from inside the dispatched call.
+contract ReenteringTarget {
+    function poke(address wallet, bytes32 pid, bytes32 mode, bytes calldata ecd) external {
+        AGW(payable(wallet)).executeAsAgent(pid, mode, ecd);
     }
 }

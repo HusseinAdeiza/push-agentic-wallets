@@ -88,7 +88,7 @@ contract PushAgentWalletOwnerIntentTest is BaseTest {
             maxValue: 0
         });
         return canonicalSession(
-            ecdsaConfig(agentAddr),
+            agentConfig(agentAddr),
             universalInitData(
                 Config({
                     initialized: false,
@@ -176,7 +176,7 @@ contract PushAgentWalletOwnerIntentTest is BaseTest {
         Session memory s = _session();
         OwnerIntent memory i = _grantIntent(wallet, ownerAddr, s);
         bytes memory sig = signIntent(ownerPk, i);
-        s.sessionValidatorInitData = ecdsaConfig(makeAddr("attackerKey"));
+        s.sessionValidatorInitData = agentConfig(makeAddr("attacker"));
         vm.expectRevert(abi.encodeWithSelector(AGWErrors.IntentSessionMismatch.selector, keccak256(abi.encode(s))));
         _grantWithSig(s, i, sig);
     }
@@ -523,26 +523,14 @@ contract PushAgentWalletOwnerIntentTest is BaseTest {
         assertEq(wallet.getNonce(OWNER_LANE_FLAG), 0, "the nonce write unwound with the revert");
     }
 
-    /// ⚠️ NEVER-DELETE. The same key signing an agent op hash cannot pass as the owner.
+    /// ⚠️ NEVER-DELETE. An owner signature over anything but the EIP-712 intent digest is refused.
+    ///      The closest analogue of an agent-door request — `(rulesId, mode, keccak256(calldata))` for
+    ///      the same calldata — signed by the OWNER's own key, cannot pass as the owner's intent.
     function test_X18_sessionSigNeverValidatesAsOwnerIntent() public {
         bytes memory cd = _pingCalldata();
         OwnerIntent memory i = _execIntent(_single(), cd);
-        // the ten-field agent op hash for the same calldata, signed by the OWNER's key
-        bytes32 opHash = keccak256(
-            abi.encode(
-                keccak256("AGW.Op.v3"),
-                block.chainid,
-                address(wallet),
-                address(engine),
-                bytes32(uint256(1)),
-                _single(),
-                keccak256(cd),
-                uint192(0),
-                uint64(0),
-                uint48(0)
-            )
-        );
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPk, opHash);
+        bytes32 requestHash = keccak256(abi.encode(bytes32(uint256(1)), _single(), keccak256(cd)));
+        (uint8 v, bytes32 r, bytes32 s) = vm.sign(ownerPk, requestHash);
         vm.expectRevert(AGWErrors.InvalidOwnerSignature.selector);
         _execWithSig(_single(), cd, i, abi.encodePacked(r, s, v));
     }

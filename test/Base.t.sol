@@ -77,9 +77,6 @@ abstract contract BaseTest is Test {
 
     // ─────────────────────────── named addresses ───────────────────────────
 
-    /// @dev The Ed25519 precompile. Must equal AgentValidator.USV — asserted in the smoke test.
-    address internal constant USV = 0xEC00000000000000000000000000000000000001;
-
     address internal GATEWAY;
     address internal EXECUTOR_MODULE;
     address internal RELAYER;
@@ -254,65 +251,11 @@ abstract contract BaseTest is Test {
         (addr, pk) = makeAddrAndKey(label);
     }
 
-    /// @dev Scheme 0, 20-byte key. The exact initData format the validator PRD §10 item 5 freezes:
-    ///      abi.encode(uint8, bytes). It feeds the permission id; changing it changes every id.
-    function ecdsaConfig(address signer) internal pure returns (bytes memory) {
-        return abi.encode(uint8(0), abi.encodePacked(signer));
-    }
-
-    /// @dev Scheme 1, 32-byte key.
-    function ed25519Config(bytes32 pubKey) internal pure returns (bytes memory) {
-        return abi.encode(uint8(1), abi.encodePacked(pubKey));
-    }
-
-    /// @dev 65-byte r‖s‖v. EIP-2098 compact signatures are deliberately unsupported.
-    function signOpHash(uint256 pk, bytes32 opHash) internal pure returns (bytes memory) {
-        (uint8 v, bytes32 r, bytes32 s) = vm.sign(pk, opHash);
-        return abi.encodePacked(r, s, v);
-    }
-
-    // ─────────────────────────── the USV observer ───────────────────────────
-
-    // OBSERVER, NEVER ORACLE. This mock records which precompile method was called;
-    // it asserts nothing about whether the signature was valid. Liveness of the real
-    // Ed25519 path is proven only by P-03 against the live precompile. The original
-    // critical bug in this validator was masked by a mock that supplied behaviour —
-    // an oracle. Do not extend this mock to return anything but a fixed value.
-    //
-    // MECHANISM NOTE: the validator reaches USV via STATICCALL, so an observer that records
-    // by writing storage cannot work — a staticcall reverts on SSTORE. The observer therefore
-    // returns a fixed `true` and nothing else, and *which method was called* is asserted with
-    // `vm.expectCall(USV, <exact calldata>)` at the assertion site. That keeps the expected
-    // selector visible in the test rather than hidden behind a getter.
-    function etchUSVObserver() internal {
-        vm.etch(USV, type(USVObserver).runtimeCode);
-    }
-
-    /// @dev Assert the next call to USV carries exactly this method + arguments.
-    ///      Pairs with etchUSVObserver: the mock answers, this proves what was asked.
-    function expectUSVCall(bytes memory expectedCalldata) internal {
-        vm.expectCall(USV, expectedCalldata);
-    }
-
-    /**
-     * @dev A USV observer that answers a fixed `false`.
-     *
-     *      PERMITTED ONLY IN TESTS NAMED FOR PROPAGATION, NEVER FOR VALIDITY. Pairing this with
-     *      `etchUSVObserver` lets V-05/V-06 prove that whatever the precompile answered is what the
-     *      validator returned — which is the only Ed25519 property observable without a live chain.
-     *      A test that used either observer to claim a signature is *correct* would be the oracle
-     *      mistake that let this repo's one shipped critical bug survive review.
-     *
-     *      Correctness and liveness of the Ed25519 branch are proven ONLY by P-03 against the real
-     *      precompile; P-04 proves it fails closed when USV has no code.
-     */
-    function etchUSVFalseObserver() internal {
-        vm.etch(USV, type(USVFalseObserver).runtimeCode);
-    }
-
-    /// @dev Remove all code from USV, so fails-closed tests (P-04) exercise a codeless precompile.
-    function stripUSV() internal {
-        vm.etch(USV, "");
+    /// @dev The agent config every rules set carries: the agent's Push address, `abi.encode(agent)`.
+    ///      The exact format `AgentConfigLib` decodes. It feeds the permission id; changing it
+    ///      changes every id.
+    function agentConfig(address agent) internal pure returns (bytes memory) {
+        return abi.encode(agent);
     }
 
     // ─────────────────────── the storage-layout assertion ───────────────────────
@@ -790,24 +733,5 @@ contract CallRecorder {
 
     receive() external payable {
         count++;
-    }
-}
-
-/// @dev Deployed only via vm.etch at USV. See etchUSVObserver's comment: observer, never oracle.
-///      Returns a FIXED value and records nothing — it must be safe under STATICCALL, which is
-///      how the validator actually reaches the precompile. What was called is asserted with
-///      vm.expectCall, not read back from here.
-contract USVObserver {
-    fallback(bytes calldata) external returns (bytes memory) {
-        return abi.encode(true);
-    }
-}
-
-/// @dev The `false` counterpart. See etchUSVFalseObserver: permitted only in tests named for
-///      PROPAGATION, never for validity. It supplies no correctness — it exists so that
-///      "the validator returns what the precompile said" is assertable in both directions.
-contract USVFalseObserver {
-    fallback(bytes calldata) external returns (bytes memory) {
-        return abi.encode(false);
     }
 }

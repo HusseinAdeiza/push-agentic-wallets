@@ -86,7 +86,8 @@ contract Deploy is Script {
         // 1 · SmartSession — plain deploy: no constructor, no arguments, no admin, no owner.
         SmartSession engine = new SmartSession();
 
-        // 2 · AgentValidator — stateless; never installed, only named inside each permission.
+        // 2 · AgentValidator — stateless sender validator; never installed, only named inside each rules set
+        //     as the agent check.
         AgentValidator validator = new AgentValidator();
 
         // 3 · URP — logic + Transparent proxy, INITIALISED IN THE SAME TRANSACTION. A proxy left

@@ -19,7 +19,7 @@ ERC-7579 smart accounts on Push Chain that let an autonomous agent execute bound
 | `AGWFactory` | **Built** — `src/AGWFactory.sol`; creates agent wallets at addresses computable before deployment |
 | `AGW` (Agentic Wallet) | **Built** — `src/AGW.sol`; holds funds; an unrestricted owner door and a fully checked agent door |
 | `UniversalRulesPolicy` (URP) | **Built** — `src/policies/UniversalRulesPolicy.sol`; the only novel contract: opens the cross-chain payload and enforces every limit |
-| `AgentValidator` | **Carried forward** — `src/validators/AgentValidator.sol`, stateless signature check (secp256k1 / Ed25519) |
+| `AgentValidator` | **Carried forward** — `src/validators/AgentValidator.sol`, stateless sender validator |
 | `SmartSession` | **Adopted unmodified** — `lib/smartsessions/`, the permission engine |
 
 ## What is in `src/` today
