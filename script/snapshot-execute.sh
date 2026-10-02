@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# A WARNING, never a gate: compares the owner-door (execute) tests' gas against the 67929f2 baseline
+# A WARNING, never a gate: compares the owner-door (execute) tests' gas against the B2 baseline
 # in .gas-snapshot-execute and flags any that moved by more than TOLERANCE gas.
 #
 # Adding functions to the wallet shifts the selector dispatcher and the code size, so gas moves with
 # execute() itself untouched. MEASURED when the owner-intent doors were added: test_AccountId, a
 # constant view, moved 172 gas; the owner-door tests moved 223-794. The tolerance is set above that
 # noise floor. The binding pins on execute() are script/check-execute.sh and
-# test_W_execute_readsNoStorage — never this. `forge snapshot --tolerance` is a percentage, which is
+# test_W_execute_touchesOnlyTheCheckpointSlot — never this. `forge snapshot --tolerance` is a percentage, which is
 # why this is a script and not a flag.
 set -euo pipefail
 
@@ -30,5 +30,5 @@ awk -v tol="$TOLERANCE" -v doors="$OWNER_DOOR_TESTS" '
         d = g - base[n]; if (d < 0) d = -d
         if (d > tol) { printf "WARN %s moved %d gas (%s -> %s)\n", n, d, base[n], g; warned = 1 }
     }
-    END { if (!warned) print "snapshot-execute: all owner-door tests within " tol " gas of 67929f2" }
+    END { if (!warned) print "snapshot-execute: all owner-door tests within " tol " gas of the B2 baseline" }
 ' "$BASELINE" "$current"

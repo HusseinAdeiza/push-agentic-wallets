@@ -31,6 +31,7 @@ contract NamingTest is BaseTest {
         assertEq(IAGW.RulesGranted.selector, keccak256("RulesGranted(bytes32,uint8,bytes32,string)"));
         assertEq(IAGW.RulesRevoked.selector, keccak256("RulesRevoked(bytes32)"));
         assertEq(IAGW.RulesActionAuthorized.selector, keccak256("RulesActionAuthorized(bytes32,address,bytes32)"));
+        assertEq(IAGW.Checkpointed.selector, keccak256("Checkpointed(uint64,uint8,bytes32,uint64)"));
         assertEq(
             IUniversalRulesPolicy.RulesConfigured.selector,
             keccak256("RulesConfigured(bytes32,address,address,uint8,uint8,bytes32)")
@@ -60,6 +61,8 @@ contract NamingTest is BaseTest {
         assertEq(AGW.domainSeparator.selector, bytes4(keccak256("domainSeparator(uint256)")));
         assertEq(AGW.executeAsAgent.selector, bytes4(keccak256("executeAsAgent(bytes32,bytes32,bytes)")));
         assertEq(AGW.agentOf.selector, bytes4(keccak256("agentOf(bytes32)")));
+        assertEq(AGW.checkpointCount.selector, bytes4(keccak256("checkpointCount()")));
+        assertEq(AGW.lastCheckpointBlock.selector, bytes4(keccak256("lastCheckpointBlock()")));
         assertEq(IAGW.SESSION_ENGINE.selector, bytes4(keccak256("SESSION_ENGINE()")));
         assertEq(IAGW.RULES_POLICY.selector, bytes4(keccak256("RULES_POLICY()")));
         assertEq(IAGW.SESSION_VALIDATOR.selector, bytes4(keccak256("SESSION_VALIDATOR()")));
@@ -70,11 +73,11 @@ contract NamingTest is BaseTest {
         );
     }
 
-    /// @dev XOR of the wallet's 29 external selectors — taken from the CONTRACT, or as literals for the
+    /// @dev XOR of the wallet's 31 external selectors — taken from the CONTRACT, or as literals for the
     ///      four auto-getters — equals `type(IAGW).interfaceId`, so `IAGW` declares exactly the wallet's
     ///      surface. `assertSelectorSet` in the owner-door suite proves the contract has exactly these.
     function test_naming_IAGWIsTheWholeSurface() public pure {
-        bytes4[29] memory s = [
+        bytes4[31] memory s = [
             AGW.initializeAccount.selector,
             AGW.execute.selector,
             AGW.grantRules.selector,
@@ -85,6 +88,8 @@ contract NamingTest is BaseTest {
             AGW.revokeAllRules.selector,
             AGW.executeAsAgent.selector,
             AGW.agentOf.selector,
+            AGW.checkpointCount.selector,
+            AGW.lastCheckpointBlock.selector,
             AGW.installModule.selector,
             AGW.uninstallModule.selector,
             AGW.isModuleInstalled.selector,
@@ -109,7 +114,7 @@ contract NamingTest is BaseTest {
         for (uint256 i; i < s.length; ++i) {
             x ^= s[i];
         }
-        assertEq(x, type(IAGW).interfaceId, "IAGW declares exactly the wallet's 29 external functions");
+        assertEq(x, type(IAGW).interfaceId, "IAGW declares exactly the wallet's 31 external functions");
     }
 
     function test_naming_noLegacyVocabularyInABIs() public view {

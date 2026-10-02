@@ -22,15 +22,17 @@ Everything else in the repository is history. **The PRD is the specification; th
 make build             # forge build
 make test              # check-execute, then forge test -vv
 make sizes             # the S-06 size gate — forge build --sizes, exits non-zero over 24,576 B
-make check-execute     # sha256 pin: execute() byte-identical to its audited text (67929f2 + the nomenclature rename)
+make check-execute     # sha256 pin: execute() byte-identical to its reviewed text (the B2 checkpoint revision)
 make snapshot-execute  # WARNING only — owner-door test gas vs .gas-snapshot-execute (±1000 gas)
 make e2e               # PARKED: prints that the Marketplace E2E awaits its rewrite, exits 1
 forge fmt              # line_length 120, tab_width 4
 ```
 
 **`execute()` is hash-pinned.** `script/check-execute.sh` hashes the source span of
-`AGW.execute` — not a byte, not a comment may change. Owner-authority features go in
-*sibling* doors (`executeWithSig`, `grantRulesWithSig`), never in `execute`.
+`AGW.execute` (pinned at the B2 checkpoint revision) — not a byte, not a comment may change.
+Owner-authority features go in *sibling* doors (`executeWithSig`, `grantRulesWithSig`), never in
+`execute`; the per-call checkpoint is the one addition `execute` carries, and it consults nothing and
+cannot revert.
 
 **The Marketplace E2E deploys the core repo's own artifacts** via `vm.deployCode` (core is
 shanghai / 99,999 runs / OZ 5.3; this repo does not recompile it). Run `make e2e` — `test_E2E_13` fails on
@@ -117,12 +119,17 @@ AGW follows the core/gateway naming standard (`docs-internal/sdk-first-changes/N
 ### Load-bearing invariants (each has a permanent test)
 
 - **The two doors are the whole authority model.** `execute` (owner door) consults *exactly two things* —
-  the immutable-args owner and calldata. No module, policy, engine state or flag may ever be read there; it
-  must succeed with the engine uninstalled, a hostile validator installed, or ghost-rules state. Adding
-  any check is the catastrophic regression. `executeAsAgent` (agent door) is callable only by the rules set's
-  agent: the wallet checks `msg.sender == agentOf(rulesId)` and writes the sender into the engine's signature
-  field, which the sender validator checks. The agent is a Push address — an EOA, or the UEA of an external
-  key; the wallet verifies no signature, and replay is the sender's own nonce.
+  the immutable-args owner and calldata — and its only side effect besides the calls is one checkpoint
+  write per call to the wallet's own slot 0, which cannot revert. No module, policy, engine state or flag
+  may ever be read there; it must succeed with the engine uninstalled, a hostile validator installed, or
+  ghost-rules state. Adding any check is the catastrophic regression. `executeAsAgent` (agent door) is
+  callable only by the rules set's agent: the wallet checks `msg.sender == agentOf(rulesId)` and writes the
+  sender into the engine's signature field, which the sender validator checks. The agent is a Push
+  address — an EOA, or the UEA of an external key; the wallet verifies no signature, and replay is the
+  sender's own nonce.
+- **Checkpoints never tick from the agent door.** `_checkpoint` is called only from the two owner doors
+  (once per call, before the call), `_grantRules`, `revokeRules` and `revokeAllRules` — never from
+  `_execute`, which both doors share. Kinds are a frozen, append-only wire format.
 - **Owner-intent doors are siblings, not extensions, of `execute`.** `executeWithSig` and
   `grantRulesWithSig` let a relayer (`intent.executor`) present an EIP-712 `OwnerIntent` signed by the
   owner — usually a UEA, which has no ERC-1271, so `OwnerAuthLib.isOwnerSig` tries
@@ -296,7 +303,7 @@ conveniences: the artifact-based storage-layout and selector-set assertions depe
 | `src/interfaces/` | `IUniversalRulesPolicy`, `IAgentValidator`, `IAGWFactory`, `IAGW`, `IAGWInit`, `ISmartSessionConfigReader` (the one engine view upstream omits), gateway + module interfaces |
 | `src/libraries/` | `Types.sol` (the policy's terms/config types, `RulesType`, `VmFamily`, `OwnerIntent` + EIP-712 typehashes, and the temporary gateway/core mirrors), `Errors.sol` (one error library per contract), `PushChainLib` (mode/VM derivation), `OwnerAuthLib` (owner-signature check shared by factory and wallet), `AgentConfigLib` (the one decoder of the agent config, shared by validator and wallet), `ModeLib`, `ExecutionLib` |
 | `test/Base.t.sol` | Shared harness — every suite extends `BaseTest` |
-| `test/unit/`, `test/integration/`, `test/mocks/` | Suites numbered by area (`1_factory` … `27_naming`; slot 18 is reserved for the B2 suite), end-to-end flows, observers |
+| `test/unit/`, `test/integration/`, `test/mocks/` | Suites numbered by area (`1_factory` … `27_naming`), end-to-end flows, observers |
 | `script/check-execute.sh`, `script/snapshot-execute.sh` | The `execute()` source pin and its advisory gas check |
 | `demo/`, `demo-native/` | Cross-chain and Push-native demos — **frozen** against the deployed v1 contracts; own `justfile`, Foundry profile and `state/` ledger |
 | `script/Deploy.s.sol` | The five-contract deployment, in dependency order |

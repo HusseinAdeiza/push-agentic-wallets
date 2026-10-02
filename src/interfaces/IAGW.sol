@@ -3,7 +3,7 @@ pragma solidity 0.8.26;
 
 import { Session } from "smartsessions/DataTypes.sol";
 
-import { OwnerIntent, RulesType } from "../libraries/Types.sol";
+import { OwnerIntent, RulesType, CheckpointKind } from "../libraries/Types.sol";
 
 /**
  * @title  IAGW — the Agentic Wallet's external surface.
@@ -66,6 +66,14 @@ interface IAGW {
     ///         A deliberate wire-format break from the earlier `(rulesId, nonceKey, nonceSeq, opHash)`
     ///         shape; it ships with the new deployment.
     event RulesActionAuthorized(bytes32 indexed rulesId, address indexed agent, bytes32 callsHash);
+
+    /// @notice The owner side of this wallet changed. The wallet's checkpoint counter is now `seq`.
+    /// @dev    Emitted once per owner-door call (before the call runs), once per grant and once per
+    ///         revoked id. Never emitted by the agent door. On-chain consumers compare
+    ///         `checkpointCount()` against a snapshot; `kind` and `ref` are for indexers — `ref` is
+    ///         `keccak256(abi.encode(target, value, callData))` for `OWNER_ACTION` and the `rulesId`
+    ///         for `RULES_GRANTED` / `RULES_REVOKED`.
+    event Checkpointed(uint64 indexed seq, CheckpointKind kind, bytes32 ref, uint64 blockNumber);
 
     // ═══════════════════════════════ AGW_2: OWNER DOOR ═══════════════════════════════
 
@@ -142,6 +150,14 @@ interface IAGW {
 
     /// @notice The salt the next grant will use.
     function grantNonce() external view returns (uint64);
+
+    /// @notice Owner-side checkpoints so far. Any owner-door call, grant or revoke moves it; agent
+    ///         actions never do.
+    function checkpointCount() external view returns (uint64);
+
+    /// @notice `block.number` of the latest checkpoint, or zero if none. Consumers compare counts, not
+    ///         blocks: several checkpoints can share a block.
+    function lastCheckpointBlock() external view returns (uint64);
 
     /// @notice The OwnerIntent EIP-712 domain separator for a signer on `signerChainId`. Identical to
     ///         the factory's: the factory is the verifying contract.

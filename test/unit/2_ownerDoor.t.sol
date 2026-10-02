@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import { Vm } from "forge-std/Vm.sol";
+
 import { BaseTest } from "../Base.t.sol";
 
 import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
@@ -185,6 +187,7 @@ contract PushAgentWalletTest is BaseTest {
     function _assertOwnerDoorFullyLiveOn(AGW w, string memory cell) internal {
         address sink = makeAddr(string.concat("sink:", cell));
         uint256 before = sink.balance;
+        uint64 cp0 = w.checkpointCount();
 
         // (a) SINGLE — a plain transfer (this is what "withdrawal" is; there is no withdraw()).
         vm.prank(WALLET_OWNER);
@@ -217,6 +220,8 @@ contract PushAgentWalletTest is BaseTest {
         assertEq(sink.balance, before + 2 ether, string.concat(cell, ": batch transfer leg"));
         assertEq(callsRecorded(GATEWAY), 1, string.concat(cell, ": batch gateway leg"));
         vm.etch(GATEWAY, "");
+
+        assertEq(w.checkpointCount(), cp0 + 4, string.concat(cell, ": every owner call ticked"));
     }
 
     /// A non-owner is refused in every one of those states — the door is open to exactly one address.
@@ -618,6 +623,9 @@ contract PushAgentWalletTest is BaseTest {
     }
 
     /// The event is emitted AFTER successful dispatch — a failed call emits nothing.
+    ///
+    /// Counts `OwnerExecuted` only: forge also records the `Checkpointed` log emitted (before the call)
+    /// inside the frame that then reverted, though the chain keeps nothing from that frame.
     function test_W23_NoEventOnFailedDispatch() public {
         Reverter r = new Reverter();
         vm.recordLogs();
@@ -625,7 +633,14 @@ contract PushAgentWalletTest is BaseTest {
         try wallet.execute(_singleMode(), _singleCalldata(address(r), 0, abi.encodeCall(Reverter.boom, ()))) {
             fail();
         } catch { }
-        assertEq(vm.getRecordedLogs().length, 0, "no OwnerExecuted on a failed dispatch");
+        Vm.Log[] memory logs = vm.getRecordedLogs();
+        uint256 ownerExecuted;
+        for (uint256 k; k < logs.length; ++k) {
+            if (logs[k].emitter == address(wallet) && logs[k].topics[0] == IAGW.OwnerExecuted.selector) {
+                ++ownerExecuted;
+            }
+        }
+        assertEq(ownerExecuted, 0, "no OwnerExecuted on a failed dispatch");
     }
 
     // ═══════════════════════════════════ W-25 ═══════════════════════════════════
@@ -642,7 +657,7 @@ contract PushAgentWalletTest is BaseTest {
      * test fails and a human decides whether the ABI change was intended.
      */
     function test_W25_Clone_NoUpgradeSurface_ExactSelectorSet() public view {
-        bytes4[] memory expected = new bytes4[](29);
+        bytes4[] memory expected = new bytes4[](31);
         uint256 i;
 
         // one-shot initialisation
@@ -670,6 +685,8 @@ contract PushAgentWalletTest is BaseTest {
         expected[i++] = AGW.factory.selector;
         expected[i++] = AGW.getNonce.selector;
         expected[i++] = AGW.grantNonce.selector;
+        expected[i++] = AGW.checkpointCount.selector;
+        expected[i++] = AGW.lastCheckpointBlock.selector;
         expected[i++] = AGW.accountId.selector;
         expected[i++] = IAGW.SESSION_ENGINE.selector;
         expected[i++] = IAGW.RULES_POLICY.selector;
@@ -682,7 +699,7 @@ contract PushAgentWalletTest is BaseTest {
         expected[i++] = AGW.supportsInterface.selector;
         expected[i++] = AGW.isValidSignature.selector;
 
-        assertEq(i, 29, "the hard-coded list must be complete");
+        assertEq(i, 31, "the hard-coded list must be complete");
         assertSelectorSet("AGW", expected);
     }
 
@@ -794,20 +811,25 @@ contract PushAgentWalletTest is BaseTest {
     // ═════════════════════════════ storage layout ═════════════════════════════
 
     /**
-     * THE WALLET'S WHOLE STATE IS FOUR DECLARATIONS, in this order (§4). Asserted against solc's
-     * own storageLayout, not a slot read.
+     * THE WALLET'S WHOLE STATE IS SIX DECLARATIONS, in this order. Asserted against solc's own
+     * storageLayout, not a slot read.
      *
-     * `_initialized` (bool) and `_grantNonce` (uint64) MUST share slot 0 — the PRD specifies the
-     * packing, and a reordering that unpacked them would be a silent gas regression on every grant.
+     * `_initialized` (bool), `_grantNonce` (uint64), `_checkpointCount` (uint64) and
+     * `_lastCheckpointBlock` (uint64) MUST share slot 0: the packing keeps every checkpoint a rewrite
+     * of a non-zero slot, and a reordering that unpacked them would be a silent gas regression on
+     * every owner call, grant and revoke.
      */
-    function test_StorageLayout_ExactlyFourDeclarations() public view {
+    function test_StorageLayout_ExactlySixDeclarations() public view {
         string memory artifact = vm.readFile("out/AGW.sol/AGW.json");
 
-        string[] memory labels = new string[](4);
+        string[] memory labels = new string[](6);
         labels[0] = "_initialized";
         labels[1] = "_grantNonce";
-        labels[2] = "_installedValidators";
-        labels[3] = "_nonces";
+        labels[2] = "_checkpointCount";
+        labels[3] = "_lastCheckpointBlock";
+        labels[4] = "_installedValidators";
+        labels[5] = "_nonces";
+        string[6] memory slots = ["0", "0", "0", "0", "1", "2"];
 
         for (uint256 i; i < labels.length; ++i) {
             string memory base = string.concat(".storageLayout.storage[", vm.toString(i), "]");
@@ -816,19 +838,22 @@ contract PushAgentWalletTest is BaseTest {
                 labels[i],
                 string.concat("declaration ", vm.toString(i))
             );
+            assertEq(
+                vm.parseJsonString(artifact, string.concat(base, ".slot")), slots[i], string.concat(labels[i], " slot")
+            );
         }
 
-        // exactly four: index 4 must not exist
+        // exactly six: index 6 must not exist
         assertFalse(
-            vm.keyExistsJson(artifact, ".storageLayout.storage[4]"),
-            "a fifth storage declaration appeared - the wallet's whole state is four"
+            vm.keyExistsJson(artifact, ".storageLayout.storage[6]"),
+            "a seventh storage declaration appeared - the wallet's whole state is six"
         );
 
-        // the packing: both in slot 0
-        assertEq(vm.parseJsonString(artifact, ".storageLayout.storage[0].slot"), "0", "_initialized slot");
-        assertEq(vm.parseJsonString(artifact, ".storageLayout.storage[1].slot"), "0", "_grantNonce packs into slot 0");
-        assertEq(vm.parseJsonString(artifact, ".storageLayout.storage[2].slot"), "1", "_installedValidators slot");
-        assertEq(vm.parseJsonString(artifact, ".storageLayout.storage[3].slot"), "2", "_nonces slot");
+        // the packing of slot 0
+        assertEq(vm.parseJsonUint(artifact, ".storageLayout.storage[0].offset"), 0, "_initialized offset");
+        assertEq(vm.parseJsonUint(artifact, ".storageLayout.storage[1].offset"), 1, "_grantNonce offset");
+        assertEq(vm.parseJsonUint(artifact, ".storageLayout.storage[2].offset"), 9, "_checkpointCount offset");
+        assertEq(vm.parseJsonUint(artifact, ".storageLayout.storage[3].offset"), 17, "_lastCheckpointBlock offset");
     }
 
     // ═══════════════════════════════ views & plumbing ═══════════════════════════════
@@ -910,21 +935,21 @@ contract PushAgentWalletTest is BaseTest {
     // ═══════════════════ execute() is untouched (UniversalMarketplace PRD, D5) ═══════════════════
 
     /**
-     * ⚠️ NEVER-DELETE. The main pin for "execute is not modified": it touches NO wallet storage at all,
-     * single or batch — no read, no write. The reentrancy guard is transient (TLOAD/TSTORE, not
-     * recorded) and the owner comes from the clone's code, so zero is exact. `executeWithSig`, which
-     * reads the nonce lane, is the contrast that shows the recorder is live.
+     * ⚠️ NEVER-DELETE. The owner-door invariant: `execute` reads no module, policy or engine state; its
+     * only side effect besides the calls is one checkpoint write per call to the wallet's own slot 0,
+     * which cannot revert. Single and batch, every wallet storage read and write is slot 0, and the
+     * engine is never touched. The reentrancy guard is transient (TLOAD/TSTORE, not recorded) and the
+     * owner comes from the clone's code. `executeWithSig`, which also reads its nonce lane, is the
+     * contrast that shows the recorder sees more than slot 0 when there is more.
      */
-    function test_W_execute_readsNoStorage() public {
+    function test_W_execute_touchesOnlyTheCheckpointSlot() public {
         address target = makeAddr("anyTarget");
         vm.deal(address(wallet), 1 ether);
 
         vm.record();
         vm.prank(WALLET_OWNER);
         wallet.execute(ModeCode.unwrap(ModeLib.encodeSimpleSingle()), ExecutionLib.encodeSingle(target, 1, ""));
-        (bytes32[] memory reads, bytes32[] memory writes) = vm.accesses(address(wallet));
-        assertEq(reads.length, 0, "execute (single) must read no wallet storage");
-        assertEq(writes.length, 0, "execute (single) must write no wallet storage");
+        _assertOnlySlotZero("execute (single)");
 
         Execution[] memory b = new Execution[](2);
         b[0] = Execution({ target: target, value: 1, callData: "" });
@@ -932,9 +957,7 @@ contract PushAgentWalletTest is BaseTest {
         vm.record();
         vm.prank(WALLET_OWNER);
         wallet.execute(ModeCode.unwrap(ModeLib.encodeSimpleBatch()), ExecutionLib.encodeBatch(b));
-        (reads, writes) = vm.accesses(address(wallet));
-        assertEq(reads.length, 0, "execute (batch) must read no wallet storage");
-        assertEq(writes.length, 0, "execute (batch) must write no wallet storage");
+        _assertOnlySlotZero("execute (batch)");
 
         // Positive control: the recorder does see the new door's nonce lane.
         (address o, uint256 opk) = ecdsaKey("recorderControlOwner");
@@ -947,9 +970,25 @@ contract PushAgentWalletTest is BaseTest {
         vm.record();
         vm.prank(RELAYER);
         w.executeWithSig(i.mode, cd, i, sig);
-        (reads, writes) = vm.accesses(address(w));
+        (bytes32[] memory reads, bytes32[] memory writes) = vm.accesses(address(w));
         assertGt(reads.length, 0, "control: executeWithSig reads its nonce lane");
         assertGt(writes.length, 0, "control: executeWithSig writes its nonce lane");
+    }
+
+    /// @dev The wallet's recorded accesses are non-empty and all slot 0; the engine's are empty.
+    function _assertOnlySlotZero(string memory what) internal view {
+        (bytes32[] memory reads, bytes32[] memory writes) = vm.accesses(address(wallet));
+        assertGt(reads.length, 0, string.concat(what, " reads the checkpoint slot"));
+        assertGt(writes.length, 0, string.concat(what, " writes the checkpoint slot"));
+        for (uint256 k; k < reads.length; ++k) {
+            assertEq(reads[k], bytes32(0), string.concat(what, " must read no wallet slot but slot 0"));
+        }
+        for (uint256 k; k < writes.length; ++k) {
+            assertEq(writes[k], bytes32(0), string.concat(what, " must write no wallet slot but slot 0"));
+        }
+        (bytes32[] memory engineReads, bytes32[] memory engineWrites) = vm.accesses(address(engine));
+        assertEq(engineReads.length, 0, string.concat(what, " must not read the engine"));
+        assertEq(engineWrites.length, 0, string.concat(what, " must not write the engine"));
     }
 }
 

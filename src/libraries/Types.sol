@@ -165,6 +165,18 @@ bytes32 constant OWNER_INTENT_DOMAIN_VERSION_HASH = keccak256("1");
  */
 uint192 constant OWNER_LANE_FLAG = uint192(1) << 191;
 
+/**
+ * @dev The kinds of owner-side change the wallet records as a checkpoint (`IAGW.Checkpointed`).
+ *
+ *      ORDINALS ARE A FROZEN WIRE FORMAT: indexers and evaluators read them. Append only — never
+ *      reorder, never remove. A future kind (e.g. a binder) is appended as the next ordinal.
+ */
+enum CheckpointKind {
+    OWNER_ACTION,
+    RULES_GRANTED,
+    RULES_REVOKED
+}
+
 // ─────────────────────── policy types (moved from IURP) ───────────────────────
 
 /**

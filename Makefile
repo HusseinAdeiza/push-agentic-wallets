@@ -6,16 +6,16 @@ build:
 test: check-execute
 	forge test -vv
 
-# execute() — the owner door — must stay byte-identical to its audited text at 67929f2, with only the
-# nomenclature change's error-library rename applied (PushWalletErrors. -> AGWErrors.).
-# The binding pins are this source hash and test_W_execute_readsNoStorage (0 reads, 0 writes).
+# execute() — the owner door — must stay byte-identical to its reviewed text (the B2 checkpoint
+# revision). The binding pins are this source hash and test_W_execute_touchesOnlyTheCheckpointSlot
+# (wallet storage access to slot 0 only, no engine access).
 check-execute:
 	./script/check-execute.sh
 
 # A WARNING, never a gate. Adding functions to the wallet shifts the selector dispatcher, so the
 # execute() tests' gas can move by a few tens of units with execute() itself untouched. Tolerance is
 # 100 gas; a larger move is worth a look, not a failure. The baseline in .gas-snapshot-execute was
-# generated from the 67929f2 sources (before the owner-intent doors existed).
+# regenerated from the B2 checkpoint revision.
 snapshot-execute:
 	./script/snapshot-execute.sh
 

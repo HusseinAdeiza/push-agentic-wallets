@@ -627,6 +627,21 @@ abstract contract BaseTest is Test {
         assertEq(callsRecorded(target), 0, "expected no calls to target");
     }
 
+    // ─────────────────────────────── run mode ───────────────────────────────
+
+    /// @dev Whether top-level calls run as separate transactions (`--isolate`, which `--gas-report`
+    ///      switches on). A plain call to an empty account then costs at least the 21,000 intrinsic
+    ///      gas; otherwise it costs a few thousand. Gas tests use it to pick the budget measured for the
+    ///      mode they run in.
+    function isolatedCalls() internal returns (bool) {
+        address probe = makeAddr("isolationProbe");
+        uint256 before = gasleft();
+        (bool ok,) = probe.call("");
+        uint256 cost = before - gasleft();
+        assertTrue(ok, "a call to an empty account succeeds");
+        return cost >= 21_000;
+    }
+
     // ─────────────────────────── owner intents ───────────────────────────
 
     /// @dev The origin chain the default signer "lives on" — Ethereum mainnet. Deliberately NOT

@@ -1108,19 +1108,8 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         uint256 used = before - gasleft();
 
         emit log_named_uint("executeAsAgent universal steady-state gas", used);
-        uint256 budget = _isolated() ? AGENT_DOOR_GAS_BUDGET_ISOLATED : AGENT_DOOR_GAS_BUDGET;
+        uint256 budget = isolatedCalls() ? AGENT_DOOR_GAS_BUDGET_ISOLATED : AGENT_DOOR_GAS_BUDGET;
         assertLt(used, budget, "agent door gas within its measured budget");
-    }
-
-    /// @dev Whether top-level calls run as separate transactions (`--isolate`). A plain call to an empty
-    ///      account then costs at least the 21,000 intrinsic gas; otherwise it costs a few thousand.
-    function _isolated() internal returns (bool) {
-        address probe = makeAddr("isolationProbe");
-        uint256 before = gasleft();
-        (bool ok,) = probe.call("");
-        uint256 cost = before - gasleft();
-        assertTrue(ok, "a call to an empty account succeeds");
-        return cost >= 21_000;
     }
 }
 

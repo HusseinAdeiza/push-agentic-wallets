@@ -283,6 +283,7 @@ msg.sender = 0xbobagwcea · onBehalfOf = 0xbobagwcea · shares → 0xbobagwcea
 - **Withdraw** — `execute([...])`. **There is no `withdraw()` function**; the owner path *is* withdrawal, with no destination restriction and no policy in the path. It must succeed in every degraded state — zero rules sets, engine uninstalled, hostile validator installed.
 - **Revoke** — `revokeRules(pid)` (existence-checked, so a typo reverts loudly instead of silently "succeeding") or `revokeAllRules()`. Immediate on Push, unblockable, no callbacks on the path. **One honest limit:** an instruction already dispatched across the bridge still completes.
 - **Change a rules set** — **it cannot be edited.** A change is one owner transaction batching: `URP.assertSpent(expected)` → `revokeRules(old)` → `grantRules(new)`. If the agent spent in the composition window, the assertion reverts the whole change. **Counters restart at zero on the new rules set**, and any request for the old id is dead: removal cleared its agent, and the new rules set has a new id.
+- **Every one of these advances the wallet's checkpoint counter** — one tick per owner-door call, per grant and per revoked id — so a job's evaluator can tell the owner acted. Agent actions never move it.
 
 ### STAGE 7b — the second action, and why it may carry zero USDC
 

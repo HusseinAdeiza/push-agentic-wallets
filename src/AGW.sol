@@ -22,6 +22,7 @@ import {
     OWNER_LANE_FLAG,
     SEND_OUTBOUND_SELECTOR,
     RulesType,
+    CheckpointKind,
     ENGINE_FALLBACK_TARGET,
     ENGINE_FALLBACK_SELECTOR,
     ENGINE_FALLBACK_SELECTOR_SMARTSESSION
@@ -102,6 +103,12 @@ contract AGW is IAGW, ReentrancyGuardTransient {
 
     /// @dev Monotonic salt source for permission ids; never reused.
     uint64 private _grantNonce;
+
+    /// @dev Owner-side checkpoints so far; also the `seq` of the latest `Checkpointed`. Packed in slot 0.
+    uint64 private _checkpointCount;
+
+    /// @dev `block.number` of the latest checkpoint; zero before the first. Packed in slot 0.
+    uint64 private _lastCheckpointBlock;
 
     /// @dev The account's entire module registry.
     mapping(address => bool) private _installedValidators;
@@ -239,9 +246,11 @@ contract AGW is IAGW, ReentrancyGuardTransient {
      * @dev    - Reverts unless the caller is the owner; reentrancy-guarded.
      *         - Reverts on any execution type other than default, and on any call type other than
      *           single or batch.
-     *         - Reads only the immutable-args owner and its calldata. No module, policy or engine
-     *           state may ever be consulted here, so the door still works with the engine
+     *         - Reads no module, policy or engine state — only the immutable-args owner, its calldata,
+     *           and the wallet's own checkpoint slot — so the door still works with the engine
      *           uninstalled, with a hostile validator installed, or in ghost-rules state.
+     *         - Records one checkpoint per call, before the call (`_checkpointOwnerCall`). The write
+     *           cannot revert.
      *         - The signature is frozen at `execute(bytes32,bytes)`: the session engine branches on
      *           this exact selector, and any other shape routes validation down a path where the
      *           action policy sees a hardcoded zero value instead of the real one.
@@ -261,11 +270,13 @@ contract AGW is IAGW, ReentrancyGuardTransient {
         if (execType != EXECTYPE_DEFAULT) revert AGWErrors.UnsupportedExecutionMode();
         if (callType == CALLTYPE_SINGLE) {
             (address target, uint256 value, bytes calldata callData) = ExecutionLib.decodeSingle(executionCalldata);
+            _checkpointOwnerCall(target, value, callData);
             _execute(target, value, callData);
         } else if (callType == CALLTYPE_BATCH) {
             Execution[] calldata execs = ExecutionLib.decodeBatch(executionCalldata);
             uint256 len = execs.length;
             for (uint256 i; i < len;) {
+                _checkpointOwnerCall(execs[i].target, execs[i].value, execs[i].callData);
                 _execute(execs[i].target, execs[i].value, execs[i].callData);
                 unchecked {
                     ++i;
@@ -296,11 +307,49 @@ contract AGW is IAGW, ReentrancyGuardTransient {
     }
 
     /**
+     * @dev Records one owner-side change: advances the counter, stamps the block, emits `Checkpointed`.
+     *
+     *      - CANNOT REVERT except by running out of gas: an unchecked increment of a uint64 that cannot
+     *        realistically reach 2^64, one write to the wallet's own slot 0, one event. No external call.
+     *        That is what lets it sit on the owner doors and on the revocation path.
+     *      - NEVER called from `_execute` or anywhere the agent door reaches. A checkpoint means "the
+     *        owner side touched this wallet"; an agent that could tick it could always fake owner
+     *        interference.
+     *
+     * @param kind  What changed.
+     * @param ref   Per-kind reference (see `IAGW.Checkpointed`).
+     */
+    function _checkpoint(CheckpointKind kind, bytes32 ref) private {
+        uint64 seq;
+        unchecked {
+            seq = _checkpointCount + 1;
+        }
+        // forge-lint: disable-next-line(unsafe-typecast)
+        uint64 blockNumber = uint64(block.number); // a block number does not exceed 2^64 in practice
+        _checkpointCount = seq;
+        _lastCheckpointBlock = blockNumber;
+        emit Checkpointed(seq, kind, ref, blockNumber);
+    }
+
+    /**
+     * @dev The owner-door tick for one call, taken BEFORE the call runs, so a consumer snapshotting the
+     *      counter during that call already sees it, and any later call in the same batch moves it again.
+     *
+     * @param target    The call's target.
+     * @param value     The call's native value.
+     * @param callData  The call's calldata.
+     */
+    function _checkpointOwnerCall(address target, uint256 value, bytes calldata callData) private {
+        _checkpoint(CheckpointKind.OWNER_ACTION, keccak256(abi.encode(target, value, callData)));
+    }
+
+    /**
      * @notice The owner door, authorised by a signed OwnerIntent instead of `msg.sender`. Relayable.
      *
-     * @dev    - A THIRD door, separate from `execute`. `execute` is untouched: it still reads only the
-     *           immutable-args owner and its calldata, and remains the unblockable fallback. This door
-     *           reads storage (the nonce lane) and may therefore fail where `execute` cannot.
+     * @dev    - A THIRD door, separate from `execute`. `execute` reads no module, policy or engine
+     *           state — only the immutable-args owner, its calldata and its own checkpoint slot — and
+     *           remains the unblockable fallback. This door reads storage (the nonce lane) and may
+     *           therefore fail where `execute` cannot.
      *         - The mode switch below is DUPLICATED from `execute`, not shared with it, so that no
      *           refactor can ever add a check to `execute`.
      *         - Checks, in order: deadline · `intent.wallet == this` · owner · presenter is
@@ -309,6 +358,7 @@ contract AGW is IAGW, ReentrancyGuardTransient {
      *           signature under the FACTORY's domain.
      *         - Single or batch, default exec type. No dispatch guard: this is owner authority, so a
      *           batch may call the wallet's own lifecycle functions through `onlyOwnerOrSelf`.
+     *         - Records one checkpoint per call, before the call, exactly as `execute` does.
      *         - Emits `OwnerExecutedWithSig`.
      *
      * @param  mode               ERC-7579 mode word; must equal `intent.mode`.
@@ -342,11 +392,13 @@ contract AGW is IAGW, ReentrancyGuardTransient {
         if (execType != EXECTYPE_DEFAULT) revert AGWErrors.UnsupportedExecutionMode();
         if (callType == CALLTYPE_SINGLE) {
             (address target, uint256 value, bytes calldata callData) = ExecutionLib.decodeSingle(executionCalldata);
+            _checkpointOwnerCall(target, value, callData);
             _execute(target, value, callData);
         } else if (callType == CALLTYPE_BATCH) {
             Execution[] calldata execs = ExecutionLib.decodeBatch(executionCalldata);
             uint256 len = execs.length;
             for (uint256 i; i < len;) {
+                _checkpointOwnerCall(execs[i].target, execs[i].value, execs[i].callData);
                 _execute(execs[i].target, execs[i].value, execs[i].callData);
                 unchecked {
                     ++i;
@@ -406,6 +458,7 @@ contract AGW is IAGW, ReentrancyGuardTransient {
      *           terms granted twice yield distinct permission ids and a replaced id never recurs.
      *           That is what makes a request built for a revoked rules set die on regrant.
      *         - Enables the session on the engine and emits `RulesGranted`.
+     *         - Records a checkpoint (`RULES_GRANTED`).
      *         - Validates the session's shape only. The caps, allow-list and expiry inside the policy
      *           config are the policy's own concern; do not extend this into term validation.
      *         - Carries no reentrancy guard: the guard would trip on the owner's own change batch,
@@ -579,6 +632,7 @@ contract AGW is IAGW, ReentrancyGuardTransient {
         PermissionId[] memory ids = ISmartSession(SESSION_ENGINE).enableSessions(sessions);
 
         rulesId = PermissionId.unwrap(ids[0]);
+        _checkpoint(CheckpointKind.RULES_GRANTED, rulesId);
         emit RulesGranted(rulesId, mode, chainHash, chain);
     }
 
@@ -692,7 +746,8 @@ contract AGW is IAGW, ReentrancyGuardTransient {
      *           the agent, so any request under the id fails `CallerIsNotAgent`.
      *         - Deliberately carries no reentrancy guard and no health probe: nothing that can fail
      *           belongs on the stop path, since blockable removal is the one regression this
-     *           function can develop.
+     *           function can develop. It records a checkpoint (`RULES_REVOKED`) per removed id; that
+     *           write cannot revert.
      *
      * @param  rulesId  The rules set to revoke.
      *
@@ -705,6 +760,7 @@ contract AGW is IAGW, ReentrancyGuardTransient {
 
         ISmartSession(SESSION_ENGINE).removeSession(PermissionId.wrap(rulesId));
 
+        _checkpoint(CheckpointKind.RULES_REVOKED, rulesId);
         emit RulesRevoked(rulesId);
     }
 
@@ -715,7 +771,8 @@ contract AGW is IAGW, ReentrancyGuardTransient {
      *         - Snapshots the permission ids, removes each by id, and emits `RulesRevoked` per id.
      *           Removal is by id, so engine-side array shifting cannot disturb the snapshot.
      *         - Deliberately carries no reentrancy guard and no health probe, for the same reason as
-     *           `revokeRules`.
+     *           `revokeRules`. It records a checkpoint (`RULES_REVOKED`) per removed id; that write
+     *           cannot revert.
      *         - Gas grows with permission count; wallets hold few permissions by design.
      */
     function revokeAllRules() external onlyOwnerOrSelf {
@@ -724,6 +781,7 @@ contract AGW is IAGW, ReentrancyGuardTransient {
         uint256 len = ids.length;
         for (uint256 i; i < len;) {
             ISmartSession(SESSION_ENGINE).removeSession(ids[i]);
+            _checkpoint(CheckpointKind.RULES_REVOKED, PermissionId.unwrap(ids[i]));
             emit RulesRevoked(PermissionId.unwrap(ids[i]));
             unchecked {
                 ++i;
@@ -1032,6 +1090,25 @@ contract AGW is IAGW, ReentrancyGuardTransient {
      */
     function agentOf(bytes32 rulesId) external view returns (address) {
         return _agentOf(rulesId);
+    }
+
+    /**
+     * @notice Owner-side checkpoints so far. Compare against a snapshot to learn whether the owner side
+     *         touched this wallet since: any owner-door call, grant or revoke moves it; agent actions
+     *         never do.
+     * @return The number of checkpoints recorded.
+     */
+    function checkpointCount() external view returns (uint64) {
+        return _checkpointCount;
+    }
+
+    /**
+     * @notice `block.number` of the latest checkpoint, or zero if none. A convenience only: consumers
+     *         must compare COUNTS, because several checkpoints can share a block with their snapshot.
+     * @return The block number of the latest checkpoint.
+     */
+    function lastCheckpointBlock() external view returns (uint64) {
+        return _lastCheckpointBlock;
     }
 
     /// @notice The OwnerIntent domain separator this wallet verifies against, for a signer on

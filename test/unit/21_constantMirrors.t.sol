@@ -14,7 +14,7 @@ import { ActionId, PermissionId } from "smartsessions/DataTypes.sol";
 import { SmartSessionBase } from "smartsessions/core/SmartSessionBase.sol";
 import { ISmartSessionConfigReader } from "../../src/interfaces/ISmartSessionConfigReader.sol";
 import { AGW } from "../../src/AGW.sol";
-import { AllowedCall, Config } from "../../src/libraries/Types.sol";
+import { AllowedCall, CheckpointKind, Config } from "../../src/libraries/Types.sol";
 import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
 import {
     FALLBACK_TARGET_FLAG,
@@ -247,5 +247,16 @@ contract ConstantMirrorsTest is BaseTest {
             .getSessionValidatorAndConfig(address(wallet), PermissionId.wrap(pid));
         assertEq(v, address(0), "removal clears the validator");
         assertEq(config.length, 0, "and the config");
+    }
+
+    // ─────────────────────── the checkpoint kinds, a frozen wire format ───────────────────────
+
+    /// Indexers and evaluators read the ordinals of `CheckpointKind`. Append only: a reorder or a removal
+    /// fails here, and so does an extra member nobody decided to ship.
+    function test_CP_kindOrdinalsAreFrozen() public pure {
+        assertEq(uint8(CheckpointKind.OWNER_ACTION), 0, "OWNER_ACTION is ordinal 0");
+        assertEq(uint8(CheckpointKind.RULES_GRANTED), 1, "RULES_GRANTED is ordinal 1");
+        assertEq(uint8(CheckpointKind.RULES_REVOKED), 2, "RULES_REVOKED is ordinal 2");
+        assertTrue(type(CheckpointKind).max == CheckpointKind.RULES_REVOKED, "exactly three kinds");
     }
 }
