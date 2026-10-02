@@ -52,7 +52,7 @@ fs_permissions = [
     { access = "read", path = "lib/push-chain-core-contracts/src/" },
 ]
 
-# ─── The core contracts the UniversalMarketplace E2E deploys (test/integration/Marketplace.e2e.t.sol) ───
+# ─── The core contracts the UniversalMarketplace E2E deploys (test/integration/24_marketplaceE2E.t.sol) ───
 #
 # E2E must run the bytecode that SHIPS: core compiles shanghai / 99 999 runs against OZ 5.3, this repo
 # cancun / 833 against OZ 5.7. So this repo does NOT recompile core: the E2E deploys the core repo's own

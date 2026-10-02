@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import { UniversalOutboundTxRequest } from "../libraries/PushWalletTypes.sol";
+import { UniversalOutboundTxRequest } from "../libraries/Types.sol";
 
 /**
  * @title IUniversalGatewayPC

@@ -9,9 +9,9 @@ import { ERC1967Utils } from "@openzeppelin/contracts/proxy/ERC1967/ERC1967Utils
 import { TransparentUpgradeableProxy } from "@openzeppelin/contracts/proxy/transparent/TransparentUpgradeableProxy.sol";
 
 import { SmartSession } from "smartsessions/SmartSession.sol";
-import { PushSessionValidator } from "../src/validators/PushSessionValidator.sol";
-import { URP } from "../src/policies/URP.sol";
-import { PushAgentWallet } from "../src/PushAgentWallet.sol";
+import { AgentValidator } from "../src/validators/AgentValidator.sol";
+import { UniversalRulesPolicy } from "../src/policies/UniversalRulesPolicy.sol";
+import { AGW } from "../src/AGW.sol";
 import { AGWFactory } from "../src/AGWFactory.sol";
 
 /**
@@ -86,8 +86,9 @@ contract Deploy is Script {
         // 1 · SmartSession — plain deploy: no constructor, no arguments, no admin, no owner.
         SmartSession engine = new SmartSession();
 
-        // 2 · PushSessionValidator — stateless; never installed, only named inside each permission.
-        PushSessionValidator validator = new PushSessionValidator();
+        // 2 · AgentValidator — stateless sender validator; never installed, only named inside each rules set
+        //     as the agent check.
+        AgentValidator validator = new AgentValidator();
 
         // 3 · URP — logic + Transparent proxy, INITIALISED IN THE SAME TRANSACTION. A proxy left
         //     uninitialised is front-runnable: whoever calls `initialize` first chooses the engine
@@ -96,11 +97,13 @@ contract Deploy is Script {
         //
         //     THE PROXY ADDRESS IS PERMANENT — it is what every wallet pins as its canonical
         //     policy, and it must not change across upgrades.
-        URP urpLogic = new URP();
+        UniversalRulesPolicy urpLogic = new UniversalRulesPolicy();
         TransparentUpgradeableProxy urpProxy = new TransparentUpgradeableProxy(
-            address(urpLogic), admin, abi.encodeCall(URP.initialize, (gatewayPC, executorModule, address(engine)))
+            address(urpLogic),
+            admin,
+            abi.encodeCall(UniversalRulesPolicy.initialize, (gatewayPC, executorModule, address(engine)))
         );
-        URP urp = URP(address(urpProxy));
+        UniversalRulesPolicy urp = UniversalRulesPolicy(address(urpProxy));
 
         // TUP creates its own ProxyAdmin and returns it nowhere, so read it from the ERC-1967 admin
         // slot and RECORD IT. Without that address the deployment cannot be upgraded later.
@@ -110,16 +113,15 @@ contract Deploy is Script {
         // 3b · THE CHAIN-IDENTITY ASSERTIONS. Run here — after URP exists, before the wallet and
         //      factory do — so a disagreement aborts the broadcast with nothing user-facing deployed.
         //
-        //      WHAT COULD GO WRONG WITHOUT THEM: the mandate mode is derived from a chain string,
+        //      WHAT COULD GO WRONG WITHOUT THEM: the rules set mode is derived from a chain string,
         //      and `PushChainLib` computes this chain's identity from `block.chainid`. If Push named
-        //      itself differently from that, every native mandate would derive UNIVERSAL and be
+        //      itself differently from that, every native rules set would derive UNIVERSAL and be
         //      refused at grant — after deployment, on a user's first attempt, with a diagnostic
         //      pointing at the action target rather than the cause.
         _assertChainIdentity(urp);
 
         // 4 · The wallet implementation. Its constructor rejects any zero.
-        PushAgentWallet walletImplementation =
-            new PushAgentWallet(address(engine), address(urp), address(validator), gatewayPC);
+        AGW walletImplementation = new AGW(address(engine), address(urp), address(validator), gatewayPC);
 
         // 5 · The factory: logic + proxy, initialised in the SAME transaction so no initialisation
         //     front-run window exists. THE PROXY ADDRESS IS PERMANENT and user-facing.
@@ -211,8 +213,8 @@ contract Deploy is Script {
     /**
      * @dev THREE ASSERTIONS ON ONE FACT: what this chain calls itself.
      *
-     *      The mandate mode is derived, not declared — `PushChainLib` hashes
-     *      `"eip155:" ‖ decimal(block.chainid)` and a mandate on that chain is NATIVE. Nothing is
+     *      The rules set mode is derived, not declared — `PushChainLib` hashes
+     *      `"eip155:" ‖ decimal(block.chainid)` and a rules set on that chain is NATIVE. Nothing is
      *      configured, so there is no constant to set wrongly; what remains is the possibility that
      *      Push's own contracts disagree with `block.chainid` about Push's identity. That is what
      *      (3) checks, and it is the only one of the three that can fail on a correctly-built
@@ -236,7 +238,7 @@ contract Deploy is Script {
      *      deploy path that decision 90 says must STOP. Off 31337 the variable is mandatory and the
      *      address must have code, matching how `FACTORY_ADMIN` is handled above.
      */
-    function _assertChainIdentity(URP urp) internal view {
+    function _assertChainIdentity(UniversalRulesPolicy urp) internal view {
         bytes32 expected = keccak256(bytes(string.concat("eip155:", vm.toString(block.chainid))));
         require(urp.pushChainHash() == expected, "URP derives a different chain identity than this script");
 

@@ -66,7 +66,11 @@ contract Preflight is Script {
 
         address urp = AddressBook.ours("urp");
         string memory v = IURPVersion(urp).version();
-        _check("URP answers version() through the proxy", keccak256(bytes(v)) == keccak256(bytes("1.0.0")), v);
+        // 1.0.0 is the deployed implementation; 1.1.0 adds the SVM rulebook and leaves the native
+        // rulebook this demo drives unchanged. Either is a valid target until the upgrade lands.
+        bool knownVersion =
+            keccak256(bytes(v)) == keccak256(bytes("1.0.0")) || keccak256(bytes(v)) == keccak256(bytes("1.1.0"));
+        _check("URP answers version() through the proxy", knownVersion, v);
 
         address factory = AddressBook.ours("factoryProxy");
         address impl = IAGWFactory(factory).walletImplementation();

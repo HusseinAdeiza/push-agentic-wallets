@@ -9,7 +9,7 @@ import {
     OWNER_INTENT_DOMAIN_TYPEHASH,
     OWNER_INTENT_DOMAIN_NAME_HASH,
     OWNER_INTENT_DOMAIN_VERSION_HASH
-} from "./PushWalletTypes.sol";
+} from "./Types.sol";
 
 /**
  * @title  OwnerAuthLib
@@ -59,7 +59,7 @@ library OwnerAuthLib {
      * @notice EIP-712 `hashStruct(OwnerIntent)`.
      * @dev    Every OwnerIntent field is a static atomic type, so `abi.encode(typehash, i)` lays the
      *         twelve fields out as twelve consecutive words in declaration order — exactly the EIP-712
-     *         `encodeData`. Pinned field-by-field against a hand-built reference in OwnerAuthLib.t.sol.
+     *         `encodeData`. Pinned field-by-field against a hand-built reference in 19_ownerAuthLib.t.sol.
      */
     function hashIntent(OwnerIntent calldata i) internal pure returns (bytes32) {
         return keccak256(abi.encode(OWNER_INTENT_TYPEHASH, i));

@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import { AGWFactoryErrors } from "./libraries/Errors.sol";
+
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 
 import { Initializable } from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
@@ -11,13 +13,13 @@ import { PausableUpgradeable } from "@openzeppelin/contracts-upgradeable/utils/P
 import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
 import { IAGWFactory } from "./interfaces/IAGWFactory.sol";
-import { IPushAgentWalletInit } from "./interfaces/IPushAgentWalletInit.sol";
-import { OwnerIntent } from "./libraries/PushWalletTypes.sol";
+import { IAGWInit } from "./interfaces/IAGWInit.sol";
+import { OwnerIntent } from "./libraries/Types.sol";
 import { OwnerAuthLib } from "./libraries/OwnerAuthLib.sol";
 
 /**
  * @title  AGWFactory
- * @notice Deploys `PushAgentWallet` clones at addresses computable before deployment, and is the
+ * @notice Deploys `AGW` clones at addresses computable before deployment, and is the
  *         root of trust for wallet identity.
  *
  * @dev    - Wallet addresses are deterministic and predictable before deployment, so counterfactual
@@ -69,7 +71,7 @@ contract AGWFactory is
     mapping(address => IAGWFactory.WalletRecord) internal _records;
 
     /**
-     * @notice The canonical PushAgentWallet logic contract all clones delegate to.
+     * @notice The canonical AGW logic contract all clones delegate to.
      *
      * @dev    - Written once, in `initialize`. There is no setter: a function able to rewrite this
      *           would silently move every predicted address and strand counterfactually funded
@@ -102,7 +104,7 @@ contract AGWFactory is
      * @param  walletImplementation_  Logic contract every wallet clone will delegate to.
      */
     function initialize(address admin, address walletImplementation_) external initializer {
-        if (admin == address(0) || walletImplementation_ == address(0)) revert ZeroAddress();
+        if (admin == address(0) || walletImplementation_ == address(0)) revert AGWFactoryErrors.ZeroAddress();
 
         __AccessControlDefaultAdminRules_init(DEFAULT_ADMIN_DELAY, admin);
         __Pausable_init();
@@ -121,7 +123,7 @@ contract AGWFactory is
      *           external call, which is what makes a reentrant deploy unable to reuse an index.
      *           There is deliberately no reentrancy guard; the effect ordering is the protection.
      *         - Salt is the owner and the factory-assigned sequential index only. Nothing
-     *           mandate-related enters the derivation.
+     *           rules-related enters the derivation.
      *         - The owner appears twice, in the salt and in the immutable args, on purpose;
      *           removing either changes every future address.
      *         - Calls `initializeAccount` on the new clone. Any revert bubbles and the whole
@@ -133,7 +135,7 @@ contract AGWFactory is
      */
     function deployWallet(string calldata label) external whenNotPaused returns (address wallet) {
         address implementation = _walletImplementation;
-        if (implementation == address(0)) revert ImplementationNotSet();
+        if (implementation == address(0)) revert AGWFactoryErrors.ImplementationNotSet();
 
         address owner = msg.sender;
         wallet = _deploy(implementation, owner, _walletCount[owner], label);
@@ -159,31 +161,31 @@ contract AGWFactory is
      * @param  label   Free-form label, emitted and never stored. Not signed.
      * @return wallet  The deployed wallet.
      */
-    function deployWallet(OwnerIntent calldata intent, bytes calldata sig, string calldata label)
+    function deployWalletWithSig(OwnerIntent calldata intent, bytes calldata sig, string calldata label)
         external
         whenNotPaused
         returns (address wallet)
     {
         address implementation = _walletImplementation;
-        if (implementation == address(0)) revert ImplementationNotSet();
+        if (implementation == address(0)) revert AGWFactoryErrors.ImplementationNotSet();
 
         address owner = intent.owner;
-        if (owner == address(0)) revert ZeroAddress();
+        if (owner == address(0)) revert AGWFactoryErrors.ZeroAddress();
 
         uint96 index = intent.index;
         uint96 next = _walletCount[owner];
-        if (index != next) revert IndexMismatch(next, index);
+        if (index != next) revert AGWFactoryErrors.IndexMismatch(next, index);
 
         address predicted = _predict(implementation, owner, index);
-        if (intent.wallet != predicted) revert IntentWalletMismatch(predicted, intent.wallet);
+        if (intent.wallet != predicted) revert AGWFactoryErrors.IntentWalletMismatch(predicted, intent.wallet);
 
         if (msg.sender != owner) {
             if (intent.executor == address(0) || msg.sender != intent.executor) {
-                revert ExecutorMismatch(intent.executor, msg.sender);
+                revert AGWFactoryErrors.ExecutorMismatch(intent.executor, msg.sender);
             }
-            if (block.timestamp > intent.deadline) revert SignatureExpired(intent.deadline);
+            if (block.timestamp > intent.deadline) revert AGWFactoryErrors.SignatureExpired(intent.deadline);
             if (!OwnerAuthLib.isOwnerSig(owner, OwnerAuthLib.intentDigest(address(this), intent), sig)) {
-                revert InvalidOwnerSignature();
+                revert AGWFactoryErrors.InvalidOwnerSignature();
             }
         }
 
@@ -196,7 +198,7 @@ contract AGWFactory is
     }
 
     /**
-     * @dev The deployment tail shared by both `deployWallet` forms. BYTE-FOR-BYTE the logic the
+     * @dev The deployment tail shared by `deployWallet` and `deployWalletWithSig`. BYTE-FOR-BYTE the logic the
      *      single-argument form always had: count advance → salt → args → clone → record →
      *      initializeAccount → event. Every caller has run all of its checks before calling this.
      *
@@ -218,13 +220,13 @@ contract AGWFactory is
 
         _records[wallet] = WalletRecord({ owner: owner, index: index });
 
-        IPushAgentWalletInit(wallet).initializeAccount();
+        IAGWInit(wallet).initializeAccount();
 
         emit WalletDeployed(owner, index, wallet, label);
     }
 
     /**
-     * @dev The address derivation, shared by `predictWallet` and the intent form of `deployWallet`.
+     * @dev The address derivation, shared by `predictWallet` and `deployWalletWithSig`.
      *      Mirrors `_deploy`'s salt and args exactly; any divergence is a critical bug.
      */
     function _predict(address implementation, address owner, uint96 index) internal view returns (address) {
@@ -251,10 +253,10 @@ contract AGWFactory is
      */
     function predictWallet(address owner, uint256 index) external view returns (address wallet, bool deployed) {
         address implementation = _walletImplementation;
-        if (implementation == address(0)) revert ImplementationNotSet();
+        if (implementation == address(0)) revert AGWFactoryErrors.ImplementationNotSet();
 
         uint256 next = _walletCount[owner];
-        if (index > next) revert IndexOutOfRange(index, next);
+        if (index > next) revert AGWFactoryErrors.IndexOutOfRange(index, next);
 
         wallet = _predict(implementation, owner, uint96(index));
         deployed = index < next;
@@ -297,7 +299,7 @@ contract AGWFactory is
      */
     function indexOf(address wallet) external view returns (uint256) {
         WalletRecord memory record = _records[wallet];
-        if (record.owner == address(0)) revert NotAWallet(wallet);
+        if (record.owner == address(0)) revert AGWFactoryErrors.NotAWallet(wallet);
         return record.index;
     }
 
@@ -348,6 +350,6 @@ contract AGWFactory is
      * @param newImplementation  The logic contract being upgraded to.
      */
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (newImplementation == address(0)) revert ZeroAddress();
+        if (newImplementation == address(0)) revert AGWFactoryErrors.ZeroAddress();
     }
 }

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
-import { PushWalletErrors } from "./PushWalletErrors.sol";
+import { AGWErrors } from "./Errors.sol";
 
 /// @notice A single ERC-7579 execution entry.
 struct Execution {
@@ -48,7 +48,7 @@ library ExecutionLib {
      *      stride used to reject impossible lengths cheaply, before any entry is read.
      */
     function decodeBatch(bytes calldata ecd) internal pure returns (Execution[] calldata execs) {
-        if (ecd.length < 32) revert PushWalletErrors.MalformedBatchCalldata();
+        if (ecd.length < 32) revert AGWErrors.MalformedBatchCalldata();
 
         uint256 baseOffset;
         uint256 len;
@@ -58,7 +58,7 @@ library ExecutionLib {
 
         // The offset word must land inside the blob with room for the length word.
         if (baseOffset > ecd.length || ecd.length - baseOffset < 32) {
-            revert PushWalletErrors.MalformedBatchCalldata();
+            revert AGWErrors.MalformedBatchCalldata();
         }
 
         assembly {
@@ -67,7 +67,7 @@ library ExecutionLib {
 
         // `len` head slots of 32 bytes each must fit in what remains.
         uint256 remaining = ecd.length - baseOffset - 32;
-        if (len > remaining / 32) revert PushWalletErrors.MalformedBatchCalldata();
+        if (len > remaining / 32) revert AGWErrors.MalformedBatchCalldata();
 
         assembly {
             execs.offset := add(add(ecd.offset, baseOffset), 0x20)
