@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity 0.8.26;
 
+import { AGWFactoryErrors } from "./libraries/Errors.sol";
+
 import { Clones } from "@openzeppelin/contracts/proxy/Clones.sol";
 
 import { Initializable } from "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
@@ -11,11 +13,13 @@ import { PausableUpgradeable } from "@openzeppelin/contracts-upgradeable/utils/P
 import { UUPSUpgradeable } from "@openzeppelin/contracts-upgradeable/proxy/utils/UUPSUpgradeable.sol";
 
 import { IAGWFactory } from "./interfaces/IAGWFactory.sol";
-import { IPushAgentWalletInit } from "./interfaces/IPushAgentWalletInit.sol";
+import { IAGWInit } from "./interfaces/IAGWInit.sol";
+import { OwnerIntent } from "./libraries/Types.sol";
+import { OwnerAuthLib } from "./libraries/OwnerAuthLib.sol";
 
 /**
  * @title  AGWFactory
- * @notice Deploys `PushAgentWallet` clones at addresses computable before deployment, and is the
+ * @notice Deploys `AGW` clones at addresses computable before deployment, and is the
  *         root of trust for wallet identity.
  *
  * @dev    - Wallet addresses are deterministic and predictable before deployment, so counterfactual
@@ -23,8 +27,9 @@ import { IPushAgentWalletInit } from "./interfaces/IPushAgentWalletInit.sol";
  *         - This registry is the only proof of a wallet's provenance: anyone can deploy a contract
  *           with a lying `owner()` view. The audit chain is destination account, wallet, this
  *           registry, owner.
- *         - The caller is always the owner. There is no owner parameter, so deploying a wallet owned
- *           by someone else is impossible by signature rather than by check.
+ *         - The owner is the caller, or the signer of an `OwnerIntent` naming this owner, index and
+ *           wallet, presented by the intent's `executor`. Deploying a wallet owned by someone else
+ *           without that owner's signature is impossible.
  *         - Holds no funds, never touches a wallet after deployment, and has no setter for the
  *           wallet implementation.
  *         - Deployed behind an ERC-1967 UUPS proxy; the proxy address is the permanent,
@@ -66,7 +71,7 @@ contract AGWFactory is
     mapping(address => IAGWFactory.WalletRecord) internal _records;
 
     /**
-     * @notice The canonical PushAgentWallet logic contract all clones delegate to.
+     * @notice The canonical AGW logic contract all clones delegate to.
      *
      * @dev    - Written once, in `initialize`. There is no setter: a function able to rewrite this
      *           would silently move every predicted address and strand counterfactually funded
@@ -99,7 +104,7 @@ contract AGWFactory is
      * @param  walletImplementation_  Logic contract every wallet clone will delegate to.
      */
     function initialize(address admin, address walletImplementation_) external initializer {
-        if (admin == address(0) || walletImplementation_ == address(0)) revert ZeroAddress();
+        if (admin == address(0) || walletImplementation_ == address(0)) revert AGWFactoryErrors.ZeroAddress();
 
         __AccessControlDefaultAdminRules_init(DEFAULT_ADMIN_DELAY, admin);
         __Pausable_init();
@@ -118,7 +123,7 @@ contract AGWFactory is
      *           external call, which is what makes a reentrant deploy unable to reuse an index.
      *           There is deliberately no reentrancy guard; the effect ordering is the protection.
      *         - Salt is the owner and the factory-assigned sequential index only. Nothing
-     *           mandate-related enters the derivation.
+     *           rules-related enters the derivation.
      *         - The owner appears twice, in the salt and in the immutable args, on purpose;
      *           removing either changes every future address.
      *         - Calls `initializeAccount` on the new clone. Any revert bubbles and the whole
@@ -130,11 +135,81 @@ contract AGWFactory is
      */
     function deployWallet(string calldata label) external whenNotPaused returns (address wallet) {
         address implementation = _walletImplementation;
-        if (implementation == address(0)) revert ImplementationNotSet();
+        if (implementation == address(0)) revert AGWFactoryErrors.ImplementationNotSet();
 
         address owner = msg.sender;
-        uint96 index = _walletCount[owner];
+        wallet = _deploy(implementation, owner, _walletCount[owner], label);
+    }
 
+    /**
+     * @notice Deploys wallet `intent.index` for `intent.owner`, on the owner's signature.
+     *
+     * @dev    - The index is EXPLICIT and must equal the owner's current count, and `intent.wallet` must
+     *           be the address this call deploys. So a signed intent is idempotent and unmovable: a
+     *           replay fails on the index, and nobody can advance an owner's count without the owner's
+     *           signature.
+     *         - `msg.sender == intent.owner` needs no signature (the caller is the owner, exactly as in
+     *           the single-argument form). Any other caller must be `intent.executor` (non-zero) and
+     *           must carry the owner's signature, before the deadline.
+     *         - Grant and exec fields of the intent are ignored here; the wallet checks those.
+     *         - Every check runs before `_deploy`, which advances the count before its one external
+     *           call — the same effect ordering the single-argument form relies on.
+     *
+     * @param  intent  The owner's intent. Only `owner`, `wallet`, `executor`, `index`, `deadline` and
+     *                 `signerChainId` are read here.
+     * @param  sig     The owner's signature over `intent`; ignored when the caller is the owner.
+     * @param  label   Free-form label, emitted and never stored. Not signed.
+     * @return wallet  The deployed wallet.
+     */
+    function deployWalletWithSig(OwnerIntent calldata intent, bytes calldata sig, string calldata label)
+        external
+        whenNotPaused
+        returns (address wallet)
+    {
+        address implementation = _walletImplementation;
+        if (implementation == address(0)) revert AGWFactoryErrors.ImplementationNotSet();
+
+        address owner = intent.owner;
+        if (owner == address(0)) revert AGWFactoryErrors.ZeroAddress();
+
+        uint96 index = intent.index;
+        uint96 next = _walletCount[owner];
+        if (index != next) revert AGWFactoryErrors.IndexMismatch(next, index);
+
+        address predicted = _predict(implementation, owner, index);
+        if (intent.wallet != predicted) revert AGWFactoryErrors.IntentWalletMismatch(predicted, intent.wallet);
+
+        if (msg.sender != owner) {
+            if (intent.executor == address(0) || msg.sender != intent.executor) {
+                revert AGWFactoryErrors.ExecutorMismatch(intent.executor, msg.sender);
+            }
+            if (block.timestamp > intent.deadline) revert AGWFactoryErrors.SignatureExpired(intent.deadline);
+            if (!OwnerAuthLib.isOwnerSig(owner, OwnerAuthLib.intentDigest(address(this), intent), sig)) {
+                revert AGWFactoryErrors.InvalidOwnerSignature();
+            }
+        }
+
+        wallet = _deploy(implementation, owner, index, label);
+    }
+
+    /// @inheritdoc IAGWFactory
+    function domainSeparator(uint256 signerChainId) external view returns (bytes32) {
+        return OwnerAuthLib.domainSeparator(address(this), signerChainId);
+    }
+
+    /**
+     * @dev The deployment tail shared by `deployWallet` and `deployWalletWithSig`. BYTE-FOR-BYTE the logic the
+     *      single-argument form always had: count advance → salt → args → clone → record →
+     *      initializeAccount → event. Every caller has run all of its checks before calling this.
+     *
+     *      - The count advances and the record is written before the single external call, which is
+     *        what makes a reentrant deploy unable to reuse an index.
+     *      - Salt and args are frozen forever: counterfactual funding relies on them.
+     */
+    function _deploy(address implementation, address owner, uint96 index, string calldata label)
+        internal
+        returns (address wallet)
+    {
         _walletCount[owner] = index + 1;
 
         bytes32 salt = keccak256(abi.encode(owner, index));
@@ -145,9 +220,19 @@ contract AGWFactory is
 
         _records[wallet] = WalletRecord({ owner: owner, index: index });
 
-        IPushAgentWalletInit(wallet).initializeAccount();
+        IAGWInit(wallet).initializeAccount();
 
         emit WalletDeployed(owner, index, wallet, label);
+    }
+
+    /**
+     * @dev The address derivation, shared by `predictWallet` and `deployWalletWithSig`.
+     *      Mirrors `_deploy`'s salt and args exactly; any divergence is a critical bug.
+     */
+    function _predict(address implementation, address owner, uint96 index) internal view returns (address) {
+        bytes32 salt = keccak256(abi.encode(owner, index));
+        bytes memory args = abi.encodePacked(owner, address(this));
+        return Clones.predictDeterministicAddressWithImmutableArgs(implementation, args, salt, address(this));
     }
 
     /**
@@ -168,15 +253,12 @@ contract AGWFactory is
      */
     function predictWallet(address owner, uint256 index) external view returns (address wallet, bool deployed) {
         address implementation = _walletImplementation;
-        if (implementation == address(0)) revert ImplementationNotSet();
+        if (implementation == address(0)) revert AGWFactoryErrors.ImplementationNotSet();
 
         uint256 next = _walletCount[owner];
-        if (index > next) revert IndexOutOfRange(index, next);
+        if (index > next) revert AGWFactoryErrors.IndexOutOfRange(index, next);
 
-        bytes32 salt = keccak256(abi.encode(owner, uint96(index)));
-        bytes memory args = abi.encodePacked(owner, address(this));
-
-        wallet = Clones.predictDeterministicAddressWithImmutableArgs(implementation, args, salt, address(this));
+        wallet = _predict(implementation, owner, uint96(index));
         deployed = index < next;
     }
 
@@ -217,7 +299,7 @@ contract AGWFactory is
      */
     function indexOf(address wallet) external view returns (uint256) {
         WalletRecord memory record = _records[wallet];
-        if (record.owner == address(0)) revert NotAWallet(wallet);
+        if (record.owner == address(0)) revert AGWFactoryErrors.NotAWallet(wallet);
         return record.index;
     }
 
@@ -268,6 +350,6 @@ contract AGWFactory is
      * @param newImplementation  The logic contract being upgraded to.
      */
     function _authorizeUpgrade(address newImplementation) internal override onlyRole(DEFAULT_ADMIN_ROLE) {
-        if (newImplementation == address(0)) revert ZeroAddress();
+        if (newImplementation == address(0)) revert AGWFactoryErrors.ZeroAddress();
     }
 }

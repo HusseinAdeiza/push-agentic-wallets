@@ -1,0 +1,75 @@
+{
+  "generation": "v3.2",
+  "chainId": 42101,
+  "network": "Push Chain Donut testnet",
+  "measuredAtBlock": 23296566,
+  "note": "Dependencies this repository does NOT deploy. Every entry was RE-MEASURED live for this deployment rather than copied forward from the v2 book - a stale dependency record is worse than none, because it reads as evidence.",
+
+  "dependencies": {
+    "universalGatewayPC": {
+      "address": "0x00000000000000000000000000000000000000C1",
+      "consumedBy": ["URP", "PushAgentWallet"],
+      "runtimeSize": 1551,
+      "verified": true,
+      "evidence": [
+        "cast code -> 1551 B at block 23296566",
+        "universalCore() -> 0x...00C0, so it is wired to the core it should be",
+        "our mirrored SEND_OUTBOUND_SELECTOR = bytes4(keccak256(\"sendUniversalTxOutbound((bytes,address,uint256,uint256,uint256,uint256,bytes,address))\")) = 0x77b86bec, unchanged from v2"
+      ],
+      "impact": "THE FROZEN FUNCTION EVERY CROSS-CHAIN MANDATE ROUTES THROUGH. `PushWalletTypes` is a hand-copied mirror of this contract's request struct; reordering or retyping a field there silently changes the selector and every universal mandate stops matching. Pinned by a constant-mirror test."
+    },
+
+    "universalExecutorModule": {
+      "address": "0x14191Ea54B4c176fCf86f51b0FAc7CB1E71Df7d7",
+      "consumedBy": ["URP"],
+      "runtimeSize": 0,
+      "verified": false,
+      "evidence": [
+        "cast code -> 0x (NO CODE); re-measured at block 23296566, unchanged from the v2 measurement at block 23002669 and the v1 one at 22631775",
+        "address confirmed correct by the owner, 2026-09-04",
+        "matches push-chain-core-contracts/test/helpers/PushChainAddresses.sol"
+      ],
+      "impact": "CONFIGURED BUT CODELESS, AND HARMLESS TODAY. URP stores this as the sole permitted caller of `creditRevert`, the refund path that credits back a failed outbound. With no code at the address, nothing can call it - so the refund path is currently unreachable, which fails CLOSED (a mandate's spend counter simply never decreases). It becomes live when Push deploys the module; no redeployment of ours is needed, because URP stores the address rather than the code."
+    },
+
+    "ueaFactory": {
+      "address": "0x00000000000000000000000000000000000000eA",
+      "consumedBy": ["script/Deploy.s.sol (sanity check only)"],
+      "runtimeSize": 1551,
+      "verified": true,
+      "evidence": [
+        "cast code -> 1551 B",
+        "getOriginForUEA(0x...dEaD) -> ((\"eip155\", \"42101\", 0x...dead), false) at block 23296566",
+        "implementation 0xb6dc6f8894caa866a9db1d158c57fdd1be165b2f read from the EIP-1967 slot"
+      ],
+      "impact": "NOT A RUNTIME DEPENDENCY. Read once at deploy time to confirm core and `block.chainid` agree about what Push Chain calls itself - the mandate mode is derived from that identity, so a disagreement would make every native mandate derive UNIVERSAL and be refused at grant. The deploy script STOPS on a mismatch. ⚠️ `pushChainId()` exists in core's source but REVERTS on the deployed implementation; `getOriginForUEA` is used instead because it is a function that is actually live."
+    },
+
+    "universalCore": {
+      "address": "0x00000000000000000000000000000000000000C0",
+      "consumedBy": ["(indirect - the gateway calls it)"],
+      "runtimeSize": 1551,
+      "verified": true,
+      "evidence": [
+        "cast code -> 1551 B",
+        "returned by UniversalGatewayPC.universalCore()",
+        "gasTokenPRC20ByChainNamespace(\"eip155:11155111\") -> 0x2971824Db68229D087931155C2b8bB820B275809 (pETH)"
+      ],
+      "impact": "Resolves a PRC20 to its origin chain via `getOutboundTxGasAndFees`, which is how the gateway decides where an outbound goes. NEW IN v3.2 THIS MATTERS DIRECTLY: URP reads the same `SOURCE_CHAIN_NAMESPACE()` view at grant time and refuses the mandate if it disagrees with the declared chain. The coupling is safe because the gateway breaks before URP does if that view ever changes."
+    },
+
+    "prc20_usdc": {
+      "address": "0x7A58048036206bB898008b5bBDA85697DB1e5d66",
+      "consumedBy": ["(mandate asset - not a contract dependency)"],
+      "runtimeSize": 1201,
+      "verified": true,
+      "evidence": [
+        "cast code -> 1201 B",
+        "SOURCE_CHAIN_NAMESPACE() -> \"eip155:11155111\" at block 23296566",
+        "keccak256(\"eip155:11155111\") = 0xafa90c317deacd3d68f330a30f96e4fa7736e35e8d1426b2e1b2c04bce1c2fb7",
+        "symbol() == \"USDC.eth\" - NOT the deprecated \"USDC.eth.old\" at 0x387b9C8D..."
+      ],
+      "impact": "THE WORKED EXAMPLE FOR THE NEW ASSET-CHAIN CHECK. A universal mandate naming this asset must declare exactly \"eip155:11155111\" in its policy envelope, byte for byte, or URP refuses the grant with `ChainMismatch`. Pinned by a fork test (`test/integration/PRC20Source.fork.t.sol`) that reads this live token rather than a mock."
+    }
+  }
+}

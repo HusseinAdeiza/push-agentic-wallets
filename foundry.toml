@@ -35,7 +35,29 @@ fs_permissions = [
     # shared memory, so the ledger is the only way state survives from one act to the next — it is
     # what makes a failed step recoverable rather than fatal.
     { access = "read-write", path = "demo/state/" },
+    # READ-ONLY: the core repo's own build artifacts, which the UniversalMarketplace E2E deploys with
+    # vm.deployCode so it runs exactly the bytecode that ships (test_E2E_13 pins it).
+    { access = "read", path = "lib/push-chain-core-contracts/out/" },
+    # READ-ONLY: core's sources, so test_E2E_13 can prove each artifact was built from the source on disk.
+    { access = "read", path = "lib/push-chain-core-contracts/src/" },
 ]
+
+# ─── The core contracts the UniversalMarketplace E2E deploys (test/integration/24_marketplaceE2E.t.sol) ───
+#
+# E2E must run the bytecode that SHIPS: core compiles shanghai / 99 999 runs against OZ 5.3, this repo
+# cancun / 833 against OZ 5.7. So this repo does NOT recompile core: the E2E deploys the core repo's own
+# build artifacts with vm.deployCode("lib/push-chain-core-contracts/out/…json"). Build core first.
+#
+# Why not compilation_restrictions + context remappings (the first design): forge's source graph ignores
+# context remappings when it assembles a restricted compilation unit, so core's OZ imports resolved to
+# this repo's OZ 5.7 and pulled Bytes.sol (MCOPY) into the shanghai job — solc 7755. Measured on 1.5.1.
+#
+# Only core INTERFACES are compiled here (via the push-core/ remapping), and those carry no settings
+# that matter.
+#
+# TEMPORARY, while lib/push-chain-core-contracts is a symlink to the sibling checkout (the core changes are
+# not committed yet, so there is no commit to pin a submodule to). Remove once it is a real submodule.
+allow_paths = ["../push-chain-core-contracts"]
 
 # The demo's own tests (StakeDummy, and the AgentSigning equivalence proof). A SEPARATE PROFILE,
 # not a change to the default `test` path: the v3 suite is the contracts' specification and must
