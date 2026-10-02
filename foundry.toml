@@ -35,16 +35,6 @@ fs_permissions = [
     # shared memory, so the ledger is the only way state survives from one act to the next — it is
     # what makes a failed step recoverable rather than fatal.
     { access = "read-write", path = "demo/state/" },
-    # The native demo's own ledger (demo-native/state/ledger.json). Same reasoning as above, and a
-    # SEPARATE directory: the two demos are independently runnable, so a rehearsal of one must never
-    # overwrite the other's recovery state.
-    { access = "read-write", path = "demo-native/state/" },
-    # READ-ONLY, and for one assertion only: demo-native/test/AgentSigning.t.sol hashes both copies
-    # of AgentSigning.sol to prove they are byte-identical. That is the structural claim that the
-    # agent-authorisation layer is mode-independent — if the native demo ever forks it, the two
-    # mandate types no longer share a signing path, and the test is what says so.
-    { access = "read", path = "demo/lib/" },
-    { access = "read", path = "demo-native/lib/" },
     # READ-ONLY: the core repo's own build artifacts, which the UniversalMarketplace E2E deploys with
     # vm.deployCode so it runs exactly the bytecode that ships (test_E2E_13 pins it).
     { access = "read", path = "lib/push-chain-core-contracts/out/" },
@@ -75,12 +65,6 @@ allow_paths = ["../push-chain-core-contracts"]
 # which the justfile wraps. Everything else is inherited from [profile.default].
 [profile.demo]
 test = "demo/test"
-
-# The Push-NATIVE demo's tests. A THIRD profile for the same reason `[profile.demo]` is a second
-# one: `forge test` must keep running exactly the v3 suite, which is the contracts' specification.
-# Run with `FOUNDRY_PROFILE=demo-native forge test`, which demo-native/justfile wraps.
-[profile.demo-native]
-test = "demo-native/test"
 
 [fmt]
 line_length = 120
