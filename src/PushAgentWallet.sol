@@ -656,9 +656,7 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
             (bool ok, bytes memory ret) = module.staticcall{ gas: ENGINE_STATE_PROBE_GAS }(
                 abi.encodeCall(ISmartSession.isInitialized, (address(this)))
             );
-            if (ok && ret.length >= 32 && abi.decode(ret, (bool))) {
-                revert PushWalletErrors.EngineStillHoldsPermissions();
-            }
+            if (_probeReportsLivePermissions(ret)) revert PushWalletErrors.EngineStillHoldsPermissions();
         }
 
         _installedValidators[module] = false;
@@ -669,6 +667,32 @@ contract PushAgentWallet is IPushAgentWallet, ReentrancyGuardTransient {
         }
 
         emit ModuleUninstalled(moduleTypeId, module);
+    }
+
+    /**
+     * @dev Reads the uninstall probe's verdict without ever reverting.
+     *
+     *      - `abi.decode(ret, (bool))` is NOT usable here: a probe that returns exactly 32 bytes
+     *        which are not a canonical bool (`0` or `1`) makes the decoder revert, and that revert
+     *        happens INSIDE the guard expression, so a malformed-but-successful probe blocks
+     *        removal instead of failing open. The word is compared directly instead.
+     *      - Only the canonical `1` counts as "still holds permissions". Every other outcome of
+     *        the probe - reverted, out of gas, short return, no return, or a full-length
+     *        non-canonical word - proceeds with removal, which is the fail-open property the
+     *        guard's own contract promises.
+     *      - A canonical `1` still blocks removal, so the ordering mistake this guard exists to
+     *        prevent remains caught.
+     *
+     * @param ret  Raw returndata from the `isInitialized` staticcall.
+     * @return Whether the probe affirmatively reported live permissions.
+     */
+    function _probeReportsLivePermissions(bytes memory ret) private pure returns (bool) {
+        if (ret.length < 32) return false;
+        uint256 word;
+        assembly {
+            word := mload(add(ret, 0x20))
+        }
+        return word == 1;
     }
 
     /**

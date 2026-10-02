@@ -493,6 +493,13 @@ contract PushAgentWalletTest is BaseTest {
 
         // (d) probe returns no data at all
         _assertEngineRemovableWithProbe(type(EmptyReturnProbeEngine).runtimeCode, "probe returns nothing");
+
+        // (e) probe returns a FULL-LENGTH word that is not a canonical bool. This is the case the
+        // other four miss: they all fail the `ret.length >= 32` guard or the `ok` check, so the
+        // decode never runs. Here the probe SUCCEEDS and returns 32 bytes, and `abi.decode` of a
+        // non-canonical bool is itself a revert — inside the guard expression, which blocked
+        // removal instead of failing open.
+        _assertEngineRemovableWithProbe(type(NonBoolProbeEngine).runtimeCode, "probe returns non-canonical bool");
     }
 
     /// @dev Snapshot the real engine's code, etch the broken probe, assert removal proceeds, then
@@ -991,6 +998,15 @@ contract GasBurnerProbeEngine {
 contract ShortReturnProbeEngine {
     fallback(bytes calldata) external returns (bytes memory) {
         return hex"01";
+    }
+}
+
+/// @dev A probe that SUCCEEDS and returns exactly 32 bytes which are not a canonical bool.
+///      Passes the `ret.length >= 32` guard, so this is the only probe shape that reaches the
+///      decode itself.
+contract NonBoolProbeEngine {
+    fallback(bytes calldata) external returns (bytes memory) {
+        return abi.encode(uint256(2));
     }
 }
 
