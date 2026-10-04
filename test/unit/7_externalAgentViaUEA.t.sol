@@ -52,11 +52,8 @@ contract ExternalAgentViaUEATest is BaseTest {
                 validUntil: uint48(block.timestamp + 30 days),
                 destChainHash: bytes32(0),
                 expectedCEA: cea,
-                asset: asset,
-                maxAmountPerCall: 100 ether,
-                maxAmountTotal: 1000 ether,
-                maxPCPerCall: 1 ether,
-                spent: 0,
+                maxGasPerCall: 1 ether,
+                assets: oneAsset(asset, 100 ether, 1000 ether),
                 allowedCalls: rules
             })
         );

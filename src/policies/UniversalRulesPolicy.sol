@@ -16,7 +16,10 @@ import {
     AllowedCall,
     AllowedProgram,
     ArgPin,
+    AssetCap,
+    AssetCapState,
     Config,
+    MAX_ASSETS,
     MAX_PINS,
     ModeSlot,
     Multicall,
@@ -291,10 +294,12 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
      *           grant, so a regranted rules set has a new permission id and therefore an untouched
      *           config slot. The refusal only ever fires on a path this system does not use.
      *         - Rejects an allow-list that is empty or longer than the cap, an expiry that is zero
-     *           or already past, and a zero asset or expected destination account. An owner consent
-     *           term has no meaningful silence, so "never expires" is written as the maximum value.
+     *           or already past, a zero expected destination account, and an asset list that is
+     *           empty, longer than MAX_ASSETS, repeats a token, or names a token whose source chain
+     *           is not the declared chain. An owner consent term has no meaningful silence, so
+     *           "never expires" is written as the maximum value.
      *         - Deliberately does not validate cap values (zero and max are both legal, a zero
-     *           per-call cap being a valid redeploy-only rules set), `beneficiaryOffset`, or
+     *           per-call cap being a valid move-nothing entry), `beneficiaryOffset`, or
      *           allow-list contents. A wrong offset fails closed at validation time; it cannot widen
      *           a rules set, only break it. Offsets must be generated from each protocol's ABI by
      *           tooling rather than hand-typed, and each newly supported protocol must ship a test
@@ -384,9 +389,7 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         if (incoming.validUntil == 0 || incoming.validUntil <= block.timestamp) {
             revert UniversalRulesPolicyErrors.InvalidExpiry(incoming.validUntil);
         }
-        if (incoming.asset == address(0) || incoming.expectedCEA == address(0)) {
-            revert UniversalRulesPolicyErrors.InvalidConfigField();
-        }
+        if (incoming.expectedCEA == address(0)) revert UniversalRulesPolicyErrors.InvalidConfigField();
 
         // ─── THE TEETH ───
         //
@@ -394,9 +397,11 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         //
         // WHY THIS MAKES THE DECLARED CHAIN TRUE AT RUNTIME. `SOURCE_CHAIN_NAMESPACE()` is the exact
         // view the gateway reads on every outbound, through `UniversalCore.getOutboundTxGasAndFees`,
-        // to decide where to route. Gate 5 pins `req.token == cfg.asset` on every request. So
-        // asserting it here binds the owner's declared chain to the chain the gateway will actually
-        // use — with no runtime change and no external call in `checkAction`.
+        // to decide where to route. Gate 5 pins `req.token` to a LISTED asset on every request, zero
+        // amount included. So asserting it here, for EVERY listed asset, binds the owner's declared
+        // chain to the chain the gateway will actually use — with no runtime change and no external
+        // call in `checkAction`. It is also why the list may never be empty: an empty list would pin
+        // no token, and the agent would choose the chain.
         //
         // WHY AN EXTERNAL CALL IS SAFE HERE AND NOWHERE ELSE: this runs at INIT, inside the owner's
         // own grant transaction, never in `checkAction` and never on a removal path. A failure
@@ -415,10 +420,33 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         //    expected; the call to a codeless address then SUCCEEDS with empty returndata and the
         //    failure happens when THIS frame tries to ABI-decode it — outside the try/catch. Without
         //    this line a typo'd asset address, the likeliest real mistake, reverts unnamed.
-        _requireAssetOnChain(incoming.asset, chainHash);
+        _requireAssets(incoming.assets, chainHash);
 
         _store(cfg, incoming);
         cfg.initialized = true;
+    }
+
+    /**
+     * @dev The asset-list guards, shared by both universal families: 1..MAX_ASSETS entries, no token
+     *      twice, and THE TEETH for every entry. A zero token fails the teeth as `InvalidAsset(0)`.
+     *      O(n^2) duplicate check at n <= 8.
+     */
+    function _requireAssets(AssetCap[] memory assets, bytes32 chainHash) internal view {
+        uint256 n = assets.length;
+        if (n == 0 || n > MAX_ASSETS) revert UniversalRulesPolicyErrors.AssetListOutOfRange(n);
+        for (uint256 i; i < n;) {
+            address token = assets[i].token;
+            for (uint256 j; j < i;) {
+                if (assets[j].token == token) revert UniversalRulesPolicyErrors.DuplicateAsset(token);
+                unchecked {
+                    ++j;
+                }
+            }
+            _requireAssetOnChain(token, chainHash);
+            unchecked {
+                ++i;
+            }
+        }
     }
 
     /**
@@ -487,12 +515,12 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
      *      - Shape bounds first, then expiry and the three identity fields, then the allow-list
      *        rules, then the pins, then the teeth. Same discipline as the universal branch: every
      *        decode and guard before any write.
-     *      - The teeth are IDENTICAL to the universal branch and for the same reason: the asset's
-     *        `SOURCE_CHAIN_NAMESPACE()` is what the gateway routes on, so binding the declared chain
-     *        to it here is what makes a `solana:` grant with an EVM asset impossible.
+     *      - The teeth are IDENTICAL to the universal branch and for the same reason: each listed
+     *        asset's `SOURCE_CHAIN_NAMESPACE()` is what the gateway routes on, so binding the declared
+     *        chain to every one of them here is what makes a `solana:` grant with an EVM asset impossible.
      * @param cfg        Storage slot to write.
      * @param body       `abi.encode(SvmTerms)`.
-     * @param chainHash  keccak256 of the declared chain string, verified against the asset.
+     * @param chainHash  keccak256 of the declared chain string, verified against every listed asset.
      */
     function _initSvm(SvmConfig storage cfg, bytes memory body, bytes32 chainHash) internal {
         SvmTerms memory incoming = abi.decode(body, (SvmTerms));
@@ -514,8 +542,7 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         if (incoming.validUntil == 0 || incoming.validUntil <= block.timestamp) {
             revert UniversalRulesPolicyErrors.InvalidExpiry(incoming.validUntil);
         }
-        if (incoming.expectedCEA == bytes32(0) || incoming.gatewayProgram == bytes32(0) || incoming.asset == address(0))
-        {
+        if (incoming.expectedCEA == bytes32(0) || incoming.gatewayProgram == bytes32(0)) {
             revert UniversalRulesPolicyErrors.InvalidSvmConfigField();
         }
 
@@ -523,7 +550,7 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         _checkSvmPinShapes(incoming);
         _checkCeaAccountList(incoming);
 
-        _requireAssetOnChain(incoming.asset, chainHash);
+        _requireAssets(incoming.assets, chainHash);
 
         _storeSvm(cfg, incoming);
         cfg.initialized = true;
@@ -729,10 +756,11 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
      *         3.  the target is the gateway
      *         4.  calldata is at least four bytes; the selector is the outbound send; the body is at
      *             least the minimum encoded length
-     *         5.  the token matches the configured asset
-     *         6.  the amount is within the per-call cap
-     *         7.  the running total is within the lifetime cap
-     *         8.  the Push-native value is within the per-call ceiling
+     *         5.  the token is one of the listed assets — on EVERY request, zero amount included,
+     *             because the token is what the gateway routes by
+     *         6.  the amount is within THAT asset's per-call cap
+     *         7.  THAT asset's running total is within its lifetime cap
+     *         8.  the Push-native value is within the per-call ceiling (`maxGasPerCall`)
      *         9.  the request does not ask for an uncapped gas swap
      *         10. the revert recipient is the wallet
      *         11. the recipient field is empty
@@ -823,18 +851,16 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         }
         UniversalOutboundTxRequest memory req = abi.decode(data[4:], (UniversalOutboundTxRequest));
 
-        if (req.token != cfg.asset) revert UniversalRulesPolicyErrors.AssetMismatch(cfg.asset, req.token);
+        AssetCapState storage cap = _assetFor(cfg.assets, req.token);
 
-        if (req.amount > cfg.maxAmountPerCall) {
-            revert UniversalRulesPolicyErrors.AmountExceedsCap(req.amount, cfg.maxAmountPerCall);
+        if (req.amount > cap.maxPerCall) {
+            revert UniversalRulesPolicyErrors.AmountExceedsCap(req.amount, cap.maxPerCall);
         }
 
-        uint256 newSpent = cfg.spent + req.amount;
-        if (newSpent > cfg.maxAmountTotal) {
-            revert UniversalRulesPolicyErrors.TotalSpendCapExceeded(newSpent, cfg.maxAmountTotal);
-        }
+        uint256 newSpent = cap.spent + req.amount;
+        if (newSpent > cap.maxTotal) revert UniversalRulesPolicyErrors.TotalSpendCapExceeded(newSpent, cap.maxTotal);
 
-        if (value > cfg.maxPCPerCall) revert UniversalRulesPolicyErrors.PCValueExceedsCap(value, cfg.maxPCPerCall);
+        if (value > cfg.maxGasPerCall) revert UniversalRulesPolicyErrors.PCValueExceedsCap(value, cfg.maxGasPerCall);
 
         if (req.maxPCForGas == 0) revert UniversalRulesPolicyErrors.UncappedGasSwapRejected();
 
@@ -847,8 +873,8 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         _checkInnerCalls(cfg, account, req.payload);
 
         if (req.amount > 0) {
-            cfg.spent = newSpent;
-            emit OutboundMetered(id, msg.sender, account, req.amount);
+            cap.spent = newSpent;
+            emit OutboundMetered(id, msg.sender, account, req.token, req.amount);
         }
 
         return VALIDATION_SUCCESS;
@@ -1079,20 +1105,18 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         }
         UniversalOutboundTxRequest memory req = abi.decode(data[4:], (UniversalOutboundTxRequest));
 
-        if (req.token != cfg.asset) revert UniversalRulesPolicyErrors.AssetMismatch(cfg.asset, req.token);
+        AssetCapState storage cap = _assetFor(cfg.assets, req.token);
 
-        if (req.amount > cfg.maxAmountPerCall) {
-            revert UniversalRulesPolicyErrors.AmountExceedsCap(req.amount, cfg.maxAmountPerCall);
+        if (req.amount > cap.maxPerCall) {
+            revert UniversalRulesPolicyErrors.AmountExceedsCap(req.amount, cap.maxPerCall);
         }
 
         if (req.amount > type(uint64).max) revert UniversalRulesPolicyErrors.AmountExceedsU64(req.amount);
 
-        uint256 newSpent = cfg.spent + req.amount;
-        if (newSpent > cfg.maxAmountTotal) {
-            revert UniversalRulesPolicyErrors.TotalSpendCapExceeded(newSpent, cfg.maxAmountTotal);
-        }
+        uint256 newSpent = cap.spent + req.amount;
+        if (newSpent > cap.maxTotal) revert UniversalRulesPolicyErrors.TotalSpendCapExceeded(newSpent, cap.maxTotal);
 
-        if (value > cfg.maxPCPerCall) revert UniversalRulesPolicyErrors.PCValueExceedsCap(value, cfg.maxPCPerCall);
+        if (value > cfg.maxGasPerCall) revert UniversalRulesPolicyErrors.PCValueExceedsCap(value, cfg.maxGasPerCall);
 
         if (req.maxPCForGas == 0) revert UniversalRulesPolicyErrors.UncappedGasSwapRejected();
 
@@ -1109,8 +1133,8 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         _checkSvmPayload(cfg, recipient, req.payload);
 
         if (req.amount > 0) {
-            cfg.spent = newSpent;
-            emit OutboundMetered(id, msg.sender, account, req.amount);
+            cap.spent = newSpent;
+            emit OutboundMetered(id, msg.sender, account, req.token, req.amount);
         }
 
         return VALIDATION_SUCCESS;
@@ -1391,39 +1415,40 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
     }
 
     /**
-     * @notice Exact-equality assertion on the spend counter; the change-flow race guard.
+     * @notice Exact-equality assertion on every per-asset spend counter; the change-flow race guard.
      *
      * @dev    - Intended as the first entry of the owner's atomic change batch: assert, revoke,
      *           grant. A mismatch reverts the whole change.
      *         - Reverts if the config is not initialised. Reading zero from a ghost config is
      *           indistinguishable from reading zero from a real unused rules set, and this function
      *           exists to catch stale belief, so it must not have a silent-pass mode.
+     *         - One expected value per listed asset, in list order; a different count reverts
+     *           `SpentLengthMismatch` rather than checking a prefix.
      *         - Exact equality in both directions, so a credit landing between read and submit also
      *           forces recomposition.
      *         - Callable by anyone; it is a pure read.
      *
      * @param  id             Config id identifying the rules set.
      * @param  account        The wallet the rules set belongs to.
-     * @param  expectedSpent  The spend total the caller composed its change against.
+     * @param  expectedSpent  The per-asset spend totals the caller composed its change against.
      */
-    function assertSpent(ConfigId id, address account, uint256 expectedSpent) external view {
+    function assertSpent(ConfigId id, address account, uint256[] calldata expectedSpent) external view {
         (bool init, RulesType mode) = _modeOf(id, SESSION_ENGINE, account);
         if (init && mode == RulesType.NATIVE) revert UniversalRulesPolicyErrors.WrongModeForCall(RulesType.NATIVE);
 
-        // Both universal families keep ONE `spent` counter with one meaning, so one assertion serves
-        // both; only the slot it reads differs. An SVM family byte is only ever written together with
-        // an initialised `SvmConfig`, so the initialised check below is the EVM branch's alone.
-        if (_vmOf(id, SESSION_ENGINE, account) == VmFamily.SVM) {
-            uint256 svmSpent = _svm[id][SESSION_ENGINE][account].spent;
-            if (svmSpent != expectedSpent) revert UniversalRulesPolicyErrors.SpentMismatch(expectedSpent, svmSpent);
-            return;
+        AssetCapState[] storage assets = _universalAssets(id, account);
+
+        uint256 n = assets.length;
+        if (expectedSpent.length != n) revert UniversalRulesPolicyErrors.SpentLengthMismatch(n, expectedSpent.length);
+        for (uint256 i; i < n;) {
+            AssetCapState storage a = assets[i];
+            if (a.spent != expectedSpent[i]) {
+                revert UniversalRulesPolicyErrors.AssetSpentMismatch(a.token, expectedSpent[i], a.spent);
+            }
+            unchecked {
+                ++i;
+            }
         }
-
-        Config storage cfg = _configs[id][SESSION_ENGINE][account];
-
-        if (!cfg.initialized) revert UniversalRulesPolicyErrors.NotInitialized(id, account);
-
-        if (cfg.spent != expectedSpent) revert UniversalRulesPolicyErrors.SpentMismatch(expectedSpent, cfg.spent);
     }
 
     /**
@@ -1470,15 +1495,19 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
     }
 
     /**
-     * @notice Credits a confirmed far-side failure back to the spend counter.
+     * @notice Credits a confirmed far-side failure back to one asset's spend counter.
      *
      * @dev    - Callable only by the executor module; nobody else can fabricate a failure.
-     *         - Reverts if the config is not initialised, checked before the idempotency flag is
-     *           written so a misrouted credit stays retryable rather than burning the outbound id
-     *           forever.
+     *         - A ghost config reverts `NotInitialized` and an unlisted token `AssetNotAllowed`; the
+     *           revert rolls the idempotency flag back, so a misrouted credit stays retryable. Both are
+     *           resolved BEFORE the flag is checked, so an already-credited id sent with an unlisted
+     *           token reports the token, the actionable mistake.
      *         - Reverts if the id was already credited.
      *         - Subtracts saturating, since the amount is trusted from Push core and cannot be
-     *           verified here. Idempotency and saturation bound a wrong value.
+     *           verified here. Idempotency and saturation bound a wrong value, PER ASSET: a credit
+     *           can never lower another token's counter.
+     *         - `token` is trusted from the caller as much as `amount` is: URP never learns the
+     *           outbound id at check time, so it cannot map an id to the token it metered.
      *         - Emits the amount actually applied, not the amount claimed, so monitoring can detect
      *           divergence between the two.
      *         - Not yet functional: the executor module does not yet call this on outbound failure,
@@ -1490,39 +1519,50 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
      * @param  id            Config id identifying the rules set.
      * @param  account       The wallet the rules set belongs to.
      * @param  outboundTxId  Push-core transaction id, the idempotency key.
+     * @param  token         The listed asset whose counter is credited.
      * @param  amount        Amount claimed as failed, credited saturating.
      */
-    function creditRevert(ConfigId id, address account, bytes32 outboundTxId, uint256 amount) external {
+    function creditRevert(ConfigId id, address account, bytes32 outboundTxId, address token, uint256 amount) external {
         if (msg.sender != UNIVERSAL_EXECUTOR_MODULE) revert UniversalRulesPolicyErrors.CallerIsNotUEModule(msg.sender);
 
-        // The family decides which counter is credited; the idempotency set is shared, because an
-        // outbound id belongs to exactly one config whatever its family. An SVM family byte is only
-        // ever written together with an initialised `SvmConfig`, so no initialised check is needed
-        // on this branch.
-        if (_vmOf(id, SESSION_ENGINE, account) == VmFamily.SVM) {
-            SvmConfig storage svm = _svm[id][SESSION_ENGINE][account];
-
-            if (_credited[outboundTxId]) revert UniversalRulesPolicyErrors.AlreadyCredited(outboundTxId);
-            _credited[outboundTxId] = true;
-
-            uint256 appliedSvm = svm.spent > amount ? amount : svm.spent;
-            svm.spent -= appliedSvm;
-
-            emit RevertCredited(outboundTxId, id, account, appliedSvm);
-            return;
-        }
-
-        Config storage cfg = _configs[id][SESSION_ENGINE][account];
-
-        if (!cfg.initialized) revert UniversalRulesPolicyErrors.NotInitialized(id, account);
+        AssetCapState storage cap = _assetFor(_universalAssets(id, account), token);
 
         if (_credited[outboundTxId]) revert UniversalRulesPolicyErrors.AlreadyCredited(outboundTxId);
         _credited[outboundTxId] = true;
 
-        uint256 applied = cfg.spent > amount ? amount : cfg.spent;
-        cfg.spent -= applied;
+        uint256 applied = cap.spent > amount ? amount : cap.spent;
+        cap.spent -= applied;
 
-        emit RevertCredited(outboundTxId, id, account, applied);
+        emit RevertCredited(outboundTxId, id, account, token, applied);
+    }
+
+    /**
+     * @dev The engine-keyed asset list of a UNIVERSAL config, either family. Reverts `NotInitialized`
+     *      on an empty EVM slot; an SVM family byte is only ever written together with an initialised
+     *      `SvmConfig`, so that branch needs no check. Shared by `assertSpent` and `creditRevert`.
+     */
+    function _universalAssets(ConfigId id, address account) internal view returns (AssetCapState[] storage) {
+        if (_vmOf(id, SESSION_ENGINE, account) == VmFamily.SVM) return _svm[id][SESSION_ENGINE][account].assets;
+
+        Config storage cfg = _configs[id][SESSION_ENGINE][account];
+        if (!cfg.initialized) revert UniversalRulesPolicyErrors.NotInitialized(id, account);
+        return cfg.assets;
+    }
+
+    /**
+     * @dev Gate 5: the entry for `token` in a listed-asset array, or `AssetNotAllowed`. A linear scan
+     *      at n <= MAX_ASSETS, so up to eight cold reads on a miss. Makes no external call.
+     */
+    function _assetFor(AssetCapState[] storage assets, address token) internal view returns (AssetCapState storage) {
+        uint256 n = assets.length;
+        for (uint256 i; i < n;) {
+            AssetCapState storage a = assets[i];
+            if (a.token == token) return a;
+            unchecked {
+                ++i;
+            }
+        }
+        revert UniversalRulesPolicyErrors.AssetNotAllowed(token);
     }
 
     /**
@@ -1635,7 +1675,7 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
      *         BUMP THIS IN THE SAME COMMIT AS ANY LOGIC CHANGE.
      */
     function version() external pure returns (string memory) {
-        return "2.0.0";
+        return "3.0.0";
     }
 
     /**
@@ -1718,10 +1758,10 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
      *      types: the wire shape is free to change, the storage layout is frozen forever
      *      (see the layout note on `__gap`).
      *
-     *      - Forces `spent` to zero. It is not a wire field at all — URP owns it.
+     *      - Forces every asset's `spent` to zero. It is not a wire field at all — URP owns it.
      *      - DOES NOT WRITE `destChainHash`. That slot is a v2 relic, kept only so the layout never
      *        moves; the chain of every rules set now lives on `ModeSlot.chainHash`, where it has been
-     *        verified against the asset. Writing it here would recreate the second source of truth
+     *        verified against every listed asset. Writing it here would recreate the second source of truth
      *        this change exists to remove.
      *      - Clears and repopulates the allow-list.
      *      - Does not set `initialized`; the caller does, immediately after this returns.
@@ -1732,11 +1772,9 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
     function _store(Config storage cfg, UniversalTerms memory incoming) internal {
         cfg.validUntil = incoming.validUntil;
         cfg.expectedCEA = incoming.expectedCEA;
-        cfg.asset = incoming.asset;
-        cfg.maxAmountPerCall = incoming.maxAmountPerCall;
-        cfg.maxAmountTotal = incoming.maxAmountTotal;
-        cfg.maxPCPerCall = incoming.maxPCPerCall;
-        cfg.spent = 0;
+        cfg.maxGasPerCall = incoming.maxGasPerCall;
+        delete cfg.assets;
+        _storeAssets(cfg.assets, incoming.assets);
 
         // Re-initialisation is refused, so in production this array is always empty here. The
         // delete is kept for the stranger-slice path and for tests.
@@ -1744,6 +1782,22 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         uint256 len = incoming.allowedCalls.length;
         for (uint256 i; i < len;) {
             cfg.allowedCalls.push(incoming.allowedCalls[i]);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @dev Wire asset caps into storage, element by element, every `spent` forced to zero. Shared by
+    ///      both universal families. The caller deletes `dst` first, as for every other array.
+    function _storeAssets(AssetCapState[] storage dst, AssetCap[] memory src) internal {
+        uint256 len = src.length;
+        for (uint256 i; i < len;) {
+            dst.push(
+                AssetCapState({
+                    token: src[i].token, maxPerCall: src[i].maxPerCall, maxTotal: src[i].maxTotal, spent: 0
+                })
+            );
             unchecked {
                 ++i;
             }
@@ -1789,7 +1843,7 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
 
     /**
      * @dev Copies decoded SVM wire terms into storage. The SVM counterpart of `_store`.
-     *      - Forces `spent` to zero; URP owns it.
+     *      - Forces every asset's `spent` to zero; URP owns it.
      *      - Every dynamic member is copied ELEMENT BY ELEMENT, same shape and same reason as
      *        `allowedCalls` and `pins`.
      *      - Does not set `initialized`; the caller does, immediately after this returns.
@@ -1798,11 +1852,9 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         cfg.validUntil = incoming.validUntil;
         cfg.expectedCEA = incoming.expectedCEA;
         cfg.gatewayProgram = incoming.gatewayProgram;
-        cfg.asset = incoming.asset;
-        cfg.maxAmountPerCall = incoming.maxAmountPerCall;
-        cfg.maxAmountTotal = incoming.maxAmountTotal;
-        cfg.maxPCPerCall = incoming.maxPCPerCall;
-        cfg.spent = 0;
+        cfg.maxGasPerCall = incoming.maxGasPerCall;
+        delete cfg.assets;
+        _storeAssets(cfg.assets, incoming.assets);
 
         delete cfg.ceaAccounts;
         uint256 len = incoming.ceaAccounts.length;

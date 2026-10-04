@@ -123,11 +123,8 @@ contract CheckpointsTest is BaseTest {
                 validUntil: uint48(block.timestamp + 365 days),
                 destChainHash: bytes32(0),
                 expectedCEA: cea,
-                asset: asset,
-                maxAmountPerCall: 100 ether,
-                maxAmountTotal: 1000 ether,
-                maxPCPerCall: 5 ether,
-                spent: 0,
+                maxGasPerCall: 5 ether,
+                assets: oneAsset(asset, 100 ether, 1000 ether),
                 allowedCalls: rules
             })
         );

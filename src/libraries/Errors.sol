@@ -198,8 +198,13 @@ library UniversalRulesPolicyErrors {
     error AlreadyInitialized(ConfigId id);
     /// @dev init: zero, or not in the future.
     error InvalidExpiry(uint48 validUntil);
-    /// @dev init: zero asset or zero expectedCEA.
+    /// @dev init: zero expectedCEA.
     error InvalidConfigField();
+    /// @dev init, universal (EVM and SVM): the asset list is empty or longer than MAX_ASSETS. Empty is
+    ///      refused because the token is what pins the destination chain: the gateway routes by it.
+    error AssetListOutOfRange(uint256 length);
+    /// @dev init, universal: the same token listed twice — the second entry's caps would be dead.
+    error DuplicateAsset(address token);
     /// @dev init: 0 or > MAX_ALLOWED_CALLS.
     error AllowListOutOfRange(uint256 length);
     error RulesExpired(uint48 validUntil);
@@ -210,7 +215,10 @@ library UniversalRulesPolicyErrors {
     error InvalidSelector(bytes4 selector);
     /// @dev Gate 4c — body below MIN_OUTBOUND_BODY_LEN.
     error MalformedOutboundRequest(uint256 length);
-    error AssetMismatch(address expected, address actual);
+    /// @dev Gate 5: the request's token is not in the rules set's asset list. Checked on EVERY request,
+    ///      zero amount included — the token decides the destination chain, so an unlisted token is a
+    ///      chain the owner never approved.
+    error AssetNotAllowed(address token);
     error AmountExceedsCap(uint256 amount, uint256 cap);
     error TotalSpendCapExceeded(uint256 wouldBeTotal, uint256 cap);
     error PCValueExceedsCap(uint256 value, uint256 cap);
@@ -225,6 +233,10 @@ library UniversalRulesPolicyErrors {
     error InnerValueExceedsAllowance(uint256 index, uint256 value, uint256 maxValue);
     error MalformedInnerCalldata();
     error SpentMismatch(uint256 expected, uint256 actual);
+    /// @dev Universal `assertSpent`: one token's counter differs from what the caller composed against.
+    error AssetSpentMismatch(address token, uint256 expected, uint256 actual);
+    /// @dev Universal `assertSpent`: the expected array does not have one entry per listed asset.
+    error SpentLengthMismatch(uint256 expected, uint256 actual);
     error CallerIsNotUEModule(address caller);
     error AlreadyCredited(bytes32 outboundTxId);
 
@@ -304,7 +316,7 @@ library UniversalRulesPolicyErrors {
     // ───────────────────────── svm mode errors ─────────────────────────
 
     // init
-    /// @dev init: zero expectedCEA, gatewayProgram or asset.
+    /// @dev init: zero expectedCEA or gatewayProgram.
     error InvalidSvmConfigField();
     /// @dev init: 0 or > MAX_ALLOWED_PROGRAMS.
     error ProgramListOutOfRange(uint256 length);

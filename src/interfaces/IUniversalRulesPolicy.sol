@@ -31,8 +31,8 @@ interface IUniversalRulesPolicy is IActionPolicy {
     // ═══════════════════════════════ URP_1: EVENTS ═══════════════════════════════
 
     /// @dev `mode`, `vm` and `chainHash` are all DERIVED from the envelope's chain string, not
-    ///      declared. For a universal config `chainHash` has additionally been verified against the
-    ///      asset's own `SOURCE_CHAIN_NAMESPACE()`. `vm` was added with the SVM rulebook (1.1.0).
+    ///      declared. For a universal config `chainHash` has additionally been verified against EVERY
+    ///      listed asset's own `SOURCE_CHAIN_NAMESPACE()`. `vm` was added with the SVM rulebook (1.1.0).
     event RulesConfigured(
         ConfigId indexed id,
         address indexed multiplexer,
@@ -46,21 +46,26 @@ interface IUniversalRulesPolicy is IActionPolicy {
     event NativeCallMetered(
         ConfigId indexed id, address indexed multiplexer, address indexed account, uint256 value, uint256 amount
     );
-    event OutboundMetered(ConfigId indexed id, address indexed multiplexer, address indexed account, uint256 amount);
+    /// @dev `token` is the PRC20 whose counter moved — one rules set meters each listed asset separately.
+    event OutboundMetered(
+        ConfigId indexed id, address indexed multiplexer, address indexed account, address token, uint256 amount
+    );
     event RevertCredited(
-        bytes32 indexed outboundTxId, ConfigId indexed id, address indexed account, uint256 amountApplied
+        bytes32 indexed outboundTxId, ConfigId indexed id, address indexed account, address token, uint256 amountApplied
     );
 
     // ═══════════════════════════════ URP_2: POLICY ═══════════════════════════════
 
-    /// @notice Exact-equality assertion on the spend counter — the change-flow race guard.
-    /// @dev    Keyed on the SESSION_ENGINE immutable; there is no multiplexer argument to get wrong.
-    function assertSpent(ConfigId id, address account, uint256 expectedSpent) external view;
+    /// @notice Exact-equality assertion on every per-asset spend counter — the change-flow race guard.
+    /// @dev    `expectedSpent[i]` is the expected `spent` of `assets[i]`, in the order the rules set
+    ///         listed them; the array must have exactly one entry per asset. Keyed on the SESSION_ENGINE
+    ///         immutable; there is no multiplexer argument to get wrong.
+    function assertSpent(ConfigId id, address account, uint256[] calldata expectedSpent) external view;
 
-    /// @notice Credit a confirmed far-side failure back to the spend counter.
-    /// @dev    Executor-module-only, once per outboundTxId, saturating. Ships inert — Push core's
-    ///         calling side is not yet landed.
-    function creditRevert(ConfigId id, address account, bytes32 outboundTxId, uint256 amount) external;
+    /// @notice Credit a confirmed far-side failure back to one asset's spend counter.
+    /// @dev    Executor-module-only, once per outboundTxId, saturating. `token` names the counter and
+    ///         must be a listed asset. Ships inert — Push core's calling side is not yet landed.
+    function creditRevert(ConfigId id, address account, bytes32 outboundTxId, address token, uint256 amount) external;
 
     /// @notice The native change-flow race guard: exact equality on all three counters.
     /// @dev    Reverts `WrongModeForCall(UNIVERSAL)` on a universal config and `NotInitialized` on a

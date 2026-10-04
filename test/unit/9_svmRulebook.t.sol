@@ -15,6 +15,7 @@ import { ExecutionLib } from "../../src/libraries/ExecutionLib.sol";
 import {
     AllowedCall,
     AllowedProgram,
+    AssetCap,
     AmountRule,
     ArgPin,
     Config,
@@ -32,6 +33,7 @@ import { ConfigId, Session } from "smartsessions/DataTypes.sol";
 import { IPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { VALIDATION_SUCCESS } from "erc7579/interfaces/IERC7579Module.sol";
 import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
+import { MockPRC20Source } from "../mocks/MockPRC20Source.sol";
 
 /// @dev Exposes URP's internal program-id constants to the base58 witness test. Adds nothing to
 ///      URP's own selector set, which stays pinned exactly.
@@ -201,10 +203,8 @@ contract URPSvmTest is BaseTest {
             validUntil: VALID_UNTIL,
             expectedCEA: CEA,
             gatewayProgram: GATEWAY_PROG,
-            asset: ASSET,
-            maxAmountPerCall: MAX_PER_CALL,
-            maxAmountTotal: MAX_TOTAL,
-            maxPCPerCall: MAX_PC,
+            assets: oneCap(ASSET, MAX_PER_CALL, MAX_TOTAL),
+            maxGasPerCall: MAX_PC,
             ceaAccounts: _ceaAccounts(),
             programs: _rules(),
             pins: _pins(),
@@ -296,7 +296,87 @@ contract URPSvmTest is BaseTest {
     }
 
     function _spent() internal view returns (uint256) {
-        return urp.getSvmConfig(CID, ACCOUNT).spent;
+        return urp.getSvmConfig(CID, ACCOUNT).assets[0].spent;
+    }
+
+    // ───────────────────────────── multi-asset (SVM) ─────────────────────────────
+
+    /// @dev The default rules set plus a second Solana-devnet PRC20 (e.g. USDT.sol), 10/20 capped.
+    function _twoSvmAssets() internal returns (SvmTerms memory t, address second) {
+        second = address(new MockPRC20Source(CHAIN_SOLANA_DEVNET));
+        t = _terms();
+        AssetCap[] memory a = new AssetCap[](2);
+        a[0] = t.assets[0];
+        a[1] = AssetCap({ token: second, maxPerCall: 10_000_000, maxTotal: 20_000_000 });
+        t.assets = a;
+    }
+
+    function _goodWith(address token, uint256 amount) internal view returns (bytes memory) {
+        return svmOutboundRequest(token, amount, 1 ether, ACCOUNT, abi.encodePacked(PROG), _payload(_goodIx()));
+    }
+
+    function test_svm_MA_twoAssetsMeteredOnTheirOwnCounters() public {
+        (SvmTerms memory t, address second) = _twoSvmAssets();
+        _init(t);
+
+        _check(0, _goodWith(ASSET, 50_000_000));
+        _check(0, _goodWith(second, 7_000_000));
+
+        SvmConfig memory got = urp.getSvmConfig(CID, ACCOUNT);
+        assertEq(got.assets[0].spent, 50_000_000, "first asset metered alone");
+        assertEq(got.assets[1].spent, 7_000_000, "second asset metered alone");
+
+        _checkReverts(
+            abi.encodeWithSelector(
+                UniversalRulesPolicyErrors.AmountExceedsCap.selector, uint256(11_000_000), uint256(10_000_000)
+            ),
+            0,
+            _goodWith(second, 11_000_000)
+        );
+    }
+
+    /// ⚠️ NEVER-DELETE. The SVM half of the chain-escape guard: an unlisted token routes elsewhere even
+    /// at amount 0, so gate S5 refuses it before anything else.
+    function test_svm_MA_unlistedTokenRefusedEvenAtZeroAmount() public {
+        _initDefault();
+        address evmToken = address(new MockPRC20Source("eip155:11155111"));
+        _checkReverts(
+            abi.encodeWithSelector(UniversalRulesPolicyErrors.AssetNotAllowed.selector, evmToken),
+            0,
+            _goodWith(evmToken, 0)
+        );
+    }
+
+    function test_svm_MA_emptyListRefusedAndEveryTokenChainChecked() public {
+        SvmTerms memory t = _terms();
+        t.assets = new AssetCap[](0);
+        _initReverts(abi.encodeWithSelector(UniversalRulesPolicyErrors.AssetListOutOfRange.selector, uint256(0)), t);
+
+        (t,) = _twoSvmAssets();
+        address evmToken = address(new MockPRC20Source("eip155:11155111"));
+        t.assets[1].token = evmToken;
+        _initReverts(
+            abi.encodeWithSelector(
+                UniversalRulesPolicyErrors.ChainMismatch.selector,
+                keccak256(bytes(CHAIN_SOLANA_DEVNET)),
+                keccak256(bytes("eip155:11155111"))
+            ),
+            t
+        );
+    }
+
+    function test_svm_MA_creditRevertTouchesOnlyItsToken() public {
+        (SvmTerms memory t, address second) = _twoSvmAssets();
+        _init(t);
+        _check(0, _goodWith(ASSET, 50_000_000));
+        _check(0, _goodWith(second, 7_000_000));
+
+        vm.prank(EXECUTOR_MODULE);
+        urp.creditRevert(CID, ACCOUNT, keccak256("svm-second"), second, 2_000_000);
+
+        SvmConfig memory got = urp.getSvmConfig(CID, ACCOUNT);
+        assertEq(got.assets[1].spent, 5_000_000, "second asset credited");
+        assertEq(got.assets[0].spent, 50_000_000, "first asset untouched");
     }
 
     // ═════════════════════════════ init ═════════════════════════════
@@ -321,11 +401,11 @@ contract URPSvmTest is BaseTest {
         assertEq(c.validUntil, VALID_UNTIL);
         assertEq(c.expectedCEA, CEA);
         assertEq(c.gatewayProgram, GATEWAY_PROG);
-        assertEq(c.asset, ASSET);
-        assertEq(c.maxAmountPerCall, MAX_PER_CALL);
-        assertEq(c.maxAmountTotal, MAX_TOTAL);
-        assertEq(c.maxPCPerCall, MAX_PC);
-        assertEq(c.spent, 0, "spent starts at zero");
+        assertEq(c.assets[0].token, ASSET);
+        assertEq(c.assets[0].maxPerCall, MAX_PER_CALL);
+        assertEq(c.assets[0].maxTotal, MAX_TOTAL);
+        assertEq(c.maxGasPerCall, MAX_PC);
+        assertEq(c.assets[0].spent, 0, "spent starts at zero");
         assertEq(c.ceaAccounts.length, 3);
         assertEq(c.ceaAccounts[2], ATA_OUT);
         assertEq(c.programs.length, 1);
@@ -353,11 +433,8 @@ contract URPSvmTest is BaseTest {
             validUntil: VALID_UNTIL,
             destChainHash: bytes32(0),
             expectedCEA: makeAddr("cea"),
-            asset: address(sepoliaAsset),
-            maxAmountPerCall: 1,
-            maxAmountTotal: 1,
-            maxPCPerCall: 1,
-            spent: 0,
+            maxGasPerCall: 1,
+            assets: oneAsset(address(sepoliaAsset), 1, 1),
             allowedCalls: rules
         });
         vm.prank(address(engine));
@@ -382,7 +459,7 @@ contract URPSvmTest is BaseTest {
         // A pUSDC that answers Sepolia, granted under a Solana envelope: the teeth bite as on EVM.
         MockPRC20 wrong = new MockPRC20();
         SvmTerms memory t = _terms();
-        t.asset = address(wrong);
+        t.assets[0].token = address(wrong);
         _initReverts(
             abi.encodeWithSelector(
                 UniversalRulesPolicyErrors.ChainMismatch.selector,
@@ -395,15 +472,15 @@ contract URPSvmTest is BaseTest {
 
     function test_svmInit_codelessAssetReverts() public {
         SvmTerms memory t = _terms();
-        t.asset = makeAddr("no code here");
-        _initReverts(abi.encodeWithSelector(UniversalRulesPolicyErrors.InvalidAsset.selector, t.asset), t);
+        t.assets[0].token = makeAddr("no code here");
+        _initReverts(abi.encodeWithSelector(UniversalRulesPolicyErrors.InvalidAsset.selector, t.assets[0].token), t);
     }
 
     function test_svmInit_revertingAssetReverts() public {
         SvmTerms memory t = _terms();
-        t.asset = makeAddr("reverts on every call");
-        vm.etch(t.asset, hex"60006000fd"); // PUSH1 0 PUSH1 0 REVERT
-        _initReverts(abi.encodeWithSelector(UniversalRulesPolicyErrors.InvalidAsset.selector, t.asset), t);
+        t.assets[0].token = makeAddr("reverts on every call");
+        vm.etch(t.assets[0].token, hex"60006000fd"); // PUSH1 0 PUSH1 0 REVERT
+        _initReverts(abi.encodeWithSelector(UniversalRulesPolicyErrors.InvalidAsset.selector, t.assets[0].token), t);
     }
 
     function test_svmInit_reinitRefusedAcrossEverything() public {
@@ -455,9 +532,10 @@ contract URPSvmTest is BaseTest {
         t.gatewayProgram = bytes32(0);
         _initReverts(abi.encodeWithSelector(UniversalRulesPolicyErrors.InvalidSvmConfigField.selector), t);
 
+        // A zero token is no longer an identity field: it fails the per-asset teeth, named.
         t = _terms();
-        t.asset = address(0);
-        _initReverts(abi.encodeWithSelector(UniversalRulesPolicyErrors.InvalidSvmConfigField.selector), t);
+        t.assets[0].token = address(0);
+        _initReverts(abi.encodeWithSelector(UniversalRulesPolicyErrors.InvalidAsset.selector, address(0)), t);
     }
 
     function test_svmInit_discriminatorLenGuards() public {
@@ -712,7 +790,7 @@ contract URPSvmTest is BaseTest {
     function test_svm_goodRequestPassesAndMetersSpend() public {
         _initDefault();
         vm.expectEmit(true, true, true, true, address(urp));
-        emit IUniversalRulesPolicy.OutboundMetered(CID, address(engine), ACCOUNT, 50_000_000);
+        emit IUniversalRulesPolicy.OutboundMetered(CID, address(engine), ACCOUNT, ASSET, 50_000_000);
         assertEq(_check(0, _good(50_000_000)), VALIDATION_SUCCESS, "the engine's success sentinel");
         assertEq(_spent(), 50_000_000, "metered");
     }
@@ -949,7 +1027,7 @@ contract URPSvmTest is BaseTest {
         _initDefault();
         address other = makeAddr("other token");
         _checkReverts(
-            abi.encodeWithSelector(UniversalRulesPolicyErrors.AssetMismatch.selector, ASSET, other),
+            abi.encodeWithSelector(UniversalRulesPolicyErrors.AssetNotAllowed.selector, other),
             0,
             svmOutboundRequest(other, 1, 1 ether, ACCOUNT, abi.encodePacked(PROG), _payload(_goodIx()))
         );
@@ -968,8 +1046,8 @@ contract URPSvmTest is BaseTest {
 
     function test_svm_S6b_amountAboveU64() public {
         SvmTerms memory t = _terms();
-        t.maxAmountPerCall = type(uint256).max;
-        t.maxAmountTotal = type(uint256).max;
+        t.assets[0].maxPerCall = type(uint256).max;
+        t.assets[0].maxTotal = type(uint256).max;
         _init(t);
         _checkReverts(
             abi.encodeWithSelector(UniversalRulesPolicyErrors.AmountExceedsU64.selector, uint256(type(uint64).max) + 1),
@@ -1456,10 +1534,10 @@ contract URPSvmTest is BaseTest {
     function test_svm_assertSpentReadsTheSvmCounter() public {
         _initDefault();
         _check(0, _good(7));
-        urp.assertSpent(CID, ACCOUNT, 7);
+        urp.assertSpent(CID, ACCOUNT, oneSpent(7));
 
-        vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.SpentMismatch.selector, 8, 7));
-        urp.assertSpent(CID, ACCOUNT, 8);
+        vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.AssetSpentMismatch.selector, ASSET, 8, 7));
+        urp.assertSpent(CID, ACCOUNT, oneSpent(8));
     }
 
     function test_svm_creditRevertCreditsTheSvmCounter() public {
@@ -1468,24 +1546,24 @@ contract URPSvmTest is BaseTest {
         bytes32 txId = keccak256("failed outbound");
 
         vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.CallerIsNotUEModule.selector, address(this)));
-        urp.creditRevert(CID, ACCOUNT, txId, 10);
+        urp.creditRevert(CID, ACCOUNT, txId, ASSET, 10);
 
         vm.expectEmit(true, true, true, true, address(urp));
-        emit IUniversalRulesPolicy.RevertCredited(txId, CID, ACCOUNT, 10);
+        emit IUniversalRulesPolicy.RevertCredited(txId, CID, ACCOUNT, ASSET, 10);
         vm.prank(EXECUTOR_MODULE);
-        urp.creditRevert(CID, ACCOUNT, txId, 10);
+        urp.creditRevert(CID, ACCOUNT, txId, ASSET, 10);
         assertEq(_spent(), 30);
 
         vm.prank(EXECUTOR_MODULE);
         vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.AlreadyCredited.selector, txId));
-        urp.creditRevert(CID, ACCOUNT, txId, 10);
+        urp.creditRevert(CID, ACCOUNT, txId, ASSET, 10);
 
         // Saturating: a claim above the counter applies the counter, and says so.
         bytes32 txId2 = keccak256("another failed outbound");
         vm.expectEmit(true, true, true, true, address(urp));
-        emit IUniversalRulesPolicy.RevertCredited(txId2, CID, ACCOUNT, 30);
+        emit IUniversalRulesPolicy.RevertCredited(txId2, CID, ACCOUNT, ASSET, 30);
         vm.prank(EXECUTOR_MODULE);
-        urp.creditRevert(CID, ACCOUNT, txId2, 1_000);
+        urp.creditRevert(CID, ACCOUNT, txId2, ASSET, 1_000);
         assertEq(_spent(), 0);
         assertTrue(urp.isCredited(txId2));
     }
@@ -1571,8 +1649,8 @@ contract URPSvmTest is BaseTest {
     function testFuzz_svm_amountsAboveU64Refused(uint256 amount) public {
         amount = bound(amount, uint256(type(uint64).max) + 1, type(uint256).max);
         SvmTerms memory t = _terms();
-        t.maxAmountPerCall = type(uint256).max;
-        t.maxAmountTotal = type(uint256).max;
+        t.assets[0].maxPerCall = type(uint256).max;
+        t.assets[0].maxTotal = type(uint256).max;
         _init(t);
         _checkReverts(
             abi.encodeWithSelector(UniversalRulesPolicyErrors.AmountExceedsU64.selector, amount), 0, _good(amount)
@@ -1677,7 +1755,9 @@ contract URPSvmTest is BaseTest {
         _submit(ag, _agentRequest(ag, _goodIx()));
 
         assertEq(callsRecorded(GATEWAY), 1, "the outbound reached the gateway");
-        assertEq(urp.getSvmConfig(_walletConfigId(ag), address(ag.wallet)).spent, 10, "metered through the engine");
+        assertEq(
+            urp.getSvmConfig(_walletConfigId(ag), address(ag.wallet)).assets[0].spent, 10, "metered through the engine"
+        );
     }
 
     function test_svm_wallet_violationSurfacesAsTheUrpGate() public {
@@ -1695,6 +1775,6 @@ contract URPSvmTest is BaseTest {
         _submit(ag, executionCalldata);
 
         assertNoCallsTo(GATEWAY);
-        assertEq(urp.getSvmConfig(_walletConfigId(ag), address(ag.wallet)).spent, 0, "nothing metered");
+        assertEq(urp.getSvmConfig(_walletConfigId(ag), address(ag.wallet)).assets[0].spent, 0, "nothing metered");
     }
 }

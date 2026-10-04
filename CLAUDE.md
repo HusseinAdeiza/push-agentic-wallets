@@ -163,6 +163,11 @@ AGW follows the core/gateway naming standard (`docs-internal/sdk-first-changes/N
   value cap entirely.
 - **Gate 16's per-entry cap is in destination-chain native units** and is never compared against the
   Push-side `value` (gate 8). Conflating them is a real bug this design once carried.
+- **A universal rules set lists 1..`MAX_ASSETS` tokens, and gate 5 checks the request's token on every
+  request, zero amount included** (multi-asset branch). The gateway routes by the token, so the token is
+  what pins the destination chain: every listed token is chain-checked at grant, an empty list is refused,
+  and a zero-amount request naming an unlisted token is refused. Each token has its own caps and its own
+  `spent`; "unlimited" is `type(uint256).max`, never 0. See `docs/multi-asset-review.md`.
 - **The factory's derivation is frozen forever.** `_walletImplementation` is the append-only storage anchor
   with no setter; the salt formula and the 40-byte immutable-args encoding may never change, because
   counterfactual funding is a supported flow with no recovery path.
@@ -202,7 +207,7 @@ AGW follows the core/gateway naming standard (`docs-internal/sdk-first-changes/N
 - **`Config`, `SvmConfig` and `NativeConfig` are STORAGE types; `UniversalTerms`, `SvmTerms` and
   `NativeTerms` are the wire types.** URP storage is append-only — `_svm` took slot 7 and one `__gap` slot.
   The SDK encodes the latter. `Config.destChainHash` is a v2 relic that keeps slot 1 and is never written —
-  a rules set's chain lives on `ModeSlot.chainHash`, where it has been checked against the asset.
+  a rules set's chain lives on `ModeSlot.chainHash`, where it has been checked against every listed asset.
   `test_upgradeable_configStructLayoutIsFrozen` pins every member's label, slot, offset and type, because a
   struct inside a mapping never appears in the contract-level layout and can otherwise be reordered
   silently.

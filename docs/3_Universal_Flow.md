@@ -122,11 +122,10 @@ actions: [ EXACTLY ONE — the UNIVERSAL shape ]
   actionPolicies: [ URP AND ONLY URP ]
     initData = (chainNamespace = "eip155:11155111", body = ↓)   ← THE CHAIN. Not Push ⇒ UNIVERSAL; eip155: ⇒ EVM rulebook.
       validUntil        = now + 60 min      ← THE EXPIRY LIVES INSIDE URP
-      asset             = PRC20_USDC        ← checked AT GRANT against the declared chain
       expectedCEA       = 0xbobagwcea       ← DERIVED at grant, committed forever
-      maxAmountPerCall  = 100e6
-      maxAmountTotal    = 100e6
-      maxPCPerCall      = <bounded>
+      assets            = [ { token: PRC20_USDC, maxPerCall: 100e6, maxTotal: 100e6 } ]
+                                            ← 1..8 tokens; EACH checked AT GRANT against the declared chain
+      maxGasPerCall     = <bounded>         ← PC per outbound: protocol fee + gas swap
       allowedCalls      = { Aave v3, Morpho Blue, Spark } × { supply } + beneficiary offsets
 ```
 
@@ -145,7 +144,7 @@ actions: [ EXACTLY ONE — the UNIVERSAL shape ]
 ```
 0xbobuea    : 0 pUSDC            ← identity only, clean
 0xbobagw    : 100 pUSDC + PC     ← owned by 0xbobuea; one rules set live
-URP.spent  : 0
+URP.assets[0].spent : 0
 ```
 
 **Bob signed once. He has an identity, an agent wallet, a bounded rules set, and zero exposure beyond 100 USDC.**
@@ -223,7 +222,7 @@ Layer 1  the execution payload  one single call: target = the gateway, value = P
 
 ```
 0xbobagw [100 pUSDC] ──BURN──▶ ∅        emit UniversalTxOutbound(sender = 0xbobagw, …)
-URP.spent: 0 → 100e6                   emit OutboundMetered(...)   ← the correlation record
+URP.assets[0].spent: 0 → 100e6         emit OutboundMetered(..., token, amount)   ← the correlation record
 ```
 
 ---
@@ -282,7 +281,7 @@ msg.sender = 0xbobagwcea · onBehalfOf = 0xbobagwcea · shares → 0xbobagwcea
 
 - **Withdraw** — `execute([...])`. **There is no `withdraw()` function**; the owner path *is* withdrawal, with no destination restriction and no policy in the path. It must succeed in every degraded state — zero rules sets, engine uninstalled, hostile validator installed.
 - **Revoke** — `revokeRules(pid)` (existence-checked, so a typo reverts loudly instead of silently "succeeding") or `revokeAllRules()`. Immediate on Push, unblockable, no callbacks on the path. **One honest limit:** an instruction already dispatched across the bridge still completes.
-- **Change a rules set** — **it cannot be edited.** A change is one owner transaction batching: `URP.assertSpent(expected)` → `revokeRules(old)` → `grantRules(new)`. If the agent spent in the composition window, the assertion reverts the whole change. **Counters restart at zero on the new rules set**, and any request for the old id is dead: removal cleared its agent, and the new rules set has a new id.
+- **Change a rules set** — **it cannot be edited.** A change is one owner transaction batching: `URP.assertSpent(expected[] — one per token)` → `revokeRules(old)` → `grantRules(new)`. If the agent spent in the composition window, the assertion reverts the whole change. **Counters restart at zero on the new rules set**, and any request for the old id is dead: removal cleared its agent, and the new rules set has a new id.
 - **Every one of these advances the wallet's checkpoint counter** — one tick per owner-door call, per grant and per revoked id — so a job's evaluator can tell the owner acted. Agent actions never move it.
 
 ### STAGE 7b — the second action, and why it may carry zero USDC

@@ -102,11 +102,8 @@ contract URPTest is BaseTest {
             validUntil: VALID_UNTIL,
             destChainHash: keccak256("eip155:11155111"),
             expectedCEA: CEA,
-            asset: ASSET,
-            maxAmountPerCall: 100 ether,
-            maxAmountTotal: 1000 ether,
-            maxPCPerCall: 5 ether,
-            spent: 0,
+            maxGasPerCall: 5 ether,
+            assets: oneAsset(ASSET, 100 ether, 1000 ether),
             allowedCalls: rules
         });
     }
@@ -167,7 +164,7 @@ contract URPTest is BaseTest {
     }
 
     function _spent() internal view returns (uint256) {
-        return urp.getConfig(CID, ACCOUNT).spent;
+        return urp.getConfig(CID, ACCOUNT).assets[0].spent;
     }
 
     // ═══════════════════════════ construction & init ═══════════════════════════
@@ -319,35 +316,24 @@ contract URPTest is BaseTest {
      */
     function test_upgradeable_configStructLayoutIsFrozen() public view {
         // `destChainHash` at slot 1 is a HOLE, deliberately — see the NatSpec above.
-        string[10] memory universalLabels = [
-            "initialized",
-            "validUntil",
-            "destChainHash",
-            "expectedCEA",
-            "asset",
-            "maxAmountPerCall",
-            "maxAmountTotal",
-            "maxPCPerCall",
-            "spent",
-            "allowedCalls"
-        ];
-        uint256[10] memory universalSlots = [uint256(0), 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        // MULTI-ASSET BRANCH: members 4+ were re-laid out on purpose (pre-deployment, fresh product):
+        // the single `asset`/caps/`spent` became `assets`, each entry carrying its own `spent`.
+        string[7] memory universalLabels =
+            ["initialized", "validUntil", "destChainHash", "expectedCEA", "maxGasPerCall", "assets", "allowedCalls"];
+        uint256[7] memory universalSlots = [uint256(0), 0, 1, 2, 3, 4, 5];
         // OFFSET AND TYPE ARE PINNED TOO, not just the slot. A retype that keeps every slot number —
         // `uint48 validUntil` to `uint64`, `address expectedCEA` to `bytes32` — changes how the
         // packed bytes of slot 0 are read while leaving the slot column untouched. Slot-only
         // assertions would wave that through.
-        uint256[10] memory universalOffsets = [uint256(0), 1, 0, 0, 0, 0, 0, 0, 0, 0];
-        string[10] memory universalTypes = [
+        uint256[7] memory universalOffsets = [uint256(0), 1, 0, 0, 0, 0, 0];
+        string[7] memory universalTypes = [
             "t_bool",
             "t_uint48",
             "t_bytes32",
             "t_address",
-            "t_address",
-            "t_uint256",
-            "t_uint256",
-            "t_uint256",
             "t_uint256",
             // Prefix only: the artifact appends a build-varying numeric id to composite types.
+            "t_array(t_struct(AssetCapState)",
             "t_array(t_struct(AllowedCall)"
         ];
 
@@ -418,34 +404,28 @@ contract URPTest is BaseTest {
             "ModeSlot", modeLabels.length, _toDyn(modeLabels), _toDyn(modeSlots), _toDyn(modeOffsets), _toDyn(modeTypes)
         );
 
-        // `SvmConfig`, new on 2026-09-30. Frozen from its first deployment like the other two.
-        string[13] memory svmLabels = [
+        // `SvmConfig`, new on 2026-09-30, re-laid out with `Config` on the multi-asset branch.
+        string[10] memory svmLabels = [
             "initialized",
             "validUntil",
             "expectedCEA",
             "gatewayProgram",
-            "asset",
-            "maxAmountPerCall",
-            "maxAmountTotal",
-            "maxPCPerCall",
-            "spent",
+            "maxGasPerCall",
+            "assets",
             "ceaAccounts",
             "programs",
             "pins",
             "dataPins"
         ];
-        uint256[13] memory svmSlots = [uint256(0), 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
-        uint256[13] memory svmOffsets = [uint256(0), 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
-        string[13] memory svmTypes = [
+        uint256[10] memory svmSlots = [uint256(0), 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        uint256[10] memory svmOffsets = [uint256(0), 1, 0, 0, 0, 0, 0, 0, 0, 0];
+        string[10] memory svmTypes = [
             "t_bool",
             "t_uint48",
             "t_bytes32",
             "t_bytes32",
-            "t_address",
             "t_uint256",
-            "t_uint256",
-            "t_uint256",
-            "t_uint256",
+            "t_array(t_struct(AssetCapState)",
             "t_array(t_bytes32)",
             "t_array(t_struct(AllowedProgram)",
             "t_array(t_struct(SvmAccountPin)",
@@ -453,6 +433,21 @@ contract URPTest is BaseTest {
         ];
         _assertStructLayout(
             "SvmConfig", svmLabels.length, _toDyn(svmLabels), _toDyn(svmSlots), _toDyn(svmOffsets), _toDyn(svmTypes)
+        );
+
+        // `AssetCapState`, new on the multi-asset branch: one entry per listed token, inside both
+        // `Config.assets` and `SvmConfig.assets`. Four full slots; `spent` is last.
+        string[4] memory assetLabels = ["token", "maxPerCall", "maxTotal", "spent"];
+        uint256[4] memory assetSlots = [uint256(0), 1, 2, 3];
+        uint256[4] memory assetOffsets = [uint256(0), 0, 0, 0];
+        string[4] memory assetTypes = ["t_address", "t_uint256", "t_uint256", "t_uint256"];
+        _assertStructLayout(
+            "AssetCapState",
+            assetLabels.length,
+            _toDyn(assetLabels),
+            _toDyn(assetSlots),
+            _toDyn(assetOffsets),
+            _toDyn(assetTypes)
         );
     }
 
@@ -567,16 +562,16 @@ contract URPTest is BaseTest {
         }
     }
 
-    function _toDyn(string[13] memory a) internal pure returns (string[] memory out) {
-        out = new string[](13);
-        for (uint256 i; i < 13; ++i) {
+    function _toDyn(string[7] memory a) internal pure returns (string[] memory out) {
+        out = new string[](7);
+        for (uint256 i; i < 7; ++i) {
             out[i] = a[i];
         }
     }
 
-    function _toDyn(uint256[13] memory a) internal pure returns (uint256[] memory out) {
-        out = new uint256[](13);
-        for (uint256 i; i < 13; ++i) {
+    function _toDyn(uint256[7] memory a) internal pure returns (uint256[] memory out) {
+        out = new uint256[](7);
+        for (uint256 i; i < 7; ++i) {
             out[i] = a[i];
         }
     }
@@ -618,7 +613,7 @@ contract URPTest is BaseTest {
         expected[i++] = UniversalRulesPolicy.checkAction.selector;
 
         // assertions — BOTH overloads, addressed by signature because `.selector` is ambiguous
-        expected[i++] = bytes4(keccak256("assertSpent(bytes32,address,uint256)"));
+        expected[i++] = bytes4(keccak256("assertSpent(bytes32,address,uint256[])"));
         expected[i++] = bytes4(keccak256("assertSpent(bytes32,address,uint256,uint256,uint32)"));
 
         // the refund path
@@ -739,7 +734,7 @@ contract URPTest is BaseTest {
 
         // Neither attempt touched anything.
         assertEq(_spent(), spentBefore, "spend counter untouched by the refused re-inits");
-        assertEq(urp.getConfig(CID, ACCOUNT).asset, ASSET, "and the live config is still readable");
+        assertEq(urp.getConfig(CID, ACCOUNT).assets[0].token, ASSET, "and the live config is still readable");
     }
 
     /// @dev `_mode` is slot 5: keccak(account . keccak(multiplexer . keccak(configId . 5))).
@@ -785,11 +780,11 @@ contract URPTest is BaseTest {
         assertTrue(got.initialized, "initialized set by init, not by _store");
         assertEq(got.validUntil, VALID_UNTIL, "validUntil");
         assertEq(got.expectedCEA, CEA, "expectedCEA");
-        assertEq(got.asset, ASSET, "asset");
-        assertEq(got.maxAmountPerCall, 100 ether, "maxAmountPerCall");
-        assertEq(got.maxAmountTotal, 1000 ether, "maxAmountTotal");
-        assertEq(got.maxPCPerCall, 5 ether, "maxPCPerCall");
-        assertEq(got.spent, 0, "spent starts at zero");
+        assertEq(got.assets[0].token, ASSET, "asset");
+        assertEq(got.assets[0].maxPerCall, 100 ether, "maxAmountPerCall");
+        assertEq(got.assets[0].maxTotal, 1000 ether, "maxAmountTotal");
+        assertEq(got.maxGasPerCall, 5 ether, "maxPCPerCall");
+        assertEq(got.assets[0].spent, 0, "spent starts at zero");
         assertEq(got.allowedCalls.length, 1, "allow-list deep-copied");
         assertEq(got.allowedCalls[0].target, PROTOCOL, "rule target");
         assertEq(got.allowedCalls[0].selector, SWAP_SELECTOR, "rule selector");
@@ -801,7 +796,7 @@ contract URPTest is BaseTest {
     /// `spent` supplied in initData is ignored — _store forces it to zero.
     function test_init_ignoresSuppliedSpent() public {
         Config memory cfg = _defaultConfig();
-        cfg.spent = 500 ether;
+        cfg.assets[0].spent = 500 ether;
         _init(cfg);
         assertEq(_spent(), 0, "supplied spent ignored");
     }
@@ -828,9 +823,10 @@ contract URPTest is BaseTest {
 
     function test_init_rejectsZeroAssetAndZeroCEA() public {
         Config memory noAsset = _defaultConfig();
-        noAsset.asset = address(0);
+        noAsset.assets[0].token = address(0);
         vm.prank(address(engine));
-        vm.expectRevert(UniversalRulesPolicyErrors.InvalidConfigField.selector);
+        // A zero token fails the per-asset teeth (no code at address 0), named with the token.
+        vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.InvalidAsset.selector, address(0)));
         urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(noAsset));
 
         Config memory noCEA = _defaultConfig();
@@ -843,9 +839,9 @@ contract URPTest is BaseTest {
     /// §6.1: a per-call cap of zero is a LEGAL redeploy-only mandate. Do not reject it at init.
     function test_init_acceptsZeroPerCallCap() public {
         Config memory cfg = _defaultConfig();
-        cfg.maxAmountPerCall = 0;
+        cfg.assets[0].maxPerCall = 0;
         _init(cfg);
-        assertEq(urp.getConfig(CID, ACCOUNT).maxAmountPerCall, 0, "zero per-call cap accepted");
+        assertEq(urp.getConfig(CID, ACCOUNT).assets[0].maxPerCall, 0, "zero per-call cap accepted");
     }
 
     // ═════════════════════════════════ U-08 ═════════════════════════════════
@@ -980,17 +976,17 @@ contract URPTest is BaseTest {
         //     failure to refill its own budget.
         vm.prank(AGENT);
         vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.CallerIsNotUEModule.selector, AGENT));
-        urp.creditRevert(CID, ACCOUNT, keccak256("tx"), 10 ether);
+        urp.creditRevert(CID, ACCOUNT, keccak256("tx"), ASSET, 10 ether);
 
         vm.prank(ACCOUNT);
         vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.CallerIsNotUEModule.selector, ACCOUNT));
-        urp.creditRevert(CID, ACCOUNT, keccak256("tx"), 10 ether);
+        urp.creditRevert(CID, ACCOUNT, keccak256("tx"), ASSET, 10 ether);
 
         vm.prank(address(engine));
         vm.expectRevert(
             abi.encodeWithSelector(UniversalRulesPolicyErrors.CallerIsNotUEModule.selector, address(engine))
         );
-        urp.creditRevert(CID, ACCOUNT, keccak256("tx"), 10 ether);
+        urp.creditRevert(CID, ACCOUNT, keccak256("tx"), ASSET, 10 ether);
 
         assertEq(_spent(), 10 ether, "spent never reduced by an agent-reachable path");
     }
@@ -1094,7 +1090,7 @@ contract URPTest is BaseTest {
         address wrongToken = makeAddr("someOtherPRC20");
         bytes memory data = outboundRequest(wrongToken, 1 ether, 1 ether, ACCOUNT, _goodCalls());
         vm.prank(address(engine));
-        vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.AssetMismatch.selector, ASSET, wrongToken));
+        vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.AssetNotAllowed.selector, wrongToken));
         urp.checkAction(CID, ACCOUNT, GATEWAY, 0, data);
         assertEq(_spent(), 0, "nothing spent");
     }
@@ -1113,7 +1109,7 @@ contract URPTest is BaseTest {
 
     function test_U03_gate7_TotalSpendCapExceeded() public {
         Config memory cfg = _defaultConfig();
-        cfg.maxAmountTotal = 150 ether;
+        cfg.assets[0].maxTotal = 150 ether;
         _init(cfg);
 
         assertEq(_check(0, _goodRequest(100 ether)), 0, "first request fits");
@@ -1484,7 +1480,7 @@ contract URPTest is BaseTest {
 
     function test_U07_LifetimeCap_AtTheCrossing() public {
         Config memory cfg = _defaultConfig();
-        cfg.maxAmountTotal = 100 ether;
+        cfg.assets[0].maxTotal = 100 ether;
         _init(cfg);
 
         assertEq(_check(0, _goodRequest(60 ether)), 0, "first fits");
@@ -1509,8 +1505,8 @@ contract URPTest is BaseTest {
     /// simply never trips.
     function test_U07_UnlimitedNeverTrips() public {
         Config memory cfg = _defaultConfig();
-        cfg.maxAmountPerCall = type(uint256).max;
-        cfg.maxAmountTotal = type(uint256).max;
+        cfg.assets[0].maxPerCall = type(uint256).max;
+        cfg.assets[0].maxTotal = type(uint256).max;
         _init(cfg);
 
         assertEq(_check(0, _goodRequest(type(uint128).max)), 0, "huge amount passes an unlimited cap");
@@ -1520,7 +1516,7 @@ contract URPTest is BaseTest {
     /// A per-call cap of zero bridges nothing but redeploys freely.
     function test_U07_ZeroPerCallCap_RedeploysOnly() public {
         Config memory cfg = _defaultConfig();
-        cfg.maxAmountPerCall = 0;
+        cfg.assets[0].maxPerCall = 0;
         _init(cfg);
 
         assertEq(_check(0, _goodRequest(0)), 0, "zero-amount redeploy allowed");
@@ -1649,7 +1645,7 @@ contract URPTest is BaseTest {
         _initDefault();
 
         vm.expectEmit(true, true, true, true, address(urp));
-        emit IUniversalRulesPolicy.OutboundMetered(CID, address(engine), ACCOUNT, 7 ether);
+        emit IUniversalRulesPolicy.OutboundMetered(CID, address(engine), ACCOUNT, ASSET, 7 ether);
 
         assertEq(_check(0, _goodRequest(7 ether)), 0, "validates");
         assertEq(_spent(), 7 ether, "spent advanced by exactly the bridged amount");
@@ -1675,12 +1671,12 @@ contract URPTest is BaseTest {
             vm.expectRevert(
                 abi.encodeWithSelector(UniversalRulesPolicyErrors.CallerIsNotUEModule.selector, strangers[i])
             );
-            urp.creditRevert(CID, ACCOUNT, keccak256("tx"), 1 ether);
+            urp.creditRevert(CID, ACCOUNT, keccak256("tx"), ASSET, 1 ether);
         }
 
         // the module itself succeeds
         vm.prank(EXECUTOR_MODULE);
-        urp.creditRevert(CID, ACCOUNT, keccak256("tx"), 1 ether);
+        urp.creditRevert(CID, ACCOUNT, keccak256("tx"), ASSET, 1 ether);
         assertEq(_spent(), 9 ether, "module credit applied");
     }
 
@@ -1694,18 +1690,18 @@ contract URPTest is BaseTest {
         assertFalse(urp.isCredited(txId), "not credited yet");
 
         vm.prank(EXECUTOR_MODULE);
-        urp.creditRevert(CID, ACCOUNT, txId, 2 ether);
+        urp.creditRevert(CID, ACCOUNT, txId, ASSET, 2 ether);
         assertTrue(urp.isCredited(txId), "recorded");
         assertEq(_spent(), 8 ether, "applied once");
 
         vm.prank(EXECUTOR_MODULE);
         vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.AlreadyCredited.selector, txId));
-        urp.creditRevert(CID, ACCOUNT, txId, 2 ether);
+        urp.creditRevert(CID, ACCOUNT, txId, ASSET, 2 ether);
         assertEq(_spent(), 8 ether, "second credit changed nothing");
 
         // a different id still works
         vm.prank(EXECUTOR_MODULE);
-        urp.creditRevert(CID, ACCOUNT, keccak256("outbound-2"), 3 ether);
+        urp.creditRevert(CID, ACCOUNT, keccak256("outbound-2"), ASSET, 3 ether);
         assertEq(_spent(), 5 ether, "distinct ids credit independently");
     }
 
@@ -1734,7 +1730,7 @@ contract URPTest is BaseTest {
         // arrives before the config exists (or against the wrong id)
         vm.prank(EXECUTOR_MODULE);
         vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.NotInitialized.selector, ghost, ACCOUNT));
-        urp.creditRevert(ghost, ACCOUNT, txId, 1 ether);
+        urp.creditRevert(ghost, ACCOUNT, txId, ASSET, 1 ether);
 
         assertFalse(urp.isCredited(txId), "the id is still uncredited after the failed call");
 
@@ -1742,7 +1738,7 @@ contract URPTest is BaseTest {
         _initDefault();
         _check(0, _goodRequest(10 ether));
         vm.prank(EXECUTOR_MODULE);
-        urp.creditRevert(CID, ACCOUNT, txId, 1 ether);
+        urp.creditRevert(CID, ACCOUNT, txId, ASSET, 1 ether);
         assertEq(_spent(), 9 ether, "retry applied");
     }
 
@@ -1754,10 +1750,10 @@ contract URPTest is BaseTest {
 
         // credit far more than was ever spent
         vm.expectEmit(true, true, true, true, address(urp));
-        emit IUniversalRulesPolicy.RevertCredited(keccak256("big"), CID, ACCOUNT, 5 ether); // the APPLIED amount
+        emit IUniversalRulesPolicy.RevertCredited(keccak256("big"), CID, ACCOUNT, ASSET, 5 ether); // the APPLIED amount
 
         vm.prank(EXECUTOR_MODULE);
-        urp.creditRevert(CID, ACCOUNT, keccak256("big"), 1000 ether);
+        urp.creditRevert(CID, ACCOUNT, keccak256("big"), ASSET, 1000 ether);
 
         assertEq(_spent(), 0, "saturated at zero, no underflow");
     }
@@ -1771,7 +1767,7 @@ contract URPTest is BaseTest {
         vm.warp(uint256(VALID_UNTIL) + 1); // the mandate can no longer validate anything
 
         vm.prank(EXECUTOR_MODULE);
-        urp.creditRevert(CID, ACCOUNT, keccak256("late"), 4 ether);
+        urp.creditRevert(CID, ACCOUNT, keccak256("late"), ASSET, 4 ether);
         assertEq(_spent(), 6 ether, "credit still applies to the orphan config");
 
         // but nothing can be spent through it again
@@ -1787,22 +1783,22 @@ contract URPTest is BaseTest {
         _check(0, _goodRequest(10 ether));
 
         // equality passes
-        urp.assertSpent(CID, ACCOUNT, 10 ether);
+        urp.assertSpent(CID, ACCOUNT, oneSpent(10 ether));
 
         // mismatch in BOTH directions reverts — stale beliefs never silently become new budgets
         vm.expectRevert(
             abi.encodeWithSelector(
-                UniversalRulesPolicyErrors.SpentMismatch.selector, uint256(9 ether), uint256(10 ether)
+                UniversalRulesPolicyErrors.AssetSpentMismatch.selector, ASSET, uint256(9 ether), uint256(10 ether)
             )
         );
-        urp.assertSpent(CID, ACCOUNT, 9 ether);
+        urp.assertSpent(CID, ACCOUNT, oneSpent(9 ether));
 
         vm.expectRevert(
             abi.encodeWithSelector(
-                UniversalRulesPolicyErrors.SpentMismatch.selector, uint256(11 ether), uint256(10 ether)
+                UniversalRulesPolicyErrors.AssetSpentMismatch.selector, ASSET, uint256(11 ether), uint256(10 ether)
             )
         );
-        urp.assertSpent(CID, ACCOUNT, 11 ether);
+        urp.assertSpent(CID, ACCOUNT, oneSpent(11 ether));
     }
 
     /// The ruled revision: without the initialized check, a wrong config reads spent == 0 and an
@@ -1810,7 +1806,7 @@ contract URPTest is BaseTest {
     function test_U16_AssertSpent_GhostConfigHasNoSilentPass() public {
         ConfigId ghost = ConfigId.wrap(bytes32(uint256(0xABCD)));
         vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.NotInitialized.selector, ghost, ACCOUNT));
-        urp.assertSpent(ghost, ACCOUNT, 0);
+        urp.assertSpent(ghost, ACCOUNT, oneSpent(0));
     }
 
     /// A credit landing between the owner's read and their submit forces recomposition.
@@ -1819,19 +1815,19 @@ contract URPTest is BaseTest {
         _check(0, _goodRequest(10 ether));
 
         // the owner reads 10 and composes their batch...
-        urp.assertSpent(CID, ACCOUNT, 10 ether);
+        urp.assertSpent(CID, ACCOUNT, oneSpent(10 ether));
 
         // ...a credit lands first...
         vm.prank(EXECUTOR_MODULE);
-        urp.creditRevert(CID, ACCOUNT, keccak256("race"), 4 ether);
+        urp.creditRevert(CID, ACCOUNT, keccak256("race"), ASSET, 4 ether);
 
         // ...so the batch's first entry now fails, and the whole change reverts.
         vm.expectRevert(
             abi.encodeWithSelector(
-                UniversalRulesPolicyErrors.SpentMismatch.selector, uint256(10 ether), uint256(6 ether)
+                UniversalRulesPolicyErrors.AssetSpentMismatch.selector, ASSET, uint256(10 ether), uint256(6 ether)
             )
         );
-        urp.assertSpent(CID, ACCOUNT, 10 ether);
+        urp.assertSpent(CID, ACCOUNT, oneSpent(10 ether));
     }
 
     // ═════════════════════════════════ U-17 ═════════════════════════════════
@@ -1844,14 +1840,14 @@ contract URPTest is BaseTest {
 
         // A stranger initialises the SAME configId and account with a config of their choosing.
         Config memory attackerCfg = _defaultConfig();
-        attackerCfg.maxAmountTotal = type(uint256).max;
+        attackerCfg.assets[0].maxTotal = type(uint256).max;
         vm.prank(AGENT);
         urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(attackerCfg));
 
         // The engine-keyed config is untouched — including its spend counter.
         Config memory real = urp.getConfig(CID, ACCOUNT);
-        assertEq(real.spent, 10 ether, "engine-keyed spent untouched");
-        assertEq(real.maxAmountTotal, 1000 ether, "engine-keyed caps untouched");
+        assertEq(real.assets[0].spent, 10 ether, "engine-keyed spent untouched");
+        assertEq(real.assets[0].maxTotal, 1000 ether, "engine-keyed caps untouched");
 
         // And the stranger's write did NOT clear the engine's initialized flag: re-init still fails.
         vm.prank(address(engine));
@@ -1870,20 +1866,20 @@ contract URPTest is BaseTest {
         _check(0, _goodRequest(10 ether));
 
         Config memory strangerCfg = _defaultConfig();
-        strangerCfg.spent = 999 ether; // ignored by _store anyway
+        strangerCfg.assets[0].spent = 999 ether; // ignored by _store anyway
         vm.prank(AGENT);
         urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(strangerCfg));
 
         // getConfig reads the engine slice
-        assertEq(urp.getConfig(CID, ACCOUNT).spent, 10 ether, "getConfig is engine-keyed");
+        assertEq(urp.getConfig(CID, ACCOUNT).assets[0].spent, 10 ether, "getConfig is engine-keyed");
 
         // assertSpent reads the engine slice
-        urp.assertSpent(CID, ACCOUNT, 10 ether);
+        urp.assertSpent(CID, ACCOUNT, oneSpent(10 ether));
 
         // creditRevert writes the engine slice
         vm.prank(EXECUTOR_MODULE);
-        urp.creditRevert(CID, ACCOUNT, keccak256("t"), 1 ether);
-        assertEq(urp.getConfig(CID, ACCOUNT).spent, 9 ether, "creditRevert is engine-keyed");
+        urp.creditRevert(CID, ACCOUNT, keccak256("t"), ASSET, 1 ether);
+        assertEq(urp.getConfig(CID, ACCOUNT).assets[0].spent, 9 ether, "creditRevert is engine-keyed");
     }
 
     // ═════════════════════════════════ U-18 ═════════════════════════════════
@@ -1895,7 +1891,7 @@ contract URPTest is BaseTest {
      *
      * WHAT THIS DOES NOT PROVE, stated because the distinction matters: this is the ATOMICITY half
      * of "optimistic but atomic", not the effects-LAST half. Effects-last is not observable from
-     * outside a single transaction — verified by mutation, hoisting `cfg.spent = newSpent` above
+     * outside a single transaction — verified by mutation, hoisting `cfg.assets[0].spent = newSpent` above
      * the inner-call gauntlet leaves all 64 tests green, because the gates that would then run
      * after the write all revert, unwinding it. The ordering is kept because it is what makes the
      * atomicity argument hold without depending on every later gate reverting; §10 item 4 forbids

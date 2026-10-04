@@ -22,7 +22,7 @@ import {
  * @notice WHAT THIS BUYS, stated once. The gateway routes an outbound to whatever chain the PRC20
  *         `token` says it came from — `IPRC20(token).SOURCE_CHAIN_NAMESPACE()`, read through
  *         `UniversalCore.getOutboundTxGasAndFees` on every single outbound. Gate 5 pins
- *         `req.token == cfg.asset` on every request. So checking the asset's chain ONCE at grant
+ *         `req.token == cfg.assets[0].token` on every request. So checking the asset's chain ONCE at grant
  *         makes the owner's declared chain true for every request the mandate will ever authorise —
  *         with no runtime change, and no external call anywhere near `checkAction`.
  *
@@ -68,11 +68,8 @@ contract URPTeethTest is BaseTest {
             validUntil: VALID_UNTIL,
             destChainHash: bytes32(0),
             expectedCEA: CEA,
-            asset: asset,
-            maxAmountPerCall: 100e6,
-            maxAmountTotal: 1000e6,
-            maxPCPerCall: 5 ether,
-            spent: 0,
+            maxGasPerCall: 5 ether,
+            assets: oneAsset(asset, 100e6, 1000e6),
             allowedCalls: calls
         });
     }
@@ -92,7 +89,7 @@ contract URPTeethTest is BaseTest {
         ModeSlot memory slot = urp.getMode(CID, ACCOUNT);
         assertTrue(slot.initialized, "config written");
         assertEq(slot.chainHash, keccak256(bytes(CHAIN_SEPOLIA)), "and the chain recorded on the mode slot");
-        assertEq(urp.getConfig(CID, ACCOUNT).asset, asset, "asset stored");
+        assertEq(urp.getConfig(CID, ACCOUNT).assets[0].token, asset, "asset stored");
     }
 
     // ══════════════════════════════ the refusals ══════════════════════════════

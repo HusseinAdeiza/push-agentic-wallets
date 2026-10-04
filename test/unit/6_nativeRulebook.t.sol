@@ -266,11 +266,8 @@ contract URPNativeTest is BaseTest {
             validUntil: VALID_UNTIL,
             destChainHash: bytes32(0),
             expectedCEA: makeAddr("cea"),
-            asset: address(new MockPRC20()),
-            maxAmountPerCall: 1,
-            maxAmountTotal: 1,
-            maxPCPerCall: 1,
-            spent: 0,
+            maxGasPerCall: 1,
+            assets: oneAsset(address(new MockPRC20()), 1, 1),
             allowedCalls: rules
         });
 
@@ -740,7 +737,7 @@ contract URPNativeTest is BaseTest {
     function test_native_assertSpent_wrongModeBothWays() public {
         _initDefaultNative();
         vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.WrongModeForCall.selector, RulesType.NATIVE));
-        urp.assertSpent(CID, ACCOUNT, 0);
+        urp.assertSpent(CID, ACCOUNT, oneSpent(0));
 
         _initUniversalAt(CID2);
         vm.expectRevert(
@@ -767,7 +764,7 @@ contract URPNativeTest is BaseTest {
 
         vm.prank(EXECUTOR_MODULE);
         vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.NotInitialized.selector, CID, ACCOUNT));
-        urp.creditRevert(CID, ACCOUNT, txId, 1e6);
+        urp.creditRevert(CID, ACCOUNT, txId, address(0xA55E7), 1e6);
 
         assertFalse(urp.isCredited(txId), "the outbound id was NOT burned");
     }
@@ -784,11 +781,8 @@ contract URPNativeTest is BaseTest {
             validUntil: VALID_UNTIL,
             destChainHash: bytes32(0),
             expectedCEA: makeAddr("cea"),
-            asset: address(new MockPRC20()),
-            maxAmountPerCall: 1 ether,
-            maxAmountTotal: 1 ether,
-            maxPCPerCall: 1 ether,
-            spent: 0,
+            maxGasPerCall: 1 ether,
+            assets: oneAsset(address(new MockPRC20()), 1 ether, 1 ether),
             allowedCalls: rules
         });
         vm.prank(address(engine));

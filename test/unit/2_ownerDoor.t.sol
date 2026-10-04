@@ -114,11 +114,8 @@ contract PushAgentWalletTest is BaseTest {
                 validUntil: uint48(block.timestamp + 365 days),
                 destChainHash: keccak256("eip155:11155111"),
                 expectedCEA: _addr("cea"),
-                asset: PRC20,
-                maxAmountPerCall: 100 ether,
-                maxAmountTotal: 1000 ether,
-                maxPCPerCall: 5 ether,
-                spent: 0,
+                maxGasPerCall: 5 ether,
+                assets: oneAsset(PRC20, 100 ether, 1000 ether),
                 allowedCalls: rules
             })
         );

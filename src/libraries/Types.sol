@@ -190,6 +190,45 @@ enum CheckpointKind {
  */
 uint256 constant MAX_PINS = 8;
 
+/**
+ * @dev Maximum tokens one UNIVERSAL rules set may list (EVM and SVM alike). Bounds the init duplicate
+ *      check and the gate-5 scan.
+ *
+ *      FILE-LEVEL FOR THE SAME REASON AS `MAX_PINS`: it bounds an array THE SDK BUILDS.
+ */
+uint256 constant MAX_ASSETS = 8;
+
+/**
+ * @notice WIRE TYPE — one token a UNIVERSAL rules set may move, with its own caps.
+ * @param token       The PRC20 ON PUSH (e.g. USDC.eth), never the destination chain's address: the
+ *                    gateway request carries the PRC20 and routes by it. Its `SOURCE_CHAIN_NAMESPACE()`
+ *                    must equal the rules set's chain, checked at init for every entry.
+ * @param maxPerCall  Per-request ceiling, PRC20 base units. ZERO IS LEGAL and means "this token may
+ *                    route a request but never moves": the move-nothing rules set is one entry with a
+ *                    zero `maxPerCall`, never an empty list (an empty list would pin no chain).
+ * @param maxTotal    Lifetime ceiling on the amount SENT OUT in this token. `type(uint256).max` =
+ *                    unlimited, with no special branch; zero means nothing may move.
+ */
+struct AssetCap {
+    address token;
+    uint256 maxPerCall;
+    uint256 maxTotal;
+}
+
+/**
+ * @notice STORAGE TYPE — an `AssetCap` plus the counter URP owns. Never a wire type: a caller-set
+ *         counter would be a granted head start on the cap.
+ * @param spent  Lifetime amount sent out in this token, recorded before dispatch. Money coming back
+ *               to the wallet never lowers it (URP cannot see inflows, and could not tell an agent's
+ *               return from the owner's top-up); only `creditRevert` does.
+ */
+struct AssetCapState {
+    address token;
+    uint256 maxPerCall;
+    uint256 maxTotal;
+    uint256 spent;
+}
+
 /// @param target            far-chain contract
 /// @param selector          far-chain function
 /// @param beneficiaryOffset byte offset of the beneficiary word in the inner calldata
@@ -217,10 +256,8 @@ struct AllowedCall {
 struct UniversalTerms {
     uint48 validUntil;
     address expectedCEA;
-    address asset;
-    uint256 maxAmountPerCall;
-    uint256 maxAmountTotal;
-    uint256 maxPCPerCall;
+    AssetCap[] assets;
+    uint256 maxGasPerCall;
     AllowedCall[] allowedCalls;
 }
 
@@ -232,20 +269,17 @@ struct UniversalTerms {
 ///                         `getMode(id, account).chainHash`. Do not read this field; do not
 ///                         resurrect it as an input.
 /// @param expectedCEA      the wallet's destination account, committed at grant
-/// @param asset            the one permitted PRC20
-/// @param maxAmountTotal   type(uint256).max = unlimited
-/// @param maxPCPerCall     Push-native per-call ceiling (protocol fee + gas swap budget)
-/// @param spent            lifetime BRIDGED, recorded before dispatch
+/// @param maxGasPerCall    Push-native per-call ceiling on `msg.value`, in PC wei. It pays the protocol
+///                         fee AND the gas swap, despite the name (renamed from `maxPCPerCall` to
+///                         match the SDK)
+/// @param assets           1..MAX_ASSETS permitted PRC20s, each with its own caps and its own `spent`
 struct Config {
     bool initialized;
     uint48 validUntil;
     bytes32 destChainHash;
     address expectedCEA;
-    address asset;
-    uint256 maxAmountPerCall;
-    uint256 maxAmountTotal;
-    uint256 maxPCPerCall;
-    uint256 spent;
+    uint256 maxGasPerCall;
+    AssetCapState[] assets;
     AllowedCall[] allowedCalls;
 }
 
@@ -452,12 +486,14 @@ struct SvmDataPin {
  *                          SDK sources it from the chain registry. Forbidden as a target: that
  *                          route only returns the permitted asset to the owner's wallet, at the
  *                          owner's rate-limit and gas cost.
- * @param asset             the one permitted PRC20
- * @param maxAmountPerCall  PRC20 base units (lamports / SPL base units); Solana amounts are u64
- * @param maxAmountTotal    type(uint256).max = unlimited
- * @param maxPCPerCall      Push-native per-call ceiling (protocol fee + gas swap budget)
- * @param ceaAccounts       every CEA-controlled account that HOLDS VALUE: the CEA, its ATA for the
- *                          asset, its ATAs for allowed outputs. Each may appear in a request ONLY
+ * @param assets            1..MAX_ASSETS permitted PRC20s with their caps, exactly as `UniversalTerms`;
+ *                          amounts are PRC20 base units (lamports / SPL base units), and a request's
+ *                          amount must also fit Solana's u64 (S6b)
+ * @param maxGasPerCall     Push-native per-call ceiling (protocol fee + gas swap budget), PC wei
+ * @param ceaAccounts       every CEA-controlled account that HOLDS VALUE: the CEA, its ATA for EACH
+ *                          listed asset, its ATAs for allowed outputs. Capped at MAX_CEA_ACCOUNTS
+ *                          (8, the CEA included), so a rules set listing 8 assets cannot protect
+ *                          every one of their ATAs — an open item. Each may appear in a request ONLY
  *                          at a position the matched rule pins to it. Unlisted accounts are not
  *                          protected — the list is the owner's statement of what is worth taking.
  *                          Must contain `expectedCEA`; no zero, duplicate, or program entries.
@@ -469,10 +505,8 @@ struct SvmTerms {
     uint48 validUntil;
     bytes32 expectedCEA;
     bytes32 gatewayProgram;
-    address asset;
-    uint256 maxAmountPerCall;
-    uint256 maxAmountTotal;
-    uint256 maxPCPerCall;
+    AssetCap[] assets;
+    uint256 maxGasPerCall;
     bytes32[] ceaAccounts;
     AllowedProgram[] programs;
     SvmAccountPin[] pins;
@@ -480,20 +514,17 @@ struct SvmTerms {
 }
 
 /**
- * @dev The SVM rulebook — STORAGE type, lives inside `_svm`, append-only forever.
+ * @dev The SVM rulebook — STORAGE type, lives inside `_svm`.
  * @param initialized  set once; re-initialisation is refused
- * @param spent        lifetime BRIDGED, recorded before dispatch, exactly as `Config.spent`
+ * @param assets       per-token caps and per-token `spent`, exactly as `Config.assets`
  */
 struct SvmConfig {
     bool initialized;
     uint48 validUntil;
     bytes32 expectedCEA;
     bytes32 gatewayProgram;
-    address asset;
-    uint256 maxAmountPerCall;
-    uint256 maxAmountTotal;
-    uint256 maxPCPerCall;
-    uint256 spent;
+    uint256 maxGasPerCall;
+    AssetCapState[] assets;
     bytes32[] ceaAccounts;
     AllowedProgram[] programs;
     SvmAccountPin[] pins;
