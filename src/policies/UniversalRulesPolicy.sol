@@ -379,6 +379,42 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
     }
 
     /**
+     * @dev Allow-list ambiguity guard — the EVM counterpart of `_checkSvmRules`'s pairwise scan.
+     *
+     *      `_requireAllowed` is FIRST-MATCH, so two rules sharing a (target, selector) pair make the
+     *      later one dead: the earlier rule's `hasBeneficiary` and `maxValue` are the only ones that
+     *      ever run. An owner who appends a rule to TIGHTEN an existing one therefore gets the OLD,
+     *      LOOSER rule in force — a wider value cap and no beneficiary pin — with no error anywhere.
+     *      That is fail-OPEN, which is why it is refused at grant rather than documented.
+     *
+     *      The SVM rulebook already refuses the identical shape with `AmbiguousRule`, for the same
+     *      reason stated in `_rulesCollide`. Same defect, two rulebooks, one guard between them.
+     *
+     *      O(n^2) at n <= MAX_ALLOWED_CALLS (32), matching the SVM scan and the wallet's own
+     *      duplicate-action scan. Exact pair equality: two rules that differ in EITHER component
+     *      match different requests and are both reachable.
+     */
+    function _checkAllowedCalls(UniversalTerms memory incoming) internal pure {
+        uint256 n = incoming.allowedCalls.length;
+        for (uint256 i; i < n;) {
+            for (uint256 j; j < i;) {
+                if (
+                    incoming.allowedCalls[j].target == incoming.allowedCalls[i].target
+                        && incoming.allowedCalls[j].selector == incoming.allowedCalls[i].selector
+                ) {
+                    revert UniversalRulesPolicyErrors.AmbiguousAllowedCall(j, i);
+                }
+                unchecked {
+                    ++j;
+                }
+            }
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /**
      * @dev The universal init guards — unchanged from the single-mode contract, only relocated.
      * @param cfg   Storage slot to write.
      * @param body  `abi.encode(Config)`.
@@ -390,6 +426,8 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         if (listLength == 0 || listLength > MAX_ALLOWED_CALLS) {
             revert UniversalRulesPolicyErrors.AllowListOutOfRange(listLength);
         }
+
+        _checkAllowedCalls(incoming);
 
         if (incoming.validUntil == 0 || incoming.validUntil <= block.timestamp) {
             revert UniversalRulesPolicyErrors.InvalidExpiry(incoming.validUntil);

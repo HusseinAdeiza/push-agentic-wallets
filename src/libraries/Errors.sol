@@ -207,6 +207,9 @@ library UniversalRulesPolicyErrors {
     error DuplicateAsset(address token);
     /// @dev init: 0 or > MAX_ALLOWED_CALLS.
     error AllowListOutOfRange(uint256 length);
+    /// @dev init: two allow-list rules on the SAME (target, selector) pair. `_requireAllowed` is
+    ///      first-match, so the later rule is dead and its beneficiary pin and value cap never run.
+    error AmbiguousAllowedCall(uint256 first, uint256 second);
     error RulesExpired(uint48 validUntil);
     error InvalidTarget(address target);
     /// @dev Gate 4a. Distinct from InvalidSelector: there is no selector to report, and a zero
