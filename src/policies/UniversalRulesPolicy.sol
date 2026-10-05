@@ -101,8 +101,10 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
     uint256 internal constant MAX_SVM_PINS = 16;
     /// @dev Maximum ix_data pins per SVM config.
     uint256 internal constant MAX_SVM_DATA_PINS = 8;
-    /// @dev Maximum CEA-controlled accounts an owner may list. Bounds the S18 loop.
-    uint256 internal constant MAX_CEA_ACCOUNTS = 8;
+    /// @dev Maximum CEA-controlled accounts an owner may list. Bounds the S18 loop. 16 = the CEA, one
+    ///      token account per listed asset (MAX_ASSETS = 8) and up to 7 swap-output accounts. S18 gas
+    ///      grows with the number actually listed, never with this bound.
+    uint256 internal constant MAX_CEA_ACCOUNTS = 16;
     /// @dev Loop bound on a request's account list. Solana's transaction size limit bites first.
     uint256 internal constant MAX_SVM_ACCOUNTS = 64;
     /// @dev Loop bound on a request's instruction data.

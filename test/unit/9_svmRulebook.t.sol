@@ -365,6 +365,108 @@ contract URPSvmTest is BaseTest {
         );
     }
 
+    /**
+     * The documented Solana limit: one rule per (program, instruction), so one pinned key per position.
+     * The route rule pins its input (index 3) to the USDC account, so the second asset's token account,
+     * even when listed, can never be that instruction's input:
+     * - put at the pinned input position, it fails the account pin (S17);
+     * - passed anywhere unpinned, it fails the value-holding check (S18).
+     */
+    function test_svm_MA_oneInputPinPerInstruction() public {
+        (SvmTerms memory t, address second) = _twoSvmAssets();
+        bytes32 ataSecond = keccak256("ata(CEA, second asset)");
+        bytes32[] memory listed = new bytes32[](4);
+        listed[0] = CEA;
+        listed[1] = ATA_IN;
+        listed[2] = ATA_OUT;
+        listed[3] = ataSecond;
+        t.ceaAccounts = listed;
+        _init(t);
+
+        (bytes32[] memory a, bool[] memory w) = _accounts();
+        a[3] = ataSecond;
+        _checkReverts(
+            abi.encodeWithSelector(
+                UniversalRulesPolicyErrors.SvmAccountPinMismatch.selector, uint256(1), uint8(3), ATA_IN, ataSecond
+            ),
+            0,
+            svmOutboundRequest(
+                second, 1_000_000, 1 ether, ACCOUNT, abi.encodePacked(PROG), svmExecutePayload(a, w, _goodIx(), 2, PROG)
+            )
+        );
+
+        (bytes32[] memory a10, bool[] memory w10) = _accounts();
+        bytes32[] memory a11 = new bytes32[](11);
+        bool[] memory w11 = new bool[](11);
+        for (uint256 i; i < 10; ++i) {
+            a11[i] = a10[i];
+            w11[i] = w10[i];
+        }
+        a11[10] = ataSecond;
+        w11[10] = true;
+        _checkReverts(
+            abi.encodeWithSelector(
+                UniversalRulesPolicyErrors.CeaAccountAtUnpinnedIndex.selector, uint256(10), ataSecond
+            ),
+            0,
+            svmOutboundRequest(
+                    second,
+                    1_000_000,
+                    1 ether,
+                    ACCOUNT,
+                    abi.encodePacked(PROG),
+                    svmExecutePayload(a11, w11, _goodIx(), 2, PROG)
+                )
+        );
+    }
+
+    /// @dev S18 cost of one more listed value-holding account, on the default 10-account request,
+    ///      budget = measured +10%. Two budgets because the run mode decides warmth (see the multi-asset
+    ///      suite's MA18): plain runs see slots init just wrote as warm; `--isolate` / `--gas-report`
+    ///      read them cold, as a real agent call does.
+    ///      Measured 4,041 warm and 6,041 cold per extra listed account; listing all 16 instead of 3
+    ///      adds about 78.5k gas cold. The cost is request accounts × listed accounts storage reads, so a
+    ///      longer request scales it up.
+    uint256 internal constant S18_GAS_PER_LISTED_ACCOUNT_BUDGET = 4_445;
+    uint256 internal constant S18_GAS_PER_LISTED_ACCOUNT_BUDGET_ISOLATED = 6_645;
+
+    /// Raising MAX_CEA_ACCOUNTS to 16 costs nothing unless the owner lists more: S18 gas grows with the
+    /// number actually listed. Measured on fresh configs listing 3 and 16, after a warm-up on a third.
+    function test_gas_svm_S18CostPerListedAccount() public {
+        ConfigId warm = ConfigId.wrap(bytes32(uint256(0x5180)));
+        ConfigId three = ConfigId.wrap(bytes32(uint256(0x5183)));
+        ConfigId sixteen = ConfigId.wrap(bytes32(uint256(0x5196)));
+        SvmTerms memory t = _terms();
+        vm.startPrank(address(engine));
+        urp.initializeWithMultiplexer(ACCOUNT, warm, svmInitData(CHAIN_SOLANA_DEVNET, t));
+        urp.initializeWithMultiplexer(ACCOUNT, three, svmInitData(CHAIN_SOLANA_DEVNET, t));
+        t.ceaAccounts = _ceaAccountsOfLength(16);
+        urp.initializeWithMultiplexer(ACCOUNT, sixteen, svmInitData(CHAIN_SOLANA_DEVNET, t));
+        vm.stopPrank();
+
+        bytes memory req = _good(0);
+        vm.prank(address(engine));
+        urp.checkAction(warm, ACCOUNT, GATEWAY, 0, req);
+
+        vm.prank(address(engine));
+        uint256 g3 = gasleft();
+        urp.checkAction(three, ACCOUNT, GATEWAY, 0, req);
+        g3 -= gasleft();
+
+        vm.prank(address(engine));
+        uint256 g16 = gasleft();
+        urp.checkAction(sixteen, ACCOUNT, GATEWAY, 0, req);
+        g16 -= gasleft();
+
+        uint256 perAccount = (g16 - g3) / 13;
+        emit log_named_uint("S18 gas per extra listed account (10-account request)", perAccount);
+        emit log_named_uint("checkAction gas, 3 listed", g3);
+        emit log_named_uint("checkAction gas, 16 listed", g16);
+        uint256 budget =
+            isolatedCalls() ? S18_GAS_PER_LISTED_ACCOUNT_BUDGET_ISOLATED : S18_GAS_PER_LISTED_ACCOUNT_BUDGET;
+        assertLe(perAccount, budget, "S18 per listed account");
+    }
+
     function test_svm_MA_creditRevertTouchesOnlyItsToken() public {
         (SvmTerms memory t, address second) = _twoSvmAssets();
         _init(t);
@@ -508,8 +610,28 @@ contract URPSvmTest is BaseTest {
         _initReverts(abi.encodeWithSelector(UniversalRulesPolicyErrors.TooManySvmDataPins.selector, 9), t);
 
         t = _terms();
-        t.ceaAccounts = new bytes32[](9);
-        _initReverts(abi.encodeWithSelector(UniversalRulesPolicyErrors.TooManyCeaAccounts.selector, 9), t);
+        t.ceaAccounts = new bytes32[](17);
+        _initReverts(abi.encodeWithSelector(UniversalRulesPolicyErrors.TooManyCeaAccounts.selector, 17), t);
+    }
+
+    /// The value-holding list holds 16: the CEA, one token account per listed asset (up to 8) and up to
+    /// 7 swap outputs. Sixteen distinct, valid entries are accepted; the 17th is refused above.
+    function test_svmInit_ceaAccountListHoldsSixteen() public {
+        SvmTerms memory t = _terms();
+        t.ceaAccounts = _ceaAccountsOfLength(16);
+        _init(t);
+        assertEq(urp.getSvmConfig(CID, ACCOUNT).ceaAccounts.length, 16, "sixteen value-holding accounts stored");
+    }
+
+    /// @dev The default three (CEA, ATA_IN, ATA_OUT) padded with distinct keys no request passes.
+    function _ceaAccountsOfLength(uint256 n) internal view returns (bytes32[] memory c) {
+        c = new bytes32[](n);
+        c[0] = CEA;
+        c[1] = ATA_IN;
+        c[2] = ATA_OUT;
+        for (uint256 i = 3; i < n; ++i) {
+            c[i] = keccak256(abi.encode("extra value-holding account", i));
+        }
     }
 
     function test_svmInit_expiryGuards() public {

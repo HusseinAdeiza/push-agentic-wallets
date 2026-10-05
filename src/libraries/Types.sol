@@ -491,13 +491,22 @@ struct SvmDataPin {
  *                          amount must also fit Solana's u64 (S6b)
  * @param maxGasPerCall     Push-native per-call ceiling (protocol fee + gas swap budget), PC wei
  * @param ceaAccounts       every CEA-controlled account that HOLDS VALUE: the CEA, its ATA for EACH
- *                          listed asset, its ATAs for allowed outputs. Capped at MAX_CEA_ACCOUNTS
- *                          (8, the CEA included), so a rules set listing 8 assets cannot protect
- *                          every one of their ATAs — an open item. Each may appear in a request ONLY
- *                          at a position the matched rule pins to it. Unlisted accounts are not
+ *                          listed asset, its ATAs for allowed outputs. At most MAX_CEA_ACCOUNTS (16,
+ *                          the CEA included: room for all 8 assets plus 7 outputs). Each may appear in
+ *                          a request ONLY at a position the matched rule pins to it; a listed account
+ *                          no rule pins can never be passed at all. Unlisted accounts are not
  *                          protected — the list is the owner's statement of what is worth taking.
- *                          Must contain `expectedCEA`; no zero, duplicate, or program entries.
- * @param programs          the allow-list; first match wins, made exact by the init ambiguity rule
+ *                          URP CANNOT CHECK that each listed asset's ATA is here (it cannot derive a
+ *                          Solana token account, and does not know a PRC20's mint): listing them is
+ *                          the SDK's job. Must contain `expectedCEA`; no zero, duplicate, or program
+ *                          entries.
+ * @param programs          the allow-list; first match wins, made exact by the init ambiguity rule.
+ *                          ONE RULE PER (program, instruction), so ONE PINNED KEY PER POSITION: if a
+ *                          swap rule pins its input to the USDC account, USDT can never be that
+ *                          instruction's input. Using several listed tokens through one instruction
+ *                          means leaving the input unpinned and those token accounts unlisted, so
+ *                          only the output and price pins protect them. Multi-asset on Solana is
+ *                          strongest when different tokens are used by different instructions.
  * @param pins              account pins, each naming its rule
  * @param dataPins          `ix_data` pins, each naming its rule
  */

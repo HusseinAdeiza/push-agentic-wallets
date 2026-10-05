@@ -12,7 +12,7 @@ become multi-token.
 
 | Base commit | Status | Tests | URP margin | Mutants |
 |---|---|---|---|---|
-| `e704d5b` | Not deployed | 589 pass · 0 fail | 223 B | 12 of 12 killed |
+| `e704d5b` | Not deployed | 592 pass · 0 fail | 223 B | 12 of 12 killed |
 
 **On this page:** [1 · What was built](#1--what-was-built) · [Verification](#verification) ·
 [2 · Deviations from the v2 docs](#2--where-this-deviates-from-the-v2-docs) ·
@@ -114,6 +114,21 @@ After every gate passes, only the matched token's counter moves. The event is
   spent view.
 - `version()` is `3.0.0`.
 
+### Solana specifics
+
+- **The value-holding list holds up to 16 accounts** (`MAX_CEA_ACCOUNTS`, was 8): the CEA, one token account per
+  listed token (up to 8) and up to 7 swap-output accounts. A listed account may appear in a request only where
+  the matched rule pins it; a listed account no rule pins can never be passed. The change costs no bytes; S18
+  gas grows with the number of accounts actually listed (6,041 gas per extra listed account on a 10-account
+  request, cold).
+- **URP cannot check that every listed token's account is on that list.** It cannot derive Solana token
+  accounts and does not know a PRC20's mint, so the SDK must list them.
+- **One input per instruction.** Each (program, instruction) has exactly one rule, and each position one pinned
+  key. If a swap rule pins its input to the USDC account, USDT can never be that instruction's input: at the
+  pinned position it fails S17, anywhere unpinned it fails S18. Using several tokens through one instruction
+  means leaving the input unpinned and those token accounts unlisted, protected only by the output and price
+  pins. Multi-asset on Solana works best when different tokens are used by different instructions.
+
 ### What did not change
 
 - `AGW`, `AGWFactory`, `AgentValidator` and SmartSession are untouched. The wallet passes the terms through
@@ -126,11 +141,11 @@ After every gate passes, only the matched token's counter moves. The event is
 | File | Change |
 |---|---|
 | `src/libraries/Types.sol` | `MAX_ASSETS`, `AssetCap`, `AssetCapState`; new `UniversalTerms`, `Config`, `SvmTerms`, `SvmConfig` |
-| `src/policies/UniversalRulesPolicy.sol` | Grant-time list checks, gates 5–8 in both families, `assertSpent`, `creditRevert`, storage copy |
+| `src/policies/UniversalRulesPolicy.sol` | Grant-time list checks, gates 5–8 in both families, `assertSpent`, `creditRevert`, storage copy; `MAX_CEA_ACCOUNTS` 8 → 16 |
 | `src/interfaces/IUniversalRulesPolicy.sol` | Events carry `token`; new `assertSpent` and `creditRevert` signatures |
 | `src/libraries/Errors.sol` | Added `AssetListOutOfRange`, `DuplicateAsset`, `AssetNotAllowed`, `AssetSpentMismatch`, `SpentLengthMismatch`; removed `AssetMismatch` |
 | `test/unit/28_multiAsset.t.sol` | New suite, 18 tests |
-| `test/unit/9_svmRulebook.t.sol` | 4 new Solana multi-asset tests |
+| `test/unit/9_svmRulebook.t.sol` | 7 new Solana tests: multi-asset, the 16-account list, the one-input limit, S18 gas |
 | 15 other test files and `test/Base.t.sol` | One-token lists in place of the old fields; updated expected errors |
 | `docs/`, `CLAUDE.md` | Updated to the new shape; this review is `docs/multi-asset-review.md` |
 
@@ -163,7 +178,11 @@ Solana, in `9_svmRulebook.t.sol`:
 - two tokens metered separately;
 - **Keep.** an unlisted token refused at amount 0;
 - an empty list refused and every token chain-checked;
-- `creditRevert` per token.
+- `creditRevert` per token;
+- the value-holding list accepts 16 accounts and refuses 17;
+- the one-input-per-instruction limit: a second token's listed account fails S17 at the pinned input and S18
+  anywhere unpinned;
+- gas: S18 costs 6,041 per extra listed account (cold); budget asserted.
 
 Existing tests whose expectations changed. Every one still names its exact error:
 
@@ -181,10 +200,11 @@ Existing tests whose expectations changed. Every one still names its exact error
 
 | What | Result |
 |---|---|
-| `make test` | `execute()` pin OK; **589 passed, 0 failed**, 2 skipped (the live-deployment tests, unchanged) |
+| `make test` | `execute()` pin OK; **592 passed, 0 failed**, 2 skipped (the live-deployment tests, unchanged) |
 | `forge fmt --check` | Clean |
 | Compiler and lint warnings | 4 fewer than the base commit, none new |
 | Gate-5 scan cost | 2,402 gas per listed token ahead of the match, cold. With 8 tokens, matching the last one costs about 16.8k more than the first; an unlisted token scans all 8 (about 19k) before it is refused. |
+| Solana S18 cost | 6,041 gas per extra listed value-holding account on a 10-account request, cold (4,041 warm). Listing all 16 instead of 3 adds about 78.5k gas. |
 | Mutation testing | **12 of 12 hand mutants killed**, each run against the full suite in a scratch copy. One survived the first run and was killed after a precedence check was added. |
 | `forge --version` | `1.5.1-stable` |
 
@@ -243,9 +263,9 @@ Questions that need an answer before this could ship.
 - **Q1 · Name of `maxGasPerCall`.** It caps `msg.value` in PC wei, which pays the protocol fee and the gas
   swap. "Gas" usually means gas units, and the request already has a `gasLimit` in units. Keep the name, or
   go back to `maxPCPerCall`?
-- **Q2 · Solana token accounts.** Each listed token's account under the wallet's Solana CEA must be in
-  `ceaAccounts` to be protected. That list is capped at 8 including the CEA, so at most 7 tokens can be
-  fully protected, fewer once swap outputs are listed. Raise the cap, or limit Solana rules to fewer tokens?
+- **Q2 · Solana token accounts. Resolved (option A):** the value-holding list now holds 16 accounts, enough
+  for all 8 tokens plus 7 outputs; the SDK must list every token's account; the one-input-per-instruction
+  limit is documented (see "Solana specifics").
 - **Q3 · The marketplace (core repo).** `UniversalMarketplaceTerms.verifySession` copies the old struct and
   checks that the rule's asset is the job's token and its total equals the job's payment. Should it require
   exactly one token, the job's token, with `maxTotal` equal to the payment? Otherwise extra tokens come
@@ -290,6 +310,7 @@ Questions that need an answer before this could ship.
 | Right chain, wrong token | URP checks the chain, not which token; picking USDC.eth vs USDT.eth is the SDK's job | design |
 | `maxGasPerCall` | Applies per request, whatever the token | unchanged |
 | Changing a rule | Still revoke plus grant; every counter restarts at zero | unchanged |
+| Solana: a second token through the same instruction | Refused while its account is listed: S17 at the pinned input, S18 anywhere unpinned | svm one-input test |
 
 ---
 
@@ -308,7 +329,7 @@ Questions that need an answer before this could ship.
 | Medium | **Right chain, wrong token** is not caught on-chain. If the SDK resolves pUSDC where the user meant pUSDT, the grant succeeds. |
 | Medium | **Shared allow-list.** Any listed token can be sent to any allowed protocol. |
 | Medium | **`creditRevert`** trusts both `token` and `amount` from the executor module, and it is still unwired. |
-| Medium | **Solana:** with many tokens, not every token account can be protected (Q2). |
+| Medium | **Solana:** the SDK must list every token's account (URP can't check it), and one instruction can take only one pinned input token. Both documented; see "Solana specifics". |
 | Low | **Naming footgun.** Someone who sets `maxGasPerCall` to a gas-units number (e.g. 300000) gets 300000 wei of PC, so every call fails. That fails safe, but it is confusing (Q1). |
 
 ### Unchanged risks
