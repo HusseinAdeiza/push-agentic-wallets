@@ -264,13 +264,9 @@ contract URPNativeTest is BaseTest {
         Config memory u = Config({
             initialized: false,
             validUntil: VALID_UNTIL,
-            destChainHash: bytes32(0),
             expectedCEA: makeAddr("cea"),
-            asset: address(new MockPRC20()),
-            maxAmountPerCall: 1,
-            maxAmountTotal: 1,
-            maxPCPerCall: 1,
-            spent: 0,
+            maxGasPerCall: 1,
+            assets: oneAsset(address(new MockPRC20()), 1, 1),
             allowedCalls: rules
         });
 
@@ -605,35 +601,6 @@ contract URPNativeTest is BaseTest {
 
     // ═════════════════════════ cross-mode surface ═════════════════════════
 
-    /**
-     * A LEGACY universal config — `_configs` live, `_mode` empty — is reported and guarded
-     * correctly by the mode-sensitive views (review §2.1).
-     *
-     * `_modeOf` derives UNIVERSAL from `_configs[..].initialized`, so these must behave exactly as
-     * they would for a post-upgrade universal config: the native getter refuses, and the native
-     * `assertSpent` refuses with `WrongModeForCall`, NOT `NotInitialized`.
-     */
-    function test_native_legacyUniversalSlot_isGuardedByTheViews() public {
-        _initUniversalAt(CID2);
-
-        // Make it legacy-shaped: _mode never written.
-        bytes32 modeSlot = keccak256(
-            abi.encode(ACCOUNT, keccak256(abi.encode(address(engine), keccak256(abi.encode(CID2, uint256(5))))))
-        );
-        vm.store(address(urp), modeSlot, bytes32(0));
-        assertEq(vm.load(address(urp), modeSlot), bytes32(0), "legacy shape: raw slot empty");
-
-        vm.expectRevert(
-            abi.encodeWithSelector(UniversalRulesPolicyErrors.WrongModeForCall.selector, RulesType.UNIVERSAL)
-        );
-        urp.getNativeConfig(CID2, ACCOUNT);
-
-        vm.expectRevert(
-            abi.encodeWithSelector(UniversalRulesPolicyErrors.WrongModeForCall.selector, RulesType.UNIVERSAL)
-        );
-        urp.assertSpent(CID2, ACCOUNT, 0, 0, 0);
-    }
-
     function test_native_getConfig_revertsOnNativeSlot() public {
         _initDefaultNative();
         vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.WrongModeForCall.selector, RulesType.NATIVE));
@@ -740,7 +707,7 @@ contract URPNativeTest is BaseTest {
     function test_native_assertSpent_wrongModeBothWays() public {
         _initDefaultNative();
         vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.WrongModeForCall.selector, RulesType.NATIVE));
-        urp.assertSpent(CID, ACCOUNT, 0);
+        urp.assertSpent(CID, ACCOUNT, oneSpent(0));
 
         _initUniversalAt(CID2);
         vm.expectRevert(
@@ -767,7 +734,7 @@ contract URPNativeTest is BaseTest {
 
         vm.prank(EXECUTOR_MODULE);
         vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.NotInitialized.selector, CID, ACCOUNT));
-        urp.creditRevert(CID, ACCOUNT, txId, 1e6);
+        urp.creditRevert(CID, ACCOUNT, txId, address(0xA55E7), 1e6);
 
         assertFalse(urp.isCredited(txId), "the outbound id was NOT burned");
     }
@@ -782,13 +749,9 @@ contract URPNativeTest is BaseTest {
         Config memory u = Config({
             initialized: false,
             validUntil: VALID_UNTIL,
-            destChainHash: bytes32(0),
             expectedCEA: makeAddr("cea"),
-            asset: address(new MockPRC20()),
-            maxAmountPerCall: 1 ether,
-            maxAmountTotal: 1 ether,
-            maxPCPerCall: 1 ether,
-            spent: 0,
+            maxGasPerCall: 1 ether,
+            assets: oneAsset(address(new MockPRC20()), 1 ether, 1 ether),
             allowedCalls: rules
         });
         vm.prank(address(engine));

@@ -32,7 +32,7 @@ import { RulesType, VmFamily } from "./Types.sol";
  *
  *         NOT THE UEAFACTORY FORMULA. `keccak256(abi.encode("eip155", "42101"))` — two separately
  *         encoded strings — is a DIFFERENT value for the same chain, and it belongs to UEA address
- *         prediction. Conflating the two is how `Config.destChainHash` came to carry four different
+ *         prediction. Conflating the two is how a since-removed `Config` chain field came to carry four different
  *         conventions in one repository. `test_ChainLib_notTheTwoStringFormula` pins the difference.
  *
  *         TESTS MUST PIN `block.chainid`. Foundry's default is 31337, where this derives

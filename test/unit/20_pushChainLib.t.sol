@@ -100,7 +100,7 @@ contract PushChainLibTest is Test {
      *
      * `keccak256(abi.encode("eip155", "42101"))` is a DIFFERENT value for the same chain, and it is
      * the formula core's `UEAFactory` uses to derive UEA addresses. Both live in this ecosystem and
-     * they must never be conflated: before this change `Config.destChainHash` had acquired FOUR
+     * they must never be conflated: before this change a since-removed `Config` chain field had acquired FOUR
      * different conventions across the repo — the colon form, the two-string form, a packed form,
      * and plain zero — precisely because nothing ever compared the field.
      *

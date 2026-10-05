@@ -465,7 +465,7 @@ contract AGW is IAGW, ReentrancyGuardTransient {
      *           and the engine's enable path never calls back into the account.
      *
      *         - TAKES NO MANDATE TYPE. The kind of a rules set is DERIVED, not declared: each action's
-     *           URP policy envelope is `abi.encode(string chain, bytes body)`, and the chain decides
+     *           URP policy envelope is `abi.encode(uint16 version, string chain, bytes body)`, and the chain decides
      *           the rulebook — this chain means a Push-side call (NATIVE), any other means a call
      *           through the gateway (UNIVERSAL). The owner states a chain once, where they were
      *           already stating the terms; nobody states a mode anywhere. Every action must name the
@@ -663,16 +663,17 @@ contract AGW is IAGW, ReentrancyGuardTransient {
      *
      *      CALLER MUST HAVE RUN `_requirePolicyShape` FIRST.
      *
-     *      Same decoder as URP's, deliberately (`abi.decode(initData, (string, bytes))`): two
-     *      different readers of one security-relevant field is the drift this design exists to
-     *      prevent. A malformed envelope reverts here, unnamed, and fails closed.
+     *      Same decoder as URP's, deliberately (`abi.decode(initData, (uint16, string, bytes))`):
+     *      two different readers of one security-relevant field is the drift this design exists to
+     *      prevent. A malformed envelope reverts here, unnamed, and fails closed. The version is
+     *      URP's to judge: it refuses anything but `ENVELOPE_VERSION` at init, inside this grant.
      *
      * @param  a          The action to read.
      * @return chain      The declared CAIP-2 string, e.g. `"eip155:11155111"`.
      * @return chainHash  Its keccak256, the value everything downstream compares.
      */
     function _chainNamespaceOf(ActionData calldata a) internal pure returns (string memory chain, bytes32 chainHash) {
-        (chain,) = abi.decode(a.actionPolicies[0].initData, (string, bytes));
+        (, chain,) = abi.decode(a.actionPolicies[0].initData, (uint16, string, bytes));
         if (bytes(chain).length == 0) revert AGWErrors.EmptyChain();
         chainHash = keccak256(bytes(chain));
     }

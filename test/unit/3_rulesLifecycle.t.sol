@@ -72,13 +72,9 @@ contract PushAgentWalletLifecycleTest is BaseTest {
             Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 365 days),
-                destChainHash: keccak256("eip155:11155111"),
                 expectedCEA: _addr("cea"),
-                asset: PRC20,
-                maxAmountPerCall: 100 ether,
-                maxAmountTotal: 1000 ether,
-                maxPCPerCall: 5 ether,
-                spent: 0,
+                maxGasPerCall: 5 ether,
+                assets: oneAsset(PRC20, 100 ether, 1000 ether),
                 allowedCalls: rules
             })
         );
@@ -393,13 +389,9 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         Config memory bad = Config({
             initialized: false,
             validUntil: uint48(block.timestamp + 1 days),
-            destChainHash: bytes32(0),
             expectedCEA: _addr("cea"),
-            asset: address(0), // URP's own guard rejects this
-            maxAmountPerCall: 1,
-            maxAmountTotal: 1,
-            maxPCPerCall: 1,
-            spent: 0,
+            maxGasPerCall: 1,
+            assets: oneAsset(address(0), 1, 1), // URP's own guard rejects this
             allowedCalls: rules
         });
 
@@ -413,7 +405,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         // rewrap (the 32-byte PolicyCheckReverted rewrap is on the checkAction path), so this
         // arrives as itself.
         vm.prank(WALLET_OWNER);
-        vm.expectRevert(UniversalRulesPolicyErrors.InvalidConfigField.selector);
+        vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.InvalidAsset.selector, address(0)));
         wallet.grantRules(s);
     }
 
@@ -596,10 +588,10 @@ contract PushAgentWalletLifecycleTest is BaseTest {
             target: address(urp),
             value: 0,
             // `assertSpent` is overloaded since native mode landed, and `abi.encodeCall` cannot
-            // disambiguate a function reference by arity. Encode the universal (three-argument)
-            // form by its explicit signature instead. The selector is unchanged — 0x85859f51.
+            // disambiguate a function reference by arity. Encode the universal (per-asset array)
+            // form by its explicit signature instead.
             callData: abi.encodeWithSignature(
-                "assertSpent(bytes32,address,uint256)", configId, address(wallet), believedSpent
+                "assertSpent(bytes32,address,uint256[])", configId, address(wallet), oneSpent(believedSpent)
             )
         });
         batch[1] = Execution({ target: address(wallet), value: 0, callData: abi.encodeCall(AGW.revokeRules, (oldPid)) });
@@ -627,7 +619,9 @@ contract PushAgentWalletLifecycleTest is BaseTest {
 
         vm.prank(WALLET_OWNER);
         vm.expectRevert(
-            abi.encodeWithSelector(UniversalRulesPolicyErrors.SpentMismatch.selector, uint256(5 ether), uint256(0))
+            abi.encodeWithSelector(
+                UniversalRulesPolicyErrors.AssetSpentMismatch.selector, PRC20, uint256(5 ether), uint256(0)
+            )
         );
         wallet.execute(ModeCode.unwrap(ModeLib.encodeSimpleBatch()), ExecutionLib.encodeBatch(batch));
 
@@ -734,7 +728,7 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         // the config exists and is initialised
         Config memory before = urp.getConfig(ConfigId.wrap(configId), address(wallet));
         assertTrue(before.initialized, "URP config written during the grant");
-        assertEq(before.asset, PRC20, "and carries the terms");
+        assertEq(before.assets[0].token, PRC20, "and carries the terms");
 
         vm.prank(WALLET_OWNER);
         wallet.revokeRules(pid);
@@ -745,14 +739,14 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         // ...but the config PERSISTS and getConfig still reads it
         Config memory orphan = urp.getConfig(ConfigId.wrap(configId), address(wallet));
         assertTrue(orphan.initialized, "the config persists as inert orphan data");
-        assertEq(orphan.asset, before.asset, "unchanged");
-        assertEq(orphan.maxAmountTotal, before.maxAmountTotal, "unchanged");
+        assertEq(orphan.assets[0].token, before.assets[0].token, "unchanged");
+        assertEq(orphan.assets[0].maxTotal, before.assets[0].maxTotal, "unchanged");
         assertEq(orphan.allowedCalls.length, before.allowedCalls.length, "including the allow-list");
 
         // and a late credit still lands on it, harmlessly
         vm.prank(EXECUTOR_MODULE);
-        urp.creditRevert(ConfigId.wrap(configId), address(wallet), keccak256("late"), 1 ether);
-        assertEq(urp.getConfig(ConfigId.wrap(configId), address(wallet)).spent, 0, "saturated, harmless");
+        urp.creditRevert(ConfigId.wrap(configId), address(wallet), keccak256("late"), PRC20, 1 ether);
+        assertEq(urp.getConfig(ConfigId.wrap(configId), address(wallet)).assets[0].spent, 0, "saturated, harmless");
 
         // The orphan is NOT reusable: re-initialising that config id is refused.
         vm.prank(address(engine));

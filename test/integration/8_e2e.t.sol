@@ -119,13 +119,9 @@ contract E2ETest is BaseTest {
             Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 30 days),
-                destChainHash: keccak256("eip155:1"),
                 expectedCEA: BOB_AGW_CEA,
-                asset: address(pUSDC),
-                maxAmountPerCall: HUNDRED_USDC,
-                maxAmountTotal: HUNDRED_USDC,
-                maxPCPerCall: 1 ether,
-                spent: 0,
+                maxGasPerCall: 1 ether,
+                assets: oneAsset(address(pUSDC), HUNDRED_USDC, HUNDRED_USDC),
                 allowedCalls: rules
             })
         );
@@ -157,7 +153,7 @@ contract E2ETest is BaseTest {
     }
 
     function _spent(bytes32 pid) internal view returns (uint256) {
-        return urp.getConfig(_configId(pid), address(bobAgw)).spent;
+        return urp.getConfig(_configId(pid), address(bobAgw)).assets[0].spent;
     }
 
     // ═══════════════════════════════ THE BOB FLOW ═══════════════════════════════
@@ -213,14 +209,14 @@ contract E2ETest is BaseTest {
         // ── LEDGER after stage 3 ──
         assertEq(pUSDC.balanceOf(address(bobAgw)), HUNDRED_USDC, "stage 3: wallet holds 100 pUSDC");
         assertEq(pUSDC.balanceOf(BOB_UEA), 0, "stage 3: the UEA is identity only, clean");
-        assertEq(_spent(permissionId), 0, "stage 3: URP.spent == 0");
+        assertEq(_spent(permissionId), 0, "stage 3: URP.assets[0].spent == 0");
 
         // ── STAGE 5 · execution through the agent door ──
         bytes memory ecd = _executionCalldata(HUNDRED_USDC, 0.05 ether);
 
         vm.expectEmit(true, true, true, true, address(urp));
         emit IUniversalRulesPolicy.OutboundMetered(
-            _configId(permissionId), address(engine), address(bobAgw), HUNDRED_USDC
+            _configId(permissionId), address(engine), address(bobAgw), address(pUSDC), HUNDRED_USDC
         );
 
         vm.expectEmit(true, true, false, true, address(bobAgw));
@@ -248,7 +244,7 @@ contract E2ETest is BaseTest {
 
         // ── LEDGER after stage 5 ──
         assertEq(pUSDC.balanceOf(address(bobAgw)), 0, "stage 5: 100 pUSDC left the wallet");
-        assertEq(_spent(permissionId), HUNDRED_USDC, "stage 5: URP.spent == 100e6");
+        assertEq(_spent(permissionId), HUNDRED_USDC, "stage 5: URP.assets[0].spent == 100e6");
 
         // ── STAGE 7b · the redeploy path — amount 0, and `spent` does NOT move ──
         // The capital is already at the CEA; moving it between protocols bridges nothing. The
@@ -480,7 +476,7 @@ contract E2ETest is BaseTest {
         assertEq(uint8(slot.mode), uint8(RulesType.UNIVERSAL), "and it reports UNIVERSAL");
 
         // The universal getter works; the native one refuses. Cross-mode reads are loud.
-        assertGt(urp.getConfig(cid, address(bobAgw)).spent, 0, "the universal counter moved");
+        assertGt(urp.getConfig(cid, address(bobAgw)).assets[0].spent, 0, "the universal counter moved");
         vm.expectRevert(
             abi.encodeWithSelector(UniversalRulesPolicyErrors.WrongModeForCall.selector, RulesType.UNIVERSAL)
         );
@@ -549,10 +545,10 @@ contract E2ETest is BaseTest {
         // watching the getter-based version of this test still go green. The raw slot is the only
         // honest instrument.
         //
-        // `_configs` is slot 3. `Config.spent` sits at base + 7, NOT base + 8: `initialized` (bool)
-        // and `validUntil` (uint48) PACK into the struct's first slot, so every later field shifts
-        // down by one. Located by dumping the slots rather than counting fields — the field count
-        // and the slot index are different numbers whenever anything packs.
+        // `_configs` is slot 3. `Config.assets` is the struct's slot 2 (`initialized`, `validUntil` and
+        // `expectedCEA` PACK into slot 0, so field index and slot index differ), and entry 0 of that
+        // array starts at `keccak256(base + 2)`; `AssetCapState.spent` is its fourth full slot, so +3.
+        // Pinned by the struct-layout test in the URP suite.
         bytes32 configsBase = keccak256(
             abi.encode(
                 address(bobAgw), keccak256(abi.encode(address(engine), keccak256(abi.encode(nativeCid, uint256(3)))))
@@ -569,12 +565,17 @@ contract E2ETest is BaseTest {
             )
         );
         assertEq(
-            uint256(vm.load(address(urp), bytes32(uint256(universalBase) + 7))),
+            uint256(vm.load(address(urp), _asset0SpentSlot(universalBase))),
             universalSpent,
-            "offset +7 IS Config.spent - proven against a slot known to be non-zero"
+            "keccak(base+2)+3 IS Config.assets[0].spent - proven against a slot known to be non-zero"
         );
         assertEq(
-            uint256(vm.load(address(urp), bytes32(uint256(configsBase) + 7))),
+            uint256(vm.load(address(urp), bytes32(uint256(configsBase) + 2))),
+            0,
+            "the native action created no universal asset list"
+        );
+        assertEq(
+            uint256(vm.load(address(urp), _asset0SpentSlot(configsBase))),
             0,
             "the native action wrote NOTHING into the universal rulebook"
         );
@@ -668,5 +669,10 @@ contract E2ETest is BaseTest {
     function _submitNative(AGW w, bytes memory ecd, bytes32 pid) internal {
         vm.prank(agentAddr);
         w.executeAsAgent(pid, _singleMode(), ecd);
+    }
+
+    /// @dev Raw slot of `Config.assets[0].spent` for a config whose struct starts at `base`.
+    function _asset0SpentSlot(bytes32 base) internal pure returns (bytes32) {
+        return bytes32(uint256(keccak256(abi.encode(uint256(base) + 2))) + 3);
     }
 }

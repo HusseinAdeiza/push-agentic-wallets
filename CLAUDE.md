@@ -163,6 +163,11 @@ AGW follows the core/gateway naming standard (`docs-internal/sdk-first-changes/N
   value cap entirely.
 - **Gate 16's per-entry cap is in destination-chain native units** and is never compared against the
   Push-side `value` (gate 8). Conflating them is a real bug this design once carried.
+- **A universal rules set lists 1..`MAX_ASSETS` tokens, and gate 5 checks the request's token on every
+  request, zero amount included** (multi-asset branch). The gateway routes by the token, so the token is
+  what pins the destination chain: every listed token is chain-checked at grant, an empty list is refused,
+  and a zero-amount request naming an unlisted token is refused. Each token has its own caps and its own
+  `spent`; "unlimited" is `type(uint256).max`, never 0. See `docs/multi-asset-review.md`.
 - **The factory's derivation is frozen forever.** `_walletImplementation` is the append-only storage anchor
   with no setter; the salt formula and the 40-byte immutable-args encoding may never change, because
   counterfactual funding is a supported flow with no recovery path.
@@ -184,8 +189,10 @@ AGW follows the core/gateway naming standard (`docs-internal/sdk-first-changes/N
   init reverts bubble with full data — assert `ChainMismatch`, `InvalidAsset` and `EmptyChain` with every
   argument, never through `expectUrpGate`.
 - **Which rulebook a rules set uses is DERIVED, by both contracts, from one string.** Each action's URP
-  `initData` is `abi.encode(string chainNamespace, bytes body)` — the same shape in both modes, which is what lets
-  the leading field be read before the mode is known. The wallet hashes it and the engine hands URP the
+  `initData` is `abi.encode(uint16 version, string chainNamespace, bytes body)` — the same shape in every mode,
+  which is what lets the chain be read before the mode is known. URP reads the version from the first word
+  before decoding anything else and refuses anything but `ENVELOPE_VERSION` (`UnsupportedEnvelopeVersion`);
+  the wallet decodes the same three fields but judges only the chain. The wallet hashes it and the engine hands URP the
   identical bytes, so both call `PushChainLib.deriveMode` and reach the same answer with nothing between
   them that can drift. There is no mode byte, no `RulesType` argument and no `PUSH_CHAIN_HASH` constant:
   `PushChainLib` computes this chain's identity from `block.chainid`, so there is nothing to configure and
@@ -201,8 +208,8 @@ AGW follows the core/gateway naming standard (`docs-internal/sdk-first-changes/N
   `block.chainid`, never a literal.
 - **`Config`, `SvmConfig` and `NativeConfig` are STORAGE types; `UniversalTerms`, `SvmTerms` and
   `NativeTerms` are the wire types.** URP storage is append-only — `_svm` took slot 7 and one `__gap` slot.
-  The SDK encodes the latter. `Config.destChainHash` is a v2 relic that keeps slot 1 and is never written —
-  a rules set's chain lives on `ModeSlot.chainHash`, where it has been checked against the asset.
+  The SDK encodes the latter. `Config` stores no chain — a rules set's chain lives on `ModeSlot.chainHash`,
+  where it has been checked against every listed asset.
   `test_upgradeable_configStructLayoutIsFrozen` pins every member's label, slot, offset and type, because a
   struct inside a mapping never appears in the contract-level layout and can otherwise be reordered
   silently.
@@ -230,17 +237,18 @@ AGW follows the core/gateway naming standard (`docs-internal/sdk-first-changes/N
    (correct-length, malformed-offset body), which asserts "reverts" because it fails at an un-named
    `abi.decode` step, and the **malformed-envelope rejection test**.
 
-   **The envelope exception, restated for `abi.encode(string chainNamespace, bytes body)`.** On an **uninitialised**
-   config, an envelope whose outer `(string, bytes)` decode fails — a `(uint8, bytes32, bytes)` header,
-   `(uint8 ≥ 2, bytes)`, or fewer than 64 bytes — reverts **unnamed**; so does a well-formed envelope
-   whose body is the wrong `Terms` type for the derived mode, **on the owner-door-direct path only**, and
-   so does an asset that *answers* `SOURCE_CHAIN_NAMESPACE()` with a non-string. A v2 `(uint8 0, bytes)`
-   envelope and any bare struct decode to an **empty chain** and revert **named `EmptyChain()`**; a v2
-   `(uint8 1, bytes)` envelope decodes to a garbage chain and is refused **named** at the wallet's target
-   check. On an **already-initialised** config every shape reverts `AlreadyInitialized` first, because the
-   re-init guard precedes the decode. Naming the remaining cases would require heuristic decoding, which
-   is worse than the unnamed revert; the property the tests do assert is that each **reverts rather than
-   mis-decoding**.
+   **The envelope exception, restated for `abi.encode(uint16 version, string chainNamespace, bytes body)`.**
+   URP reads the version from the **first word** before decoding anything else, so on an **uninitialised**
+   config almost every malformed or pre-version blob is refused **named** as
+   `UnsupportedEnvelopeVersion(firstWord)`: a two-field `(string, bytes)` envelope reports 64, a bare struct
+   32, a `(uint8, …)` header its leading byte. What stays **unnamed** at URP: blobs shorter than one word, a
+   version-1 envelope whose body is the wrong `Terms` type for the derived mode (**owner-door-direct path
+   only**), and an asset that *answers* `SOURCE_CHAIN_NAMESPACE()` with a non-string. **Through the wallet**
+   the wallet decodes the envelope first and does not judge the version: an unsupported version reaches the
+   owner named from URP, but a pre-version two-field envelope panics in the wallet's decode (`0x41`) before
+   URP is reached — assert that panic, not a bare revert. On an **already-initialised** config every shape
+   reverts `AlreadyInitialized` first, because the re-init guard precedes the decode. The property the tests
+   assert is that each **reverts rather than mis-decoding**.
 
    **A bare `vm.expectRevert()` is permitted only where the revert genuinely carries no data, and
    only with an in-line justification saying so.** Before writing one, **grep the repo for the same

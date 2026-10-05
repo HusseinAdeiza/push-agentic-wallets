@@ -105,13 +105,9 @@ contract EngineTest is BaseTest {
             Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 30 days),
-                destChainHash: keccak256("eip155:1"),
                 expectedCEA: CEA,
-                asset: address(pUSDC),
-                maxAmountPerCall: CAP,
-                maxAmountTotal: CAP,
-                maxPCPerCall: 1 ether,
-                spent: 0,
+                maxGasPerCall: 1 ether,
+                assets: oneAsset(address(pUSDC), CAP, CAP),
                 allowedCalls: rules
             })
         );

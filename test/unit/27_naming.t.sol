@@ -145,7 +145,7 @@ contract NamingTest is BaseTest {
     function test_naming_identityStrings() public {
         AGW wallet = newWallet(makeAddr("namingOwner"));
         assertEq(wallet.accountId(), "push.agw.1.0.0", "ERC-7579 account id");
-        assertEq(urp.version(), "2.0.0", "policy version");
+        assertEq(urp.version(), "3.1.0", "policy version");
     }
 
     /// @dev The `abi` section of a forge artifact: everything before the `bytecode` key. NatSpec

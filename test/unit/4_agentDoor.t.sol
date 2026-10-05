@@ -123,13 +123,9 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
             Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 365 days),
-                destChainHash: keccak256("eip155:11155111"),
                 expectedCEA: CEA,
-                asset: ASSET,
-                maxAmountPerCall: 100 ether,
-                maxAmountTotal: 1000 ether,
-                maxPCPerCall: 5 ether,
-                spent: 0,
+                maxGasPerCall: 5 ether,
+                assets: oneAsset(ASSET, 100 ether, 1000 ether),
                 allowedCalls: rules
             })
         );
@@ -192,7 +188,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
     }
 
     function _spentOf(bytes32 pid) internal view returns (uint256) {
-        return urp.getConfig(_configIdOf(pid, GATEWAY, SEND_OUTBOUND_SELECTOR), address(wallet)).spent;
+        return urp.getConfig(_configIdOf(pid, GATEWAY, SEND_OUTBOUND_SELECTOR), address(wallet)).assets[0].spent;
     }
 
     function _spent() internal view returns (uint256) {
@@ -821,7 +817,7 @@ contract PushAgentWalletAgentDoorTest is BaseTest {
         etchCallRecorder(GATEWAY);
 
         vm.expectEmit(true, true, true, true, address(urp));
-        emit IUniversalRulesPolicy.OutboundMetered(_configId(), address(engine), address(wallet), 3 ether);
+        emit IUniversalRulesPolicy.OutboundMetered(_configId(), address(engine), address(wallet), ASSET, 3 ether);
 
         _submitAs(agentAddr, permissionId, _singleMode(), _executionCalldata(3 ether, 0));
 

@@ -91,10 +91,8 @@ contract PushAgentWalletChainDerivationTest is BaseTest {
             AllowedCall({ target: PROTOCOL, selector: SWAP, beneficiaryOffset: 4, hasBeneficiary: true, maxValue: 0 });
         cfg.validUntil = uint48(block.timestamp + 30 days);
         cfg.expectedCEA = CEA;
-        cfg.asset = PRC20;
-        cfg.maxAmountPerCall = 100e6;
-        cfg.maxAmountTotal = 1000e6;
-        cfg.maxPCPerCall = 5 ether;
+        cfg.assets = oneAsset(PRC20, 100e6, 1000e6);
+        cfg.maxGasPerCall = 5 ether;
         cfg.allowedCalls = calls;
     }
 

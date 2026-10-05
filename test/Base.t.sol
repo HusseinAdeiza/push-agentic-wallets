@@ -24,7 +24,10 @@ import { AGW } from "../src/AGW.sol";
 import { AGWFactory } from "../src/AGWFactory.sol";
 
 import {
+    AssetCap,
+    AssetCapState,
     Config,
+    ENVELOPE_VERSION,
     Multicall,
     MULTICALL_SELECTOR,
     NativeConfig,
@@ -401,7 +404,8 @@ abstract contract BaseTest is Test {
     string internal constant CHAIN_SEPOLIA = "eip155:11155111";
 
     /**
-     * @notice Wrap an encoded body in URP's `(string chain, bytes body)` envelope.
+     * @notice Wrap an encoded body in URP's `(uint16 version, string chain, bytes body)` envelope, at
+     *         the current `ENVELOPE_VERSION`.
      *
      * @dev    SHARED HELPER — use this everywhere a policy `initData` is built. The envelope shape
      *         is IDENTICAL for both modes; the chain string alone decides which rulebook applies,
@@ -412,7 +416,7 @@ abstract contract BaseTest is Test {
      *         NATIVE config passes this chain's own identifier; anything else is UNIVERSAL.
      */
     function envelope(string memory chain, bytes memory body) internal pure returns (bytes memory) {
-        return abi.encode(chain, body);
+        return abi.encode(ENVELOPE_VERSION, chain, body);
     }
 
     /**
@@ -428,8 +432,8 @@ abstract contract BaseTest is Test {
     }
 
     /// @dev The universal case, which is most of them. Takes the storage-shaped `Config` the tests
-    ///      already build and narrows it to the wire type — the fields URP owns (`initialized`,
-    ///      `spent`, and the `destChainHash` relic) are dropped here rather than at every call site.
+    ///      already build and narrows it to the wire type — the fields URP owns (`initialized` and
+    ///      each asset's `spent`) are dropped here rather than at every call site.
     function universalInitData(Config memory cfg) internal pure returns (bytes memory) {
         return universalInitData(CHAIN_SEPOLIA, cfg);
     }
@@ -444,17 +448,52 @@ abstract contract BaseTest is Test {
         return envelope(nativeChain(), abi.encode(_terms(cfg)));
     }
 
-    /// @dev `Config` (storage shape, what tests build) → `UniversalTerms` (wire shape).
+    /// @dev `Config` (storage shape, what tests build) → `UniversalTerms` (wire shape). Each asset's
+    ///      `spent` is dropped here — URP owns it.
     function _terms(Config memory cfg) internal pure returns (UniversalTerms memory) {
         return UniversalTerms({
             validUntil: cfg.validUntil,
             expectedCEA: cfg.expectedCEA,
-            asset: cfg.asset,
-            maxAmountPerCall: cfg.maxAmountPerCall,
-            maxAmountTotal: cfg.maxAmountTotal,
-            maxPCPerCall: cfg.maxPCPerCall,
+            assets: wireAssets(cfg.assets),
+            maxGasPerCall: cfg.maxGasPerCall,
             allowedCalls: cfg.allowedCalls
         });
+    }
+
+    // ─────────────────────────── asset lists ───────────────────────────
+
+    /// @dev A one-entry STORAGE-shaped asset list (spent 0), for the `Config` literals tests build.
+    function oneAsset(address token, uint256 maxPerCall, uint256 maxTotal)
+        internal
+        pure
+        returns (AssetCapState[] memory list)
+    {
+        list = new AssetCapState[](1);
+        list[0] = AssetCapState({ token: token, maxPerCall: maxPerCall, maxTotal: maxTotal, spent: 0 });
+    }
+
+    /// @dev A one-entry WIRE asset list, for the `SvmTerms` literals tests build.
+    function oneCap(address token, uint256 maxPerCall, uint256 maxTotal)
+        internal
+        pure
+        returns (AssetCap[] memory list)
+    {
+        list = new AssetCap[](1);
+        list[0] = AssetCap({ token: token, maxPerCall: maxPerCall, maxTotal: maxTotal });
+    }
+
+    /// @dev The one-entry expected-spent array the universal `assertSpent` takes for a one-asset rules set.
+    function oneSpent(uint256 v) internal pure returns (uint256[] memory list) {
+        list = new uint256[](1);
+        list[0] = v;
+    }
+
+    /// @dev Storage-shaped asset list → wire list (drops `spent`).
+    function wireAssets(AssetCapState[] memory list) internal pure returns (AssetCap[] memory out) {
+        out = new AssetCap[](list.length);
+        for (uint256 i; i < list.length; ++i) {
+            out[i] = AssetCap({ token: list[i].token, maxPerCall: list[i].maxPerCall, maxTotal: list[i].maxTotal });
+        }
     }
 
     /// @dev `NativeConfig` (storage shape) → `NativeTerms` (wire shape).
