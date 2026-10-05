@@ -40,6 +40,23 @@ import {
     VmFamily
 } from "../libraries/Types.sol";
 
+// Cluster-independent Solana program ids, never targets. Decoded from their base58 ids by tooling and
+// pinned by `test_svm_forbiddenProgramConstantsMatchBase58` — do not hand-edit a hex word. FILE-LEVEL,
+// not inside the contract, so that test can import them without inheriting all of URP: a harness that
+// did so grew past the 24,576-byte limit and failed `make sizes`. Inlined either way; no runtime cost.
+/// @dev `11111111111111111111111111111111` — a system transfer with the CEA as funder drains it.
+bytes32 constant SYSTEM_PROGRAM = bytes32(0);
+/// @dev `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` — transfer/approve/close with CEA authority.
+bytes32 constant SPL_TOKEN_PROGRAM = 0x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9;
+/// @dev `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb` — the same surface on Token-2022.
+bytes32 constant TOKEN_2022_PROGRAM = 0x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc;
+/// @dev `Stake11111111111111111111111111111111111111` — withdraw with the CEA as authority.
+bytes32 constant STAKE_PROGRAM = 0x06a1d8179137542a983437bdfe2a7ab2557f535c8a78722b68a49dc000000000;
+/// @dev `BPFLoaderUpgradeab1e11111111111111111111111` — never a CEA action; refused outright.
+bytes32 constant BPF_LOADER_UPGRADEABLE = 0x02a8f6914e88a1b0e210153ef763ae2b00c2b93d16c124d2c0537a1004800000;
+/// @dev `AddressLookupTab1e1111111111111111111111111` — rent drain with the CEA as payer.
+bytes32 constant ADDRESS_LOOKUP_TABLE = 0x0277a6af97339b7ac88d1892c90446f50002309266f62e53c118244982000000;
+
 /**
  * @title  UniversalRulesPolicy (URP)
  * @notice The security boundary of the whole system: the only contract that ever inspects what an
@@ -118,22 +135,6 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
     uint256 internal constant SVM_LEN_FIELD = 4;
     uint256 internal constant SVM_TRAILER_LEN = 33;
     uint8 internal constant SVM_INSTRUCTION_EXECUTE = 2;
-
-    // Cluster-independent program ids, never targets. Decoded from their base58 ids by tooling and
-    // pinned by `test_svm_forbiddenProgramConstantsMatchBase58` — do not hand-edit a hex word.
-    /// @dev `11111111111111111111111111111111` — a system transfer with the CEA as funder drains it.
-    bytes32 internal constant SYSTEM_PROGRAM = bytes32(0);
-    /// @dev `TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA` — transfer/approve/close with CEA authority.
-    bytes32 internal constant SPL_TOKEN_PROGRAM = 0x06ddf6e1d765a193d9cbe146ceeb79ac1cb485ed5f5b37913a8cf5857eff00a9;
-    /// @dev `TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb` — the same surface on Token-2022.
-    bytes32 internal constant TOKEN_2022_PROGRAM = 0x06ddf6e1ee758fde18425dbce46ccddab61afc4d83b90d27febdf928d8a18bfc;
-    /// @dev `Stake11111111111111111111111111111111111111` — withdraw with the CEA as authority.
-    bytes32 internal constant STAKE_PROGRAM = 0x06a1d8179137542a983437bdfe2a7ab2557f535c8a78722b68a49dc000000000;
-    /// @dev `BPFLoaderUpgradeab1e11111111111111111111111` — never a CEA action; refused outright.
-    bytes32 internal constant BPF_LOADER_UPGRADEABLE =
-        0x02a8f6914e88a1b0e210153ef763ae2b00c2b93d16c124d2c0537a1004800000;
-    /// @dev `AddressLookupTab1e1111111111111111111111111` — rent drain with the CEA as payer.
-    bytes32 internal constant ADDRESS_LOOKUP_TABLE = 0x0277a6af97339b7ac88d1892c90446f50002309266f62e53c118244982000000;
 
     // ───────────────────────────────── storage ─────────────────────────────────
     //

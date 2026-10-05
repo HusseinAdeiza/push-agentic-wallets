@@ -6,7 +6,14 @@ import { UniversalRulesPolicyErrors } from "../../src/libraries/Errors.sol";
 import { Vm } from "forge-std/Vm.sol";
 
 import { BaseTest } from "../Base.t.sol";
-import { UniversalRulesPolicy } from "../../src/policies/UniversalRulesPolicy.sol";
+import {
+    SYSTEM_PROGRAM,
+    SPL_TOKEN_PROGRAM,
+    TOKEN_2022_PROGRAM,
+    STAKE_PROGRAM,
+    BPF_LOADER_UPGRADEABLE,
+    ADDRESS_LOOKUP_TABLE
+} from "../../src/policies/UniversalRulesPolicy.sol";
 import { IUniversalRulesPolicy } from "../../src/interfaces/IUniversalRulesPolicy.sol";
 import { PushChainLib } from "../../src/libraries/PushChainLib.sol";
 import { AGW } from "../../src/AGW.sol";
@@ -34,34 +41,6 @@ import { IPolicy } from "smartsessions/interfaces/IPolicy.sol";
 import { VALIDATION_SUCCESS } from "erc7579/interfaces/IERC7579Module.sol";
 import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
 import { MockPRC20Source } from "../mocks/MockPRC20Source.sol";
-
-/// @dev Exposes URP's internal program-id constants to the base58 witness test. Adds nothing to
-///      URP's own selector set, which stays pinned exactly.
-contract URPExposed is UniversalRulesPolicy {
-    function systemProgram() external pure returns (bytes32) {
-        return SYSTEM_PROGRAM;
-    }
-
-    function splTokenProgram() external pure returns (bytes32) {
-        return SPL_TOKEN_PROGRAM;
-    }
-
-    function token2022Program() external pure returns (bytes32) {
-        return TOKEN_2022_PROGRAM;
-    }
-
-    function stakeProgram() external pure returns (bytes32) {
-        return STAKE_PROGRAM;
-    }
-
-    function bpfLoaderUpgradeable() external pure returns (bytes32) {
-        return BPF_LOADER_UPGRADEABLE;
-    }
-
-    function addressLookupTable() external pure returns (bytes32) {
-        return ADDRESS_LOOKUP_TABLE;
-    }
-}
 
 /// @dev `PushChainLib` is `internal`; this is the thinnest possible external surface for it.
 contract PushChainLibHarness {
@@ -123,7 +102,6 @@ contract URPSvmTest is BaseTest {
     uint256 internal constant MAX_TOTAL = 1_000_000_000;
     uint256 internal constant MAX_PC = 5 ether;
 
-    URPExposed internal exposed;
     PushChainLibHarness internal lib;
 
     function setUp() public override {
@@ -132,7 +110,6 @@ contract URPSvmTest is BaseTest {
         MockPRC20 asset = new MockPRC20();
         asset.setSourceChainNamespace(CHAIN_SOLANA_DEVNET);
         ASSET = address(asset);
-        exposed = new URPExposed();
         lib = new PushChainLibHarness();
         vm.warp(1_000_000_000);
     }
@@ -467,6 +444,22 @@ contract URPSvmTest is BaseTest {
         assertLe(perAccount, budget, "S18 per listed account");
     }
 
+    /// ⚠️ NEVER-DELETE. C1, Solana half: a Solana rule with no token is refused through the real wallet,
+    /// named, and nothing is granted.
+    function test_svm_MA_ruleWithNoTokenRefusedThroughTheWallet() public {
+        address owner = makeAddr("svmNoTokenOwner");
+        AGW w = newWallet(owner);
+        SvmTerms memory t = _terms();
+        t.assets = new AssetCap[](0);
+        (address agent,) = ecdsaKey("svmNoTokenAgent");
+        uint64 grantNonceBefore = w.grantNonce();
+
+        vm.prank(owner);
+        vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.AssetListOutOfRange.selector, uint256(0)));
+        w.grantRules(canonicalSession(agentConfig(agent), svmInitData(CHAIN_SOLANA_DEVNET, t)));
+        assertEq(w.grantNonce(), grantNonceBefore, "nothing granted");
+    }
+
     function test_svm_MA_creditRevertTouchesOnlyItsToken() public {
         (SvmTerms memory t, address second) = _twoSvmAssets();
         _init(t);
@@ -684,12 +677,12 @@ contract URPSvmTest is BaseTest {
     ///      mandate action however the card is worded.
     function test_svmInit_forbiddenProgramsRefusedInAllowList() public {
         bytes32[8] memory forbidden = [
-            exposed.systemProgram(),
-            exposed.splTokenProgram(),
-            exposed.token2022Program(),
-            exposed.stakeProgram(),
-            exposed.bpfLoaderUpgradeable(),
-            exposed.addressLookupTable(),
+            SYSTEM_PROGRAM,
+            SPL_TOKEN_PROGRAM,
+            TOKEN_2022_PROGRAM,
+            STAKE_PROGRAM,
+            BPF_LOADER_UPGRADEABLE,
+            ADDRESS_LOOKUP_TABLE,
             GATEWAY_PROG,
             CEA
         ];
@@ -1318,12 +1311,12 @@ contract URPSvmTest is BaseTest {
     function test_svm_S15_forbiddenTargets() public {
         _initDefault();
         bytes32[8] memory forbidden = [
-            exposed.systemProgram(),
-            exposed.splTokenProgram(),
-            exposed.token2022Program(),
-            exposed.stakeProgram(),
-            exposed.bpfLoaderUpgradeable(),
-            exposed.addressLookupTable(),
+            SYSTEM_PROGRAM,
+            SPL_TOKEN_PROGRAM,
+            TOKEN_2022_PROGRAM,
+            STAKE_PROGRAM,
+            BPF_LOADER_UPGRADEABLE,
+            ADDRESS_LOOKUP_TABLE,
             GATEWAY_PROG,
             CEA
         ];
@@ -1693,22 +1686,18 @@ contract URPSvmTest is BaseTest {
 
     /// @dev ⚠️ NEVER-DELETE. The hex words in URP are pinned against the base58 ids the Solana
     ///      ecosystem publishes, decoded here by an independent routine. A typo in either fails.
-    function test_svm_forbiddenProgramConstantsMatchBase58() public view {
-        assertEq(exposed.systemProgram(), base58ToBytes32("11111111111111111111111111111111"), "System");
-        assertEq(exposed.splTokenProgram(), base58ToBytes32("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), "SPL Token");
+    function test_svm_forbiddenProgramConstantsMatchBase58() public pure {
+        assertEq(SYSTEM_PROGRAM, base58ToBytes32("11111111111111111111111111111111"), "System");
+        assertEq(SPL_TOKEN_PROGRAM, base58ToBytes32("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"), "SPL Token");
+        assertEq(TOKEN_2022_PROGRAM, base58ToBytes32("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"), "Token-2022");
+        assertEq(STAKE_PROGRAM, base58ToBytes32("Stake11111111111111111111111111111111111111"), "Stake");
         assertEq(
-            exposed.token2022Program(), base58ToBytes32("TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"), "Token-2022"
-        );
-        assertEq(exposed.stakeProgram(), base58ToBytes32("Stake11111111111111111111111111111111111111"), "Stake");
-        assertEq(
-            exposed.bpfLoaderUpgradeable(),
+            BPF_LOADER_UPGRADEABLE,
             base58ToBytes32("BPFLoaderUpgradeab1e11111111111111111111111"),
             "BPF Loader Upgradeable"
         );
         assertEq(
-            exposed.addressLookupTable(),
-            base58ToBytes32("AddressLookupTab1e1111111111111111111111111"),
-            "Address Lookup Table"
+            ADDRESS_LOOKUP_TABLE, base58ToBytes32("AddressLookupTab1e1111111111111111111111111"), "Address Lookup Table"
         );
         // And the decoder itself against a value that is not all-zero: SPL Token's well-known hex.
         assertEq(

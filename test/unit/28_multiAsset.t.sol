@@ -6,10 +6,11 @@ import { UniversalRulesPolicyErrors } from "../../src/libraries/Errors.sol";
 import { BaseTest } from "../Base.t.sol";
 import { AGW } from "../../src/AGW.sol";
 import { IUniversalRulesPolicy } from "../../src/interfaces/IUniversalRulesPolicy.sol";
-import { AllowedCall, AssetCapState, Config, MAX_ASSETS, Multicall } from "../../src/libraries/Types.sol";
+import { AllowedCall, AssetCapState, Config, MAX_ASSETS, Multicall, OwnerIntent } from "../../src/libraries/Types.sol";
 import { ModeLib, ModeCode } from "../../src/libraries/ModeLib.sol";
 import { ExecutionLib } from "../../src/libraries/ExecutionLib.sol";
-import { ConfigId } from "smartsessions/DataTypes.sol";
+import { ConfigId, Session } from "smartsessions/DataTypes.sol";
+import { ISmartSession } from "smartsessions/ISmartSession.sol";
 import { MockPRC20 } from "../mocks/MockUniversalGateway.sol";
 import { MockPRC20Source } from "../mocks/MockPRC20Source.sol";
 
@@ -445,6 +446,94 @@ contract MultiAssetTest is BaseTest {
         bytes32 actionId = keccak256(abi.encodePacked(GATEWAY, SEND_OUTBOUND_SELECTOR));
         bytes32 actionPolicyId = keccak256(abi.encodePacked(rulesId, actionId));
         return ConfigId.wrap(keccak256(abi.encodePacked(address(wallet), actionPolicyId)));
+    }
+
+    // ═══════════════════ C1: every rule lists at least one token ═══════════════════
+
+    /**
+     * ⚠️ NEVER-DELETE. C1: A CROSS-CHAIN RULE MUST LIST AT LEAST ONE TOKEN.
+     *
+     * The gateway picks the destination chain from the request's token alone; the request has no
+     * chain field. A rule with no token therefore pins no chain, and an agent could run its calls on
+     * any chain by naming that chain's token at amount 0. URP refuses the empty list at grant
+     * (`AssetListOutOfRange(0)`); this pins that EVERY grant path reaches that refusal:
+     *   1. `grantRules`;
+     *   2. `grantRulesWithSig`, a relayer presenting the owner's signed intent;
+     *   3. the owner door enabling the session on the engine directly, bypassing `grantRules`.
+     * The revert unwinds everything: the grant nonce and the checkpoint counter do not move.
+     */
+    function test_MA19_ruleWithNoTokenRefusedOnEveryGrantPath() public {
+        (address owner, uint256 ownerPk) = ecdsaKey("noTokenOwner");
+        address relayer = makeAddr("noTokenRelayer");
+        AGW wallet = newWallet(owner);
+        Session memory s =
+            canonicalSession(agentConfig(makeAddr("noTokenAgent")), universalInitData(_config(new AssetCapState[](0))));
+        bytes memory refused =
+            abi.encodeWithSelector(UniversalRulesPolicyErrors.AssetListOutOfRange.selector, uint256(0));
+        uint64 grantNonceBefore = wallet.grantNonce();
+        uint64 checkpointsBefore = wallet.checkpointCount();
+
+        // 1. grantRules
+        vm.prank(owner);
+        vm.expectRevert(refused);
+        wallet.grantRules(s);
+
+        // 2. grantRulesWithSig
+        OwnerIntent memory intent = blankIntent(owner, address(wallet), relayer);
+        intent.sessionHash = keccak256(abi.encode(s));
+        intent.grantNonce = wallet.grantNonce();
+        bytes memory sig = signIntent(ownerPk, intent);
+        vm.prank(relayer);
+        vm.expectRevert(refused);
+        wallet.grantRulesWithSig(s, intent, sig);
+
+        // 3. the owner door, straight to the engine
+        Session[] memory sessions = new Session[](1);
+        sessions[0] = s;
+        bytes memory direct =
+            ExecutionLib.encodeSingle(address(engine), 0, abi.encodeCall(ISmartSession.enableSessions, (sessions)));
+        vm.prank(owner);
+        vm.expectRevert(refused);
+        wallet.execute(ModeCode.unwrap(ModeLib.encodeSimpleSingle()), direct);
+
+        assertEq(wallet.grantNonce(), grantNonceBefore, "no grant nonce consumed");
+        assertEq(wallet.checkpointCount(), checkpointsBefore, "no checkpoint recorded");
+    }
+
+    /**
+     * The SDK's "no tokens" rule, end to end. A user who wants a rule that moves nothing gets one
+     * token, the destination chain's gas token, with `maxPerCall = 0` and `maxTotal = 0`. The token
+     * pins the chain; the zero limits mean the agent can make payload-only calls and never move it.
+     * Through the real wallet and engine: amount 0 passes, amount 1 is refused, and another chain's
+     * token is refused even at amount 0.
+     */
+    function test_MA20_noMovementRuleIsOneZeroLimitToken() public {
+        (address agent,) = ecdsaKey("noMovementAgent");
+        address owner = makeAddr("noMovementOwner");
+        AGW wallet = newWallet(owner);
+        address gasToken = address(new MockPRC20()); // stands in for the chain's gas token PRC20
+
+        AssetCapState[] memory pin = new AssetCapState[](1);
+        pin[0] = AssetCapState({ token: gasToken, maxPerCall: 0, maxTotal: 0, spent: 0 });
+        vm.prank(owner);
+        bytes32 rulesId = wallet.grantRules(canonicalSession(agentConfig(agent), universalInitData(_config(pin))));
+
+        etchCallRecorder(GATEWAY);
+        bytes32 mode = ModeCode.unwrap(ModeLib.encodeSimpleSingle());
+
+        vm.prank(agent);
+        wallet.executeAsAgent(rulesId, mode, _walletEcd(wallet, gasToken, 0));
+        assertEq(urp.getConfig(_walletConfigId(wallet, rulesId), address(wallet)).assets[0].spent, 0, "nothing moved");
+
+        expectUrpGate(
+            abi.encodeWithSelector(UniversalRulesPolicyErrors.AmountExceedsCap.selector, uint256(1), uint256(0))
+        );
+        vm.prank(agent);
+        wallet.executeAsAgent(rulesId, mode, _walletEcd(wallet, gasToken, 1));
+
+        expectUrpGate(abi.encodeWithSelector(UniversalRulesPolicyErrors.AssetNotAllowed.selector, arbUsdc));
+        vm.prank(agent);
+        wallet.executeAsAgent(rulesId, mode, _walletEcd(wallet, arbUsdc, 0));
     }
 
     // ═══════════════════════════════ gas ═══════════════════════════════

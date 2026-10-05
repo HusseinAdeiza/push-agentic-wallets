@@ -18,7 +18,7 @@
 Frozen at grant, per permission, written at initialisation:
 | Field                           | Meaning                                                                                                                                                                                     |
 | ------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| the tokens                      | One to eight PRC20s on Push (`assets`, at most `MAX_ASSETS`), each with its own caps and its own spent counter. No token twice. Every request must name one of them, **even at zero amount**: the token is what pins the destination chain — see §1.5 |
+| the tokens                      | One to eight PRC20s on Push (`assets`, at most `MAX_ASSETS`), each with its own caps and its own spent counter. No token twice. Every request must name one of them, **even at zero amount**: the token is what pins the destination chain — see §1.5. A permission with no token is refused at grant, on every grant path; a permission that should move nothing lists one token (the chain's gas token) with both limits at zero |
 | per-action cap, per token       | The most that one request may bridge in that token. Zero is legal: the token may route a request but never moves (the move-nothing permission) |
 | lifetime cap, per token         | The most that all requests together may bridge in that token. The largest representable number means unlimited; zero means nothing may move |
 | PC-per-action cap               | `maxGasPerCall`: the most native PC one request may carry — it pays the protocol fee and the gas swap, despite the name |

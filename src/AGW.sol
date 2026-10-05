@@ -465,7 +465,7 @@ contract AGW is IAGW, ReentrancyGuardTransient {
      *           and the engine's enable path never calls back into the account.
      *
      *         - TAKES NO MANDATE TYPE. The kind of a rules set is DERIVED, not declared: each action's
-     *           URP policy envelope is `abi.encode(string chain, bytes body)`, and the chain decides
+     *           URP policy envelope is `abi.encode(uint16 version, string chain, bytes body)`, and the chain decides
      *           the rulebook — this chain means a Push-side call (NATIVE), any other means a call
      *           through the gateway (UNIVERSAL). The owner states a chain once, where they were
      *           already stating the terms; nobody states a mode anywhere. Every action must name the
