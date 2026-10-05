@@ -199,6 +199,15 @@ uint256 constant MAX_PINS = 8;
 uint256 constant MAX_ASSETS = 8;
 
 /**
+ * @dev The rules-envelope version URP accepts. Every action policy's `initData` is
+ *      `abi.encode(uint16 version, string chainNamespace, bytes body)`, the same shape in every mode.
+ *      URP reads the version from the FIRST WORD before decoding anything else and refuses any other
+ *      value, so a body layout can change later under a new version without being misread.
+ *      FILE-LEVEL so the SDK, which writes the envelope, can read it.
+ */
+uint16 constant ENVELOPE_VERSION = 1;
+
+/**
  * @notice WIRE TYPE — one token a UNIVERSAL rules set may move, with its own caps.
  * @param token       The PRC20 ON PUSH (e.g. USDC.eth), never the destination chain's address: the
  *                    gateway request carries the PRC20 and routes by it. Its `SOURCE_CHAIN_NAMESPACE()`
@@ -263,12 +272,8 @@ struct UniversalTerms {
 
 /// @param initialized      set once, at initialisation; re-initialisation is refused
 /// @param validUntil       non-zero always (enforced at init); "never" = type(uint48).max, explicit
-/// @param destChainHash    v2 RELIC — slot 1, kept so the struct's layout never moves. Written by
-///                         pre-envelope grants from the SDK's value; NEVER WRITTEN SINCE. The
-///                         chain of every rules set, in both modes, is
-///                         `getMode(id, account).chainHash`. Do not read this field; do not
-///                         resurrect it as an input.
-/// @param expectedCEA      the wallet's destination account, committed at grant
+/// @param expectedCEA      the wallet's destination account, committed at grant. The rules set's
+///                         chain is not stored here: it lives on `getMode(id, account).chainHash`
 /// @param maxGasPerCall    Push-native per-call ceiling on `msg.value`, in PC wei. It pays the protocol
 ///                         fee AND the gas swap, despite the name (renamed from `maxPCPerCall` to
 ///                         match the SDK)
@@ -276,7 +281,6 @@ struct UniversalTerms {
 struct Config {
     bool initialized;
     uint48 validUntil;
-    bytes32 destChainHash;
     address expectedCEA;
     uint256 maxGasPerCall;
     AssetCapState[] assets;
@@ -306,8 +310,7 @@ struct ModeSlot {
     VmFamily vm;
     /// @dev keccak256(bytes(chain)) as declared in the policy envelope. THE single chain record
     ///      for BOTH modes — universal stores the destination chain, native stores this chain's
-    ///      own hash. Zero on entries written before the envelope carried a chain; treat that as
-    ///      "unverified", not as "no chain".
+    ///      own hash. Written at init, never zero on an initialised entry.
     bytes32 chainHash;
 }
 
@@ -383,7 +386,7 @@ struct NativeConfig {
  *
  *         SPLIT EVEN THOUGH ONLY THE UNIVERSAL SIDE FORCES IT. The SDK builds both; one struct
  *         with dead input fields sitting beside one without is precisely the inconsistency that
- *         let `destChainHash` acquire four different conventions in one repository.
+ *         let a since-removed chain field acquire four different conventions in one repository.
  */
 struct NativeTerms {
     uint48 validUntil;

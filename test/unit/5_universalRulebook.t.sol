@@ -100,7 +100,6 @@ contract URPTest is BaseTest {
         cfg = Config({
             initialized: false,
             validUntil: VALID_UNTIL,
-            destChainHash: keccak256("eip155:11155111"),
             expectedCEA: CEA,
             maxGasPerCall: 5 ether,
             assets: oneAsset(ASSET, 100 ether, 1000 ether),
@@ -303,33 +302,31 @@ contract URPTest is BaseTest {
      * `test_upgradeable_storageLayoutIsFrozen` stays green while every live config silently
      * reinterprets.
      *
-     * THIS TEST EXISTS BECAUSE A PROPOSAL WOULD HAVE DONE EXACTLY THAT. When the chain moved out of
-     * `Config` and into the envelope, the obvious tidy-up was to delete the now-unused
-     * `destChainHash` field. Measured consequence: `expectedCEA` packs into slot 0 beside
-     * `initialized` and `validUntil`, collapsing two slots, and **`spent` moves from slot 7 to slot
-     * 5** — so every existing config would read another field's value as its spend counter. The
-     * field stays, unwritten, as a permanent hole. `URP.sol:49`: the layout is load-bearing FOREVER.
+     * Within one deployment the layout is load-bearing: an implementation that moved a member would
+     * make URP read every live config through the wrong slots. Across deployments it is free to
+     * change, because every deployment is fresh. That is why the multi-asset branch could delete the
+     * unused `destChainHash` field (`expectedCEA` now packs into slot 0) and re-lay out the caps: the
+     * change is deliberate, and this test pins the result so the next change is deliberate too.
      *
      * Read from solc's own `storageLayout` output rather than probed with `vm.load`, for the same
      * reason `assertEmptyStorageLayout` is: there is no runtime way to ask a struct where its
      * members live, and a probe would only catch what it happened to look at.
      */
     function test_upgradeable_configStructLayoutIsFrozen() public view {
-        // `destChainHash` at slot 1 is a HOLE, deliberately — see the NatSpec above.
-        // MULTI-ASSET BRANCH: members 4+ were re-laid out on purpose (pre-deployment, fresh product):
-        // the single `asset`/caps/`spent` became `assets`, each entry carrying its own `spent`.
-        string[7] memory universalLabels =
-            ["initialized", "validUntil", "destChainHash", "expectedCEA", "maxGasPerCall", "assets", "allowedCalls"];
-        uint256[7] memory universalSlots = [uint256(0), 0, 1, 2, 3, 4, 5];
+        // MULTI-ASSET BRANCH: re-laid out on purpose (every deployment is fresh). The single
+        // `asset`/caps/`spent` became `assets`, each entry carrying its own `spent`, and the unused
+        // `destChainHash` field is gone, so `expectedCEA` packs into slot 0.
+        string[6] memory universalLabels =
+            ["initialized", "validUntil", "expectedCEA", "maxGasPerCall", "assets", "allowedCalls"];
+        uint256[6] memory universalSlots = [uint256(0), 0, 0, 1, 2, 3];
         // OFFSET AND TYPE ARE PINNED TOO, not just the slot. A retype that keeps every slot number —
         // `uint48 validUntil` to `uint64`, `address expectedCEA` to `bytes32` — changes how the
         // packed bytes of slot 0 are read while leaving the slot column untouched. Slot-only
         // assertions would wave that through.
-        uint256[7] memory universalOffsets = [uint256(0), 1, 0, 0, 0, 0, 0];
-        string[7] memory universalTypes = [
+        uint256[6] memory universalOffsets = [uint256(0), 1, 7, 0, 0, 0];
+        string[6] memory universalTypes = [
             "t_bool",
             "t_uint48",
-            "t_bytes32",
             "t_address",
             "t_uint256",
             // Prefix only: the artifact appends a build-varying numeric id to composite types.
@@ -562,16 +559,16 @@ contract URPTest is BaseTest {
         }
     }
 
-    function _toDyn(string[7] memory a) internal pure returns (string[] memory out) {
-        out = new string[](7);
-        for (uint256 i; i < 7; ++i) {
+    function _toDyn(string[6] memory a) internal pure returns (string[] memory out) {
+        out = new string[](6);
+        for (uint256 i; i < 6; ++i) {
             out[i] = a[i];
         }
     }
 
-    function _toDyn(uint256[7] memory a) internal pure returns (uint256[] memory out) {
-        out = new uint256[](7);
-        for (uint256 i; i < 7; ++i) {
+    function _toDyn(uint256[6] memory a) internal pure returns (uint256[] memory out) {
+        out = new uint256[](6);
+        for (uint256 i; i < 6; ++i) {
             out[i] = a[i];
         }
     }
@@ -638,75 +635,23 @@ contract URPTest is BaseTest {
     }
 
     /**
-     * @dev DECISION 47 — pre-upgrade universal mandates keep working with NO migration.
+     * @dev ⚠️ NEVER-DELETE — the EIGHTEENTH. Added 2026-09-09 (Phase 3b, review §2.1); retargeted on the
+     *      multi-asset branch.
      *
-     *      This is the property the whole append-only storage design exists to deliver, and it is
-     *      the one that would fail silently if the layout had been reordered. A config written
-     *      BEFORE native mode existed has an EMPTY `_mode` slot; `checkAction`'s routing sends an
-     *      empty slot to `_checkUniversal`, which is exactly right.
+     *      THE PROPERTY: A LIVE CONFIG CAN NEVER BE RE-INITIALISED, IN ANY MODE. Re-init as UNIVERSAL
+     *      would reset `spent` to zero; re-init as NATIVE would flip the mode under live universal data.
+     *      Reach is owner-door only (`grantRules` always mints a fresh permission id, and the agent door
+     *      cannot target the engine), so it is owner self-harm, not agent escalation, and it is refused
+     *      anyway.
      *
-     *      SIMULATING A PRE-UPGRADE CONFIG HONESTLY. The current code writes `_mode` on every init,
-     *      so a config created here is NOT pre-upgrade-shaped. The distinguishing feature of a real
-     *      one is precisely that `_mode` was never written — the slot did not exist when the config
-     *      was created. So the mode slot is zeroed with `vm.store` after init, reproducing the exact
-     *      storage state the deployed contract holds today: `_configs` populated, `_mode` empty.
-     *
-     *      That is a state manipulation, not a mock: nothing supplies behaviour to the code under
-     *      test. It only removes a write that the pre-upgrade implementation never made.
-     *
-     *      ⚠️ AMENDED 2026-09-09 (Phase 3b, review §2.1/§4.1). This test previously asserted that
-     *      `getMode` REPORTS a legacy config as uninitialised. That was the symptom of a real bug
-     *      dressed as a property: because the re-init guard read the same empty slot, a pre-upgrade
-     *      config was RE-INITIALISABLE — its `spent` could be reset to zero, or its mode flipped to
-     *      NATIVE, through the owner door. `_modeOf` is now legacy-aware, so the truthful statement
-     *      is TWO separate facts, asserted separately:
-     *        1. the RAW SLOT is still empty — nothing moved, which is the storage claim;
-     *        2. the DERIVED view reports `(true, UNIVERSAL)` — which is what the config actually is.
-     */
-    function test_upgradeable_preUpgradeUniversalConfigStillValidates() public {
-        _initDefault();
-        vm.prank(address(engine));
-        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
-        uint256 spentBefore = _spent();
-
-        bytes32 modeSlot = _modeSlotOf(CID, ACCOUNT);
-        vm.store(address(urp), modeSlot, bytes32(0));
-
-        // 1. the raw slot is empty — the pre-upgrade storage state, unmoved
-        assertEq(vm.load(address(urp), modeSlot), bytes32(0), "the raw _mode slot is empty");
-        // 2. and the derived view tells the truth about what the config IS
-        assertTrue(urp.getMode(CID, ACCOUNT).initialized, "a legacy config reports as initialised");
-        assertEq(uint8(urp.getMode(CID, ACCOUNT).mode), uint8(RulesType.UNIVERSAL), "and reports as UNIVERSAL");
-
-        UniversalRulesPolicy next = new UniversalRulesPolicy();
-        vm.prank(URP_ADMIN_OWNER);
-        ProxyAdmin(_urpAdmin()).upgradeAndCall(ITransparentUpgradeableProxy(address(urp)), address(next), "");
-
-        // Still routes to the universal gauntlet and still meters, with no migration of any kind.
-        vm.prank(address(engine));
-        urp.checkAction(CID, ACCOUNT, GATEWAY, 0, _goodRequest(1 ether));
-
-        assertEq(_spent(), spentBefore + 1 ether, "the pre-upgrade config still meters through gates 1-16");
-        assertEq(vm.load(address(urp), modeSlot), bytes32(0), "and its raw _mode slot is STILL empty");
-        assertTrue(urp.getMode(CID, ACCOUNT).initialized, "and it still reports as initialised");
-    }
-
-    /**
-     * @dev ⚠️ NEVER-DELETE — the EIGHTEENTH. Added 2026-09-09 (Phase 3b, review §2.1).
-     *
-     *      THE TEST THAT WOULD HAVE CAUGHT THE BUG. A pre-upgrade universal config has an empty
-     *      `_mode` slot, and the first native-mode implementation keyed its re-initialisation guard
-     *      on that slot alone. So every config that exists on Donut today was re-initialisable
-     *      through the owner door: re-init UNIVERSAL reset `spent` to zero; re-init NATIVE flipped
-     *      the mode under live universal data.
-     *
-     *      Reach was owner-door only — `grantRules` always mints a fresh permission id, and the
-     *      agent door cannot target the engine — so it was owner self-harm rather than an agent
-     *      escalation. It is fixed anyway: it silently removed a documented invariant from exactly
-     *      the state an upgrade must not weaken.
-     *
-     *      If this test starts passing for the wrong reason, check that `_modeOf` still consults
-     *      `_configs[..].initialized` and not just `_mode`.
+     *      HISTORY. This test was written for a bug in the first native-mode implementation: configs
+     *      written before native mode existed had an empty `_mode` slot, the re-init guard read that slot
+     *      alone, and so every such config was re-initialisable. The fix made `_modeOf` fall back to
+     *      `_configs[..].initialized`, and this test built that legacy shape with `vm.store`. Every
+     *      deployment is now fresh, every init writes `_mode`, and the fallback was deleted as dead
+     *      code; the legacy shape cannot occur. The test keeps its name and its permanence, and now pins
+     *      the guard as it works today — including that init really does write the mode slot, which is
+     *      what makes the fallback unnecessary.
      */
     function test_upgradeable_preUpgradeConfigRefusesReinit() public {
         _initDefault();
@@ -715,15 +660,15 @@ contract URPTest is BaseTest {
         uint256 spentBefore = _spent();
         assertGt(spentBefore, 0, "the counter must have moved, or this test proves nothing");
 
-        // The legacy shape: _configs live, _mode never written.
-        vm.store(address(urp), _modeSlotOf(CID, ACCOUNT), bytes32(0));
+        // Init wrote the mode slot — the guard's one input. Read raw, not through a getter.
+        assertTrue(vm.load(address(urp), _modeSlotOf(CID, ACCOUNT)) != bytes32(0), "init writes the _mode slot");
 
-        // (a) re-init as UNIVERSAL would have RESET `spent`.
+        // (a) re-init as UNIVERSAL would RESET `spent`.
         vm.prank(address(engine));
         vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.AlreadyInitialized.selector, CID));
         urp.initializeWithMultiplexer(ACCOUNT, CID, universalInitData(_defaultConfig()));
 
-        // (b) re-init as NATIVE would have FLIPPED the mode under live universal data.
+        // (b) re-init as NATIVE would FLIP the mode under live universal data.
         NativeConfig memory native;
         native.validUntil = VALID_UNTIL;
         native.target = PROTOCOL;
@@ -734,6 +679,7 @@ contract URPTest is BaseTest {
 
         // Neither attempt touched anything.
         assertEq(_spent(), spentBefore, "spend counter untouched by the refused re-inits");
+        assertEq(uint8(urp.getMode(CID, ACCOUNT).mode), uint8(RulesType.UNIVERSAL), "mode not flipped");
         assertEq(urp.getConfig(CID, ACCOUNT).assets[0].token, ASSET, "and the live config is still readable");
     }
 
@@ -758,12 +704,9 @@ contract URPTest is BaseTest {
     }
 
     /**
-     * getConfig round-trips every field, including the deep-copied allow-list.
-     *
-     * `destChainHash` IS DELIBERATELY NOT ASSERTED HERE ANY MORE. Since 2026-09-17 it is a v2 relic:
-     * the slot is kept so `Config`'s layout never moves, but nothing writes it, and the chain of a
-     * mandate lives on `getMode(...).chainHash` where it has been verified against the asset. The
-     * assertion moved rather than vanished — see the `chainHash` check below.
+     * getConfig round-trips every field, including the deep-copied allow-list. `Config` stores no
+     * chain: the chain of a rules set lives on `getMode(...).chainHash`, where it has been verified
+     * against every listed asset — see the `chainHash` check below.
      */
     function test_getConfig_roundTripsIncludingAllowList() public {
         _initDefault();
@@ -775,7 +718,6 @@ contract URPTest is BaseTest {
             0xafa90c317deacd3d68f330a30f96e4fa7736e35e8d1426b2e1b2c04bce1c2fb7,
             "chain recorded on the mode slot"
         );
-        assertEq(got.destChainHash, bytes32(0), "the destChainHash relic is never written");
 
         assertTrue(got.initialized, "initialized set by init, not by _store");
         assertEq(got.validUntil, VALID_UNTIL, "validUntil");

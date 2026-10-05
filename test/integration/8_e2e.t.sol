@@ -119,7 +119,6 @@ contract E2ETest is BaseTest {
             Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 30 days),
-                destChainHash: keccak256("eip155:1"),
                 expectedCEA: BOB_AGW_CEA,
                 maxGasPerCall: 1 ether,
                 assets: oneAsset(address(pUSDC), HUNDRED_USDC, HUNDRED_USDC),
@@ -546,10 +545,10 @@ contract E2ETest is BaseTest {
         // watching the getter-based version of this test still go green. The raw slot is the only
         // honest instrument.
         //
-        // `_configs` is slot 3. `Config.assets` is the struct's slot 4 (`initialized` and `validUntil`
-        // PACK into slot 0, so field index and slot index differ), and entry 0 of that array starts
-        // at `keccak256(base + 4)`; `AssetCapState.spent` is its fourth full slot, so +3. Pinned by the
-        // struct-layout test in the URP suite.
+        // `_configs` is slot 3. `Config.assets` is the struct's slot 2 (`initialized`, `validUntil` and
+        // `expectedCEA` PACK into slot 0, so field index and slot index differ), and entry 0 of that
+        // array starts at `keccak256(base + 2)`; `AssetCapState.spent` is its fourth full slot, so +3.
+        // Pinned by the struct-layout test in the URP suite.
         bytes32 configsBase = keccak256(
             abi.encode(
                 address(bobAgw), keccak256(abi.encode(address(engine), keccak256(abi.encode(nativeCid, uint256(3)))))
@@ -568,10 +567,10 @@ contract E2ETest is BaseTest {
         assertEq(
             uint256(vm.load(address(urp), _asset0SpentSlot(universalBase))),
             universalSpent,
-            "keccak(base+4)+3 IS Config.assets[0].spent - proven against a slot known to be non-zero"
+            "keccak(base+2)+3 IS Config.assets[0].spent - proven against a slot known to be non-zero"
         );
         assertEq(
-            uint256(vm.load(address(urp), bytes32(uint256(configsBase) + 4))),
+            uint256(vm.load(address(urp), bytes32(uint256(configsBase) + 2))),
             0,
             "the native action created no universal asset list"
         );
@@ -674,6 +673,6 @@ contract E2ETest is BaseTest {
 
     /// @dev Raw slot of `Config.assets[0].spent` for a config whose struct starts at `base`.
     function _asset0SpentSlot(bytes32 base) internal pure returns (bytes32) {
-        return bytes32(uint256(keccak256(abi.encode(uint256(base) + 4))) + 3);
+        return bytes32(uint256(keccak256(abi.encode(uint256(base) + 2))) + 3);
     }
 }

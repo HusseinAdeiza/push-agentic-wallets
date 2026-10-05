@@ -12,7 +12,7 @@ become multi-token.
 
 | Base commit | Status | Tests | URP margin | Mutants |
 |---|---|---|---|---|
-| `e704d5b` | Not deployed | 592 pass · 0 fail | 223 B | 12 of 12 killed |
+| `e704d5b` | Not deployed | 596 pass · 0 fail | 250 B | 12 of 12 killed |
 
 **On this page:** [1 · What was built](#1--what-was-built) · [Verification](#verification) ·
 [2 · Deviations from the v2 docs](#2--where-this-deviates-from-the-v2-docs) ·
@@ -25,7 +25,7 @@ become multi-token.
 
 ### The rule shape
 
-The terms the owner passes in `grantRules`. The envelope is unchanged: `abi.encode(string chainNamespace, bytes body)`.
+The terms the owner passes in `grantRules`. The envelope is `abi.encode(uint16 version, string chainNamespace, bytes body)`, version 1 (see "Envelope version and cleanup").
 
 ```solidity
 uint256 constant MAX_ASSETS = 8;
@@ -129,21 +129,36 @@ After every gate passes, only the matched token's counter moves. The event is
   means leaving the input unpinned and those token accounts unlisted, protected only by the output and price
   pins. Multi-asset on Solana works best when different tokens are used by different instructions.
 
+### Envelope version and cleanup
+
+- **Every rule's envelope carries a version:** `abi.encode(uint16 version, string chainNamespace, bytes body)`, with
+  `ENVELOPE_VERSION = 1` in `Types.sol`. URP reads the version from the first word before decoding anything else
+  and refuses any other value with `UnsupportedEnvelopeVersion(firstWord)`. Almost every old or malformed blob
+  is now refused named: a pre-version two-field envelope reports 64, a bare struct 32.
+- **The wallet decodes the same three fields but judges only the chain.** Through a grant, an unsupported
+  version reaches the owner named from URP; a pre-version two-field envelope panics in the wallet's decode
+  (`0x41`) before URP sees it. Both fail closed.
+- **Upgrade-only code removed** (every deployment is fresh): the unused `Config.destChainHash` field (so
+  `expectedCEA` packs into slot 0 and each cross-chain rule uses one fewer storage slot), and the legacy mode
+  fallback in `_modeOf`. `getMode` now returns the stored record directly.
+- `version()` is `3.1.0`.
+
 ### What did not change
 
 - `AGW`, `AGWFactory`, `AgentValidator` and SmartSession are untouched. The wallet passes the terms through
   as bytes.
 - The native (Push-side) rulebook.
-- The envelope shape `(string chainNamespace, bytes body)`. There is no version field yet.
 
 ### Files
 
 | File | Change |
 |---|---|
-| `src/libraries/Types.sol` | `MAX_ASSETS`, `AssetCap`, `AssetCapState`; new `UniversalTerms`, `Config`, `SvmTerms`, `SvmConfig` |
+| `src/libraries/Types.sol` | `MAX_ASSETS`, `ENVELOPE_VERSION`, `AssetCap`, `AssetCapState`; new `UniversalTerms`, `Config` (no `destChainHash`), `SvmTerms`, `SvmConfig` |
+| `src/AGW.sol` | Reads the chain from the versioned envelope |
 | `src/policies/UniversalRulesPolicy.sol` | Grant-time list checks, gates 5–8 in both families, `assertSpent`, `creditRevert`, storage copy; `MAX_CEA_ACCOUNTS` 8 → 16 |
 | `src/interfaces/IUniversalRulesPolicy.sol` | Events carry `token`; new `assertSpent` and `creditRevert` signatures |
-| `src/libraries/Errors.sol` | Added `AssetListOutOfRange`, `DuplicateAsset`, `AssetNotAllowed`, `AssetSpentMismatch`, `SpentLengthMismatch`; removed `AssetMismatch` |
+| `src/libraries/Errors.sol` | Added `AssetListOutOfRange`, `DuplicateAsset`, `AssetNotAllowed`, `AssetSpentMismatch`, `SpentLengthMismatch`, `UnsupportedEnvelopeVersion`; removed `AssetMismatch` |
+| `test/unit/14_rulesEnvelope.t.sol` | Rewritten for the version gate: 22 tests, two through the real wallet |
 | `test/unit/28_multiAsset.t.sol` | New suite, 18 tests |
 | `test/unit/9_svmRulebook.t.sol` | 7 new Solana tests: multi-asset, the 16-account list, the one-input limit, S18 gas |
 | 15 other test files and `test/Base.t.sol` | One-token lists in place of the old fields; updated expected errors |
@@ -192,7 +207,10 @@ Existing tests whose expectations changed. Every one still names its exact error
 | Spend assertions (`test_U16_*`, `test_W10_*`, `test_svm_assertSpentReadsTheSvmCounter`) | `SpentMismatch` | `AssetSpentMismatch(token, …)` |
 | `test_U03_gate5_AssetMismatch` | `AssetMismatch` | `AssetNotAllowed` (name kept) |
 | The frozen-layout test | Old layout | New `Config`, `SvmConfig`, `AssetCapState` layouts pinned |
-| The raw-slot test in `8_e2e` | Old slot | New slot of `assets[0].spent` |
+| The raw-slot test in `8_e2e` | Old slot | New slot of `assets[0].spent` (now slot 2 of `Config`) |
+| Envelope suite (`14_rulesEnvelope`) | Old shapes named `EmptyChain` or unnamed | Named `UnsupportedEnvelopeVersion(firstWord)`; only sub-word blobs and wrong-body envelopes stay unnamed |
+| `test_upgradeable_preUpgradeConfigRefusesReinit` (never-delete) | Built a legacy config with `vm.store` | Same name, still never-delete: pins that a live config can't be re-initialised in either mode and that init writes the mode slot |
+| Two upgrade-only tests | Pinned the legacy mode fallback | Deleted with the fallback (neither was never-delete) |
 
 ---
 
@@ -200,7 +218,7 @@ Existing tests whose expectations changed. Every one still names its exact error
 
 | What | Result |
 |---|---|
-| `make test` | `execute()` pin OK; **592 passed, 0 failed**, 2 skipped (the live-deployment tests, unchanged) |
+| `make test` | `execute()` pin OK; **596 passed, 0 failed**, 2 skipped (the live-deployment tests, unchanged) |
 | `forge fmt --check` | Clean |
 | Compiler and lint warnings | 4 fewer than the base commit, none new |
 | Gate-5 scan cost | 2,402 gas per listed token ahead of the match, cold. With 8 tokens, matching the last one costs about 16.8k more than the first; an unlisted token scans all 8 (about 19k) before it is refused. |
@@ -213,9 +231,10 @@ Existing tests whose expectations changed. Every one still names its exact error
 | | Runtime size | Share of the limit | Bytes left |
 |---|---|---|---|
 | Before | 23,673 B | 96.33% | 903 B |
-| This branch | 24,353 B | 99.09% | 223 B |
+| Multi-asset | 24,353 B | 99.09% | 223 B |
+| This branch (multi-asset + envelope version + cleanup) | 24,326 B | 98.98% | 250 B |
 
-AGW, the factory, the validator and the engine are unchanged.
+AGW is 16,564 B (8,012 B left) after reading the versioned envelope; the factory, the validator and the engine are unchanged.
 
 ### Mutation results
 
@@ -277,8 +296,9 @@ Questions that need an answer before this could ship.
   can still create separate rules. Which wins? The contract allows duplicates either way.
 - **Q6 · SDK `Spent` type** (§3.b) still has one `amountSpent` for cross-chain rules. It needs one entry per
   token, in list order.
-- **Q7 · Envelope version** (item 5) is not in this branch. Shape `(uint16 version, string chainNamespace,
-  bytes body)`, version first, anything but 1 refused at grant? Mind the 223-byte margin.
+- **Q7 · Envelope version. Resolved:** built as `(uint16 version, string chainNamespace, bytes body)`, version
+  1, read from the first word; anything else is refused `UnsupportedEnvelopeVersion`. It fit after removing
+  upgrade-only code (250 bytes left).
 - **Q8 · No combined limit.** Limits are per token; "1500 dollars across USDC and USDT" can't be expressed
   without an oracle. Acceptable?
 - **Q9 · Protocols are shared across tokens.** One rule can't say "USDC only to Aave, USDT only to Fluid";
@@ -324,7 +344,7 @@ Questions that need an answer before this could ship.
 
 | Severity | Risk |
 |---|---|
-| High | **Size.** URP has 223 bytes left. Almost any further URP feature (the envelope version, more Solana checks) will not fit without a plan. Options: delete code kept only for upgrades from older versions (the `destChainHash` relic, the legacy mode fallback); a lower optimizer setting for URP alone; or splitting URP, which collides with the rule that URP's agent-call check makes no external calls. |
+| High | **Size.** URP has 250 bytes left, with the envelope version in and the upgrade-only code removed. The next lever is a lower optimizer setting for URP alone (measured at about 630 bytes); splitting URP collides with the rule that URP's agent-call check makes no external calls. |
 | High | **The marketplace breaks** until the core repo updates its copy of the struct and its job check (Q3). |
 | Medium | **Right chain, wrong token** is not caught on-chain. If the SDK resolves pUSDC where the user meant pUSDT, the grant succeeds. |
 | Medium | **Shared allow-list.** Any listed token can be sent to any allowed protocol. |
@@ -341,7 +361,7 @@ spend up to `maxGasPerCall` in fees, bounded only by the wallet's PC balance.
 
 - The SDK changes: per-token `Spent`, the `assertSpent` array, and encoding `assets`.
 - The marketplace changes (core repo).
-- The envelope version (item 5) and `ref` on `grantRules` (item 3).
+- `ref` on `grantRules` (item 3).
 - A deployment.
 
 ### Not verified

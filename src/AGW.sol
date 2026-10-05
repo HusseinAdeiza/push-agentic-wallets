@@ -663,16 +663,17 @@ contract AGW is IAGW, ReentrancyGuardTransient {
      *
      *      CALLER MUST HAVE RUN `_requirePolicyShape` FIRST.
      *
-     *      Same decoder as URP's, deliberately (`abi.decode(initData, (string, bytes))`): two
-     *      different readers of one security-relevant field is the drift this design exists to
-     *      prevent. A malformed envelope reverts here, unnamed, and fails closed.
+     *      Same decoder as URP's, deliberately (`abi.decode(initData, (uint16, string, bytes))`):
+     *      two different readers of one security-relevant field is the drift this design exists to
+     *      prevent. A malformed envelope reverts here, unnamed, and fails closed. The version is
+     *      URP's to judge: it refuses anything but `ENVELOPE_VERSION` at init, inside this grant.
      *
      * @param  a          The action to read.
      * @return chain      The declared CAIP-2 string, e.g. `"eip155:11155111"`.
      * @return chainHash  Its keccak256, the value everything downstream compares.
      */
     function _chainNamespaceOf(ActionData calldata a) internal pure returns (string memory chain, bytes32 chainHash) {
-        (chain,) = abi.decode(a.actionPolicies[0].initData, (string, bytes));
+        (, chain,) = abi.decode(a.actionPolicies[0].initData, (uint16, string, bytes));
         if (bytes(chain).length == 0) revert AGWErrors.EmptyChain();
         chainHash = keccak256(bytes(chain));
     }

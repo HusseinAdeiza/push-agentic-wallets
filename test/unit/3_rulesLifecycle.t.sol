@@ -72,7 +72,6 @@ contract PushAgentWalletLifecycleTest is BaseTest {
             Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 365 days),
-                destChainHash: keccak256("eip155:11155111"),
                 expectedCEA: _addr("cea"),
                 maxGasPerCall: 5 ether,
                 assets: oneAsset(PRC20, 100 ether, 1000 ether),
@@ -390,7 +389,6 @@ contract PushAgentWalletLifecycleTest is BaseTest {
         Config memory bad = Config({
             initialized: false,
             validUntil: uint48(block.timestamp + 1 days),
-            destChainHash: bytes32(0),
             expectedCEA: _addr("cea"),
             maxGasPerCall: 1,
             assets: oneAsset(address(0), 1, 1), // URP's own guard rejects this

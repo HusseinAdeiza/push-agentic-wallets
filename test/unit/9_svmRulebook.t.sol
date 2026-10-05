@@ -533,7 +533,6 @@ contract URPSvmTest is BaseTest {
         Config memory cfg = Config({
             initialized: false,
             validUntil: VALID_UNTIL,
-            destChainHash: bytes32(0),
             expectedCEA: makeAddr("cea"),
             maxGasPerCall: 1,
             assets: oneAsset(address(sepoliaAsset), 1, 1),

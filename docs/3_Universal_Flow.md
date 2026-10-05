@@ -120,7 +120,7 @@ actions: [ EXACTLY ONE — the UNIVERSAL shape ]
   actionTarget           = UniversalGatewayPC
   actionTargetSelector   = sendUniversalTxOutbound.selector
   actionPolicies: [ URP AND ONLY URP ]
-    initData = (chainNamespace = "eip155:11155111", body = ↓)   ← THE CHAIN. Not Push ⇒ UNIVERSAL; eip155: ⇒ EVM rulebook.
+    initData = (version = 1, chainNamespace = "eip155:11155111", body = ↓)   ← THE CHAIN. Not Push ⇒ UNIVERSAL; eip155: ⇒ EVM rulebook.
       validUntil        = now + 60 min      ← THE EXPIRY LIVES INSIDE URP
       expectedCEA       = 0xbobagwcea       ← DERIVED at grant, committed forever
       assets            = [ { token: PRC20_USDC, maxPerCall: 100e6, maxTotal: 100e6 } ]

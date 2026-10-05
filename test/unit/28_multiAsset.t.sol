@@ -76,7 +76,6 @@ contract MultiAssetTest is BaseTest {
         return Config({
             initialized: false,
             validUntil: VALID_UNTIL,
-            destChainHash: bytes32(0),
             expectedCEA: cea,
             maxGasPerCall: 5 ether,
             assets: assets,

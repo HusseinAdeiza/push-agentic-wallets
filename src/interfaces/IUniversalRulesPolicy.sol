@@ -97,8 +97,7 @@ interface IUniversalRulesPolicy is IActionPolicy {
     /// @notice The mode record. NEVER REVERTS — the documented first call for any integrator that
     ///         does not already know a rules set's mode. An empty slot returns
     ///         `(initialized: false, mode: UNIVERSAL, vm: EVM, chainHash: 0)`, where the mode and vm
-    ///         values are meaningless. A `chainHash` of zero on an INITIALISED entry means the config predates
-    ///         the envelope carrying a chain — unverified, not "no chain".
+    ///         values are meaningless. An initialised entry always carries its chain.
     function getMode(ConfigId id, address account) external view returns (ModeSlot memory);
 
     /// @notice The hash this URP derives NATIVE from: `keccak256("eip155:" ‖ decimal(block.chainid))`.

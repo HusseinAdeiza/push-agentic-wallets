@@ -221,7 +221,6 @@ contract ConstantMirrorsTest is BaseTest {
             Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 1 days),
-                destChainHash: bytes32(0),
                 expectedCEA: makeAddr("cea"),
                 maxGasPerCall: 0,
                 assets: oneAsset(address(new MockPRC20()), 1 ether, 1 ether),

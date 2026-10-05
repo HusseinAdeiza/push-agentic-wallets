@@ -27,6 +27,7 @@ import {
     AssetCap,
     AssetCapState,
     Config,
+    ENVELOPE_VERSION,
     Multicall,
     MULTICALL_SELECTOR,
     NativeConfig,
@@ -403,7 +404,8 @@ abstract contract BaseTest is Test {
     string internal constant CHAIN_SEPOLIA = "eip155:11155111";
 
     /**
-     * @notice Wrap an encoded body in URP's `(string chain, bytes body)` envelope.
+     * @notice Wrap an encoded body in URP's `(uint16 version, string chain, bytes body)` envelope, at
+     *         the current `ENVELOPE_VERSION`.
      *
      * @dev    SHARED HELPER — use this everywhere a policy `initData` is built. The envelope shape
      *         is IDENTICAL for both modes; the chain string alone decides which rulebook applies,
@@ -414,7 +416,7 @@ abstract contract BaseTest is Test {
      *         NATIVE config passes this chain's own identifier; anything else is UNIVERSAL.
      */
     function envelope(string memory chain, bytes memory body) internal pure returns (bytes memory) {
-        return abi.encode(chain, body);
+        return abi.encode(ENVELOPE_VERSION, chain, body);
     }
 
     /**
@@ -430,8 +432,8 @@ abstract contract BaseTest is Test {
     }
 
     /// @dev The universal case, which is most of them. Takes the storage-shaped `Config` the tests
-    ///      already build and narrows it to the wire type — the fields URP owns (`initialized`,
-    ///      `spent`, and the `destChainHash` relic) are dropped here rather than at every call site.
+    ///      already build and narrows it to the wire type — the fields URP owns (`initialized` and
+    ///      each asset's `spent`) are dropped here rather than at every call site.
     function universalInitData(Config memory cfg) internal pure returns (bytes memory) {
         return universalInitData(CHAIN_SEPOLIA, cfg);
     }

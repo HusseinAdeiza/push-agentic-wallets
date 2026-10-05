@@ -20,6 +20,7 @@ import {
     AssetCapState,
     Config,
     MAX_ASSETS,
+    ENVELOPE_VERSION,
     MAX_PINS,
     ModeSlot,
     Multicall,
@@ -257,14 +258,10 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
     }
 
     /**
-     * @dev The EFFECTIVE mode of a config — legacy-aware. A config written before native mode existed
-     *      has an empty `_mode` slot but an initialised `_configs` entry, and it IS a universal
-     *      config. Every mode-sensitive entry point that is not `checkAction` reads through this, so a
-     *      pre-upgrade rules set is protected against re-initialisation and reported correctly by the
-     *      getters, with no migration. `checkAction` keeps its direct routing: an empty `_mode` slot
-     *      already falls through to `_checkUniversal`, which is the same answer one SLOAD cheaper.
+     * @dev The mode of a config, from its `ModeSlot`, which every init writes. Read by every
+     *      mode-sensitive entry point that is not `checkAction`.
      *
-     * @return initialized  true if either rulebook has been written for this config
+     * @return initialized  true once any rulebook has been written for this config
      * @return mode         the rulebook; meaningless when `initialized` is false
      */
     function _modeOf(ConfigId id, address mux, address account)
@@ -273,14 +270,11 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         returns (bool initialized, RulesType mode)
     {
         ModeSlot storage slot = _mode[id][mux][account];
-        if (slot.initialized) return (true, slot.mode);
-        if (_configs[id][mux][account].initialized) return (true, RulesType.UNIVERSAL);
-        return (false, RulesType.UNIVERSAL);
+        return (slot.initialized, slot.mode);
     }
 
-    /// @dev The family of a UNIVERSAL config. Reads the packed byte raw: a pre-family slot reads 0 =
-    ///      EVM, which is what every such config is. Meaningless for NATIVE and for empty slots;
-    ///      callers check the mode first.
+    /// @dev The family of a UNIVERSAL config. Meaningless for NATIVE and for empty slots; callers check
+    ///      the mode first.
     function _vmOf(ConfigId id, address mux, address account) internal view returns (VmFamily) {
         return _mode[id][mux][account].vm;
     }
@@ -311,35 +305,43 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
      *         - Writes the config, sets the initialised flag, and emits `RulesConfigured` and
      *           `PolicySet`.
      *
-     *         - THE ENVELOPE. `initData` is `abi.encode(string chain, bytes body)` — IDENTICAL IN
-     *           SHAPE FOR BOTH MODES, which is what lets the leading field be read before the mode
-     *           is known. Nobody declares the mode: URP derives it from the chain with
+     *         - THE ENVELOPE. `initData` is `abi.encode(uint16 version, string chain, bytes body)` —
+     *           IDENTICAL IN SHAPE FOR EVERY MODE, which is what lets the chain be read before the
+     *           mode is known. Nobody declares the mode: URP derives it from the chain with
      *           `PushChainLib.deriveMode`, and the wallet derived the same value from the same bytes
      *           at grant. There is no mode byte and therefore no `InvalidPolicyMode`.
+     *         - THE VERSION is read from the first word BEFORE anything else is decoded, and anything
+     *           but `ENVELOPE_VERSION` is refused `UnsupportedEnvelopeVersion`. So a body layout can
+     *           change later under a new version, and almost every malformed or pre-version blob is
+     *           refused NAMED: a two-field `(string, bytes)` envelope reports version 64 (its string
+     *           offset), a bare struct 32, a zeroed blob 0. Blobs shorter than one word, and a
+     *           version-1 envelope whose body is the wrong `Terms` type, revert unnamed. Nothing
+     *           mis-decodes into a live config — measured, one test per shape.
      *         - Re-initialisation is refused ACROSS MODES, and the guard runs BEFORE the decode, so
      *           a malformed blob aimed at a live config still gets a named `AlreadyInitialized`.
-     *         - MALFORMED ENVELOPES FAIL CLOSED, several of them NAMED. A v2 `(uint8 0, bytes)`
-     *           wrapper and any bare struct decode to an EMPTY chain and revert `EmptyChain()`; a
-     *           `(uint8, bytes32, bytes)` header and `(uint8 >= 2, bytes)` revert unnamed. Nothing
-     *           mis-decodes into a live config — measured, one test per shape.
      *
      * @param  account   The wallet this config belongs to.
      * @param  configId  Engine-derived id binding the account and the permission.
-     * @param  initData  `abi.encode(string chain, bytes body)`, body being `abi.encode(UniversalTerms)`
-     *                   or `abi.encode(NativeTerms)` according to the DERIVED mode.
+     * @param  initData  `abi.encode(uint16 version, string chain, bytes body)`, body being
+     *                   `abi.encode(UniversalTerms)`, `abi.encode(SvmTerms)` or `abi.encode(NativeTerms)`
+     *                   according to the DERIVED mode and family.
      */
     function initializeWithMultiplexer(address account, ConfigId configId, bytes calldata initData) external {
         ModeSlot storage slot = _mode[configId][msg.sender][account];
 
-        // Legacy-aware: a pre-upgrade universal config has an empty `_mode` slot but MUST still refuse
-        // re-initialisation — otherwise the owner door could reset its spend counter or flip its mode.
-        (bool already,) = _modeOf(configId, msg.sender, account);
-        if (already) revert UniversalRulesPolicyErrors.AlreadyInitialized(configId);
+        // Re-initialisation would let the owner door reset a spend counter or flip a mode.
+        if (slot.initialized) revert UniversalRulesPolicyErrors.AlreadyInitialized(configId);
+
+        // THE VERSION, from the first word, before anything else is decoded.
+        uint256 envelopeVersion = uint256(bytes32(initData[0:32]));
+        if (envelopeVersion != ENVELOPE_VERSION) {
+            revert UniversalRulesPolicyErrors.UnsupportedEnvelopeVersion(envelopeVersion);
+        }
 
         // THE ENVELOPE, decoded exactly as the wallet decoded it at grant — same expression, same
         // bytes. That identity is the whole consistency argument: there is no second author of the
         // discriminator, so there is nothing for the two contracts to disagree about.
-        (string memory chainNamespace, bytes memory body) = abi.decode(initData, (string, bytes));
+        (, string memory chainNamespace, bytes memory body) = abi.decode(initData, (uint16, string, bytes));
         if (bytes(chainNamespace).length == 0) revert UniversalRulesPolicyErrors.EmptyChain();
 
         bytes32 chainHash = keccak256(bytes(chainNamespace));
@@ -806,9 +808,6 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
         // `NotInitialized` — fail-closed either way. The `initialized &&` conjunction is what makes
         // that safe: `RulesType.UNIVERSAL` is the zero value, so testing `mode` alone could not
         // tell an empty slot from a real universal one.
-        //
-        // This is also what lets pre-upgrade universal rules sets keep working with no migration:
-        // their `_mode` slot is empty, so they route to `_checkUniversal`, which is correct.
         ModeSlot storage slot = _mode[id][msg.sender][account];
         if (slot.initialized) {
             if (slot.mode == RulesType.NATIVE) return _checkNative(id, account, target, value, data);
@@ -1631,28 +1630,14 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
      *         the mode value is MEANINGLESS when `initialized` is false, because `UNIVERSAL` is the
      *         enum's zero value. Read `initialized` first, always.
      *
-     *         `chainHash` IS READ RAW, not through `_modeOf`. A pre-envelope config has a populated
-     *         `_configs` entry and an empty `_mode` slot: `_modeOf` correctly reports it as an
-     *         initialised UNIVERSAL rules set, but no chain was ever recorded for it, so the zero it
-     *         returns here is the honest answer — "unverified", not "chain zero". Deriving a chain
-     *         for such a config would be inventing one.
-     *
-     *         THE TWO FIELDS ANSWER DIFFERENT QUESTIONS, deliberately: `initialized`/`mode` is "is
-     *         there a rulebook, and which one" — legacy-aware, so pre-envelope configs still answer;
-     *         `chainHash` is "was a chain declared and verified" — zero means no.
-     *
-     *         AND FOR SUCH A CONFIG, DO NOT GO LOOKING IN `getConfig(...).destChainHash` INSTEAD. It
-     *         may hold a value the SDK wrote before the envelope existed, under any of the four
-     *         conventions that field accumulated, and NOTHING EVER VERIFIED IT. A zero here is more
-     *         truthful than a number there.
+     *         `chainHash` is the rules set's chain, recorded at init (and, for a universal rules set,
+     *         verified against every listed asset). It is THE chain record; there is no other.
      * @param  id       Config id identifying the rules set.
      * @param  account  The wallet the rules set belongs to.
      * @return The stored mode record.
      */
     function getMode(ConfigId id, address account) external view returns (ModeSlot memory) {
-        (bool init, RulesType mode) = _modeOf(id, SESSION_ENGINE, account);
-        ModeSlot storage slot = _mode[id][SESSION_ENGINE][account];
-        return ModeSlot({ initialized: init, mode: mode, vm: slot.vm, chainHash: slot.chainHash });
+        return _mode[id][SESSION_ENGINE][account];
     }
 
     /**
@@ -1677,7 +1662,7 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
      *         BUMP THIS IN THE SAME COMMIT AS ANY LOGIC CHANGE.
      */
     function version() external pure returns (string memory) {
-        return "3.0.0";
+        return "3.1.0";
     }
 
     /**
@@ -1761,10 +1746,8 @@ contract UniversalRulesPolicy is IUniversalRulesPolicy, Initializable {
      *      (see the layout note on `__gap`).
      *
      *      - Forces every asset's `spent` to zero. It is not a wire field at all — URP owns it.
-     *      - DOES NOT WRITE `destChainHash`. That slot is a v2 relic, kept only so the layout never
-     *        moves; the chain of every rules set now lives on `ModeSlot.chainHash`, where it has been
-     *        verified against every listed asset. Writing it here would recreate the second source of truth
-     *        this change exists to remove.
+     *      - Stores no chain: the chain of every rules set lives on `ModeSlot.chainHash`, where it has
+     *        been verified against every listed asset.
      *      - Clears and repopulates the allow-list.
      *      - Does not set `initialized`; the caller does, immediately after this returns.
      *

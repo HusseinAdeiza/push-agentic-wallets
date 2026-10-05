@@ -66,7 +66,6 @@ contract URPTeethTest is BaseTest {
         cfg = Config({
             initialized: false,
             validUntil: VALID_UNTIL,
-            destChainHash: bytes32(0),
             expectedCEA: CEA,
             maxGasPerCall: 5 ether,
             assets: oneAsset(asset, 100e6, 1000e6),

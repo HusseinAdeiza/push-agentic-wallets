@@ -121,7 +121,6 @@ contract CheckpointsTest is BaseTest {
             Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 365 days),
-                destChainHash: bytes32(0),
                 expectedCEA: cea,
                 maxGasPerCall: 5 ether,
                 assets: oneAsset(asset, 100 ether, 1000 ether),

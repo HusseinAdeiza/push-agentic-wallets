@@ -50,7 +50,6 @@ contract ExternalAgentViaUEATest is BaseTest {
             Config({
                 initialized: false,
                 validUntil: uint48(block.timestamp + 30 days),
-                destChainHash: bytes32(0),
                 expectedCEA: cea,
                 maxGasPerCall: 1 ether,
                 assets: oneAsset(asset, 100 ether, 1000 ether),

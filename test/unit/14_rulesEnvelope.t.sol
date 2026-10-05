@@ -10,6 +10,8 @@ import { ConfigId } from "smartsessions/DataTypes.sol";
 import { AllowedCall, Config, ModeSlot, NativeConfig, RulesType } from "../../src/libraries/Types.sol";
 
 import { MockPRC20Source } from "../mocks/MockPRC20Source.sol";
+import { AGW } from "../../src/AGW.sol";
+import { stdError } from "forge-std/StdError.sol";
 
 /**
  * @title  URP — every shape that can reach the envelope decoder.
@@ -18,19 +20,16 @@ import { MockPRC20Source } from "../mocks/MockPRC20Source.sol";
  *         CONFIG. Every malformed, legacy or wrong-mode blob ends in a revert, and the ones that can
  *         be named ARE named.
  *
- *         This matters more than it looks. The envelope is `abi.encode(string chain, bytes body)`
- *         and the ABI decoder is lenient about offsets — it will accept an offset of 1 and read a
- *         length at an unaligned position. A v2 `(uint8 1, bytes)` wrapper therefore decodes to a
- *         256-byte "chain" made of whatever followed it in memory. That is not exploitable — only
- *         the exact bytes of this chain's identifier hash to NATIVE — but it is exactly the kind of
- *         thing that is easy to assume away and expensive to be wrong about, so each case is
- *         measured rather than reasoned.
+ *         The envelope is `abi.encode(uint16 version, string chain, bytes body)`. URP reads the
+ *         version from the FIRST WORD before decoding anything else, so almost every malformed,
+ *         legacy or pre-version blob is refused NAMED as `UnsupportedEnvelopeVersion(firstWord)`.
+ *         What remains unnamed: blobs shorter than one word, and a version-1 envelope whose body is
+ *         the wrong `Terms` type for the derived mode. Each case is measured rather than reasoned.
  *
- * @dev    SEVERAL BARE `vm.expectRevert()` CALLS LIVE HERE, each with its own justification. They are
+ * @dev    A FEW BARE `vm.expectRevert()` CALLS LIVE HERE, each with its own justification. They are
  *         permitted under `CLAUDE.md` standing test rule 1 only because these reverts genuinely
- *         carry no data: the ABI decoder fails without a selector, and naming the failures would
- *         require heuristically decoding an ambiguous blob to guess what the caller meant — which is
- *         strictly worse than failing closed. Where a named error IS available, it is asserted.
+ *         carry no data: a calldata slice or the ABI decoder fails without a selector. Where a named
+ *         error IS available, it is asserted.
  */
 contract URPEnvelopeTest is BaseTest {
     address internal ACCOUNT;
@@ -102,89 +101,85 @@ contract URPEnvelopeTest is BaseTest {
         urp.initializeWithMultiplexer(ACCOUNT, CID, envelope("", abi.encode(_terms(_universalCfg()))));
     }
 
-    /**
-     * A v2 `(uint8 0, bytes)` wrapper — the shape a stale SDK would send for a universal mandate.
-     *
-     * MEASURED, and better than expected: word 0 is `0`, read as the string's offset; the length is
-     * then read at position 0, which is that same zero. So it decodes to an EMPTY chain and gets the
-     * NAMED `EmptyChain()` rather than an unnamed decoder failure. Two of the three legacy shapes
-     * land here, which makes this exception narrower than the one it replaces.
-     */
-    function test_Envelope_v2UniversalWrapperIsNamedEmptyChain() public {
-        bytes memory legacy = abi.encode(uint8(0), abi.encode(_universalCfg()));
-
+    /// @dev Expect `UnsupportedEnvelopeVersion(version)` for `initData`, aimed at an empty config.
+    function _expectVersionRefused(bytes memory initData, uint256 version) internal {
         vm.prank(address(engine));
-        vm.expectRevert(UniversalRulesPolicyErrors.EmptyChain.selector);
-        urp.initializeWithMultiplexer(ACCOUNT, CID, legacy);
+        vm.expectRevert(abi.encodeWithSelector(UniversalRulesPolicyErrors.UnsupportedEnvelopeVersion.selector, version));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, initData);
     }
 
     /**
-     * ⚠️ THE NARROWED THIRD EXCEPTION. A bare `abi.encode(Config)` — no envelope at all.
-     *
-     * Same mechanism as the v2 wrapper above: the struct's head is an offset of 0x20, and the word
-     * there is `initialized` — false, so zero — which reads as a zero-length string. NAMED.
-     *
-     * The property under test is REVERTS-NOT-MIS-DECODES; that it can now be named is a bonus this
-     * change bought, and `CLAUDE.md` test rule 1 was updated to say so.
+     * ⚠️ THE VERSION GATE. URP reads the version from the FIRST WORD before decoding anything else,
+     * and refuses every value but `ENVELOPE_VERSION`. Versions 0 and 2 of a well-formed envelope are
+     * refused named.
      */
-    function test_Envelope_bareUniversalStructIsNamedEmptyChain() public {
-        vm.prank(address(engine));
-        vm.expectRevert(UniversalRulesPolicyErrors.EmptyChain.selector);
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(_universalCfg()));
+    function test_Envelope_onlyVersionOneIsAccepted() public {
+        bytes memory body = abi.encode(_terms(_universalCfg()));
+        _expectVersionRefused(abi.encode(uint16(0), CHAIN_SEPOLIA, body), 0);
+        _expectVersionRefused(abi.encode(uint16(2), CHAIN_SEPOLIA, body), 2);
+        _init(abi.encode(uint16(1), CHAIN_SEPOLIA, body));
+        assertTrue(urp.getMode(CID, ACCOUNT).initialized, "version 1 is accepted");
+    }
+
+    /// The WHOLE first word is compared, not its low 16 bits: 65537 truncates to 1 and must still fail.
+    function test_Envelope_versionIsTheWholeFirstWord() public {
+        bytes memory body = abi.encode(_terms(_universalCfg()));
+        _expectVersionRefused(abi.encode(uint256(1) + 2 ** 16, CHAIN_SEPOLIA, body), 2 ** 16 + 1);
+    }
+
+    /**
+     * A pre-version two-field `(string chain, bytes body)` envelope — what an SDK built before the
+     * version shipped would send. Its first word is the string's offset, 0x40, so it is refused as
+     * version 64, named.
+     */
+    function test_Envelope_preVersionTwoFieldEnvelopeIsNamed() public {
+        _expectVersionRefused(abi.encode(CHAIN_SEPOLIA, abi.encode(_terms(_universalCfg()))), 0x40);
+    }
+
+    /// A v2 `(uint8 0, bytes)` wrapper — the shape a stale SDK would send for a universal mandate.
+    function test_Envelope_v2UniversalWrapperIsNamed() public {
+        _expectVersionRefused(abi.encode(uint8(0), abi.encode(_universalCfg())), 0);
+    }
+
+    /// A bare `abi.encode(Config)` — no envelope at all. Its head is an offset of 0x20.
+    function test_Envelope_bareUniversalStructIsNamed() public {
+        _expectVersionRefused(abi.encode(_universalCfg()), 0x20);
     }
 
     /// And the native bare struct, same mechanism, same named outcome.
-    function test_Envelope_bareNativeStructIsNamedEmptyChain() public {
-        vm.prank(address(engine));
-        vm.expectRevert(UniversalRulesPolicyErrors.EmptyChain.selector);
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(_nativeCfg()));
+    function test_Envelope_bareNativeStructIsNamed() public {
+        _expectVersionRefused(abi.encode(_nativeCfg()), 0x20);
     }
 
-    /// Sixty-four zero bytes: a zero-length chain and a zero-length body. Named, fails closed.
-    function test_Envelope_zeroWordsAreNamedEmptyChain() public {
-        vm.prank(address(engine));
-        vm.expectRevert(UniversalRulesPolicyErrors.EmptyChain.selector);
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(uint256(0), uint256(0)));
+    /// Sixty-four zero bytes: version 0.
+    function test_Envelope_zeroWordsAreNamed() public {
+        _expectVersionRefused(abi.encode(uint256(0), uint256(0)), 0);
+    }
+
+    /// A Scope-D-era `(uint8, bytes32, bytes)` header, covered because an SDK built against one would
+    /// produce it. Version 0.
+    function test_Envelope_scopeDHeaderIsNamed() public {
+        _expectVersionRefused(abi.encode(uint8(0), keccak256("some chain"), abi.encode(_universalCfg())), 0);
+    }
+
+    /// A v2 `(uint8 2, bytes)` wrapper — what an out-of-range mode byte used to be. Version 2.
+    function test_Envelope_v2OutOfRangeModeIsNamed() public {
+        _expectVersionRefused(abi.encode(uint8(2), abi.encode(_universalCfg())), 2);
+    }
+
+    /// One word is enough to read a version: a single zero word is version 0, named.
+    function test_Envelope_singleZeroWordIsNamed() public {
+        _expectVersionRefused(abi.encode(uint256(0)), 0);
     }
 
     // ═══════════════════════ unnamed, fail-closed refusals ═══════════════════════
 
-    /**
-     * A Scope-D-era `(uint8, bytes32, bytes)` header — a shape that existed only in design drafts,
-     * covered because an SDK built against one would produce it.
-     *
-     * ⚠️ BARE `expectRevert`, JUSTIFIED: word 1 is a 32-byte hash, read as the `bytes` offset, which
-     * points far outside the blob. The decoder aborts with no data. There is no selector to assert.
-     */
-    function test_Envelope_scopeDHeaderRevertsUnnamed() public {
-        bytes memory d = abi.encode(uint8(0), keccak256("some chain"), abi.encode(_universalCfg()));
-
+    /// ⚠️ BARE `expectRevert`, JUSTIFIED: shorter than one word, so there is no version to read; the
+    /// calldata slice fails with no data.
+    function test_Envelope_shorterThanOneWordRevertsUnnamed() public {
         vm.prank(address(engine));
         vm.expectRevert();
-        urp.initializeWithMultiplexer(ACCOUNT, CID, d);
-    }
-
-    /**
-     * A v2 `(uint8 2, bytes)` wrapper — what an out-of-range mode byte used to be.
-     *
-     * ⚠️ BARE `expectRevert`, JUSTIFIED: offset 2 sends the decoder to read a length from an
-     * unaligned position, yielding an absurd length that exceeds the blob. Unnamed by construction.
-     * The error this USED to produce, `InvalidPolicyMode(2)`, no longer exists — there is no mode
-     * byte to be out of range.
-     */
-    function test_Envelope_v2OutOfRangeModeRevertsUnnamed() public {
-        bytes memory d = abi.encode(uint8(2), abi.encode(_universalCfg()));
-
-        vm.prank(address(engine));
-        vm.expectRevert();
-        urp.initializeWithMultiplexer(ACCOUNT, CID, d);
-    }
-
-    /// ⚠️ BARE `expectRevert`, JUSTIFIED: too short to contain two head words at all.
-    function test_Envelope_tooShortRevertsUnnamed() public {
-        vm.prank(address(engine));
-        vm.expectRevert();
-        urp.initializeWithMultiplexer(ACCOUNT, CID, abi.encode(uint256(0)));
+        urp.initializeWithMultiplexer(ACCOUNT, CID, hex"0000000000000000000000000000000000000000000000000000000001");
     }
 
     /// ⚠️ BARE `expectRevert`, JUSTIFIED: empty calldata has no head at all.
@@ -192,6 +187,38 @@ contract URPEnvelopeTest is BaseTest {
         vm.prank(address(engine));
         vm.expectRevert();
         urp.initializeWithMultiplexer(ACCOUNT, CID, "");
+    }
+
+    // ═══════════════════════ through the wallet ═══════════════════════
+
+    /// An unsupported version through the real wallet: the wallet reads the chain and passes the bytes
+    /// on untouched, URP refuses the version at init, and the error reaches the owner NAMED (init
+    /// reverts bubble with full data; only `checkAction` reverts are truncated by the engine).
+    function test_Envelope_throughTheWallet_unsupportedVersionIsNamed() public {
+        address owner = makeAddr("envelopeOwner");
+        AGW wallet = newWallet(owner);
+        bytes memory initData = abi.encode(uint16(2), CHAIN_SEPOLIA, abi.encode(_terms(_universalCfg())));
+        vm.prank(owner);
+        vm.expectRevert(
+            abi.encodeWithSelector(UniversalRulesPolicyErrors.UnsupportedEnvelopeVersion.selector, uint256(2))
+        );
+        wallet.grantRules(canonicalSession(agentConfig(makeAddr("envelopeAgent")), initData));
+    }
+
+    /**
+     * A pre-version two-field envelope through the real wallet fails EARLIER, in the wallet's own
+     * decode: the wallet reads the chain with the three-field decoder, the old layout points it at a
+     * garbage string length, and the decoder panics (0x41, memory allocation). Fails closed before URP
+     * is reached. The wallet deliberately does not judge the version — URP is the one judge of the
+     * envelope's terms — so this panic, not a named error, is what a stale SDK sees through a grant.
+     */
+    function test_Envelope_throughTheWallet_preVersionEnvelopePanicsInTheWalletDecode() public {
+        address owner = makeAddr("envelopeOwner");
+        AGW wallet = newWallet(owner);
+        bytes memory initData = abi.encode(CHAIN_SEPOLIA, abi.encode(_terms(_universalCfg())));
+        vm.prank(owner);
+        vm.expectRevert(stdError.memOverflowError);
+        wallet.grantRules(canonicalSession(agentConfig(makeAddr("envelopeAgent")), initData));
     }
 
     // ═══════════════════════ well-formed envelope, wrong body ═══════════════════════

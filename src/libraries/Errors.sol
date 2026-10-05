@@ -260,6 +260,10 @@ library UniversalRulesPolicyErrors {
     ///      string itself; a malformed non-empty string derives UNIVERSAL and is caught by the
     ///      asset check instead.
     error EmptyChain();
+    /// @dev init: the envelope's first word is not `ENVELOPE_VERSION`. Read before anything else is
+    ///      decoded, so most malformed or pre-version blobs land here, named: a two-field
+    ///      `(string, bytes)` envelope starts with its string offset and reports version 64.
+    error UnsupportedEnvelopeVersion(uint256 version);
 
     /// @dev init, universal: the asset reports a different source chain than the envelope declares.
     ///      `declared` first because it is the value the owner can act on.

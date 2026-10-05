@@ -93,7 +93,6 @@ contract PushAgentWalletOwnerIntentTest is BaseTest {
                 Config({
                     initialized: false,
                     validUntil: uint48(block.timestamp + 30 days),
-                    destChainHash: bytes32(0),
                     expectedCEA: CEA,
                     maxGasPerCall: 1 ether,
                     assets: oneAsset(ASSET, 100e6, 100e6),
